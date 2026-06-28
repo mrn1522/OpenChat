@@ -60,12 +60,17 @@ body {
   right: 0;
   width: 100%;
   height: clamp(430px, 58vh, 760px);
-  background-image: url("./assets/icons/deepspace.png?v=2");
+  background-image: url("./assets/icons/deepspace.webp");
   background-repeat: no-repeat;
   background-position: 42% 6%;
   background-size: cover;
   opacity: 0.60;
   filter: blur(0.6px) saturate(1.08) brightness(0.88);
+  /* Hint to the browser: this layer is decorative and can be composited
+     off the main thread, so decoding it never blocks interaction. */
+  will-change: opacity;
+  content-visibility: auto;
+  contain: strict;
 }
 
 .bg-lights::after {
