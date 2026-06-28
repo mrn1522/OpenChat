@@ -1,0 +1,38 @@
+# ---- Secrets / env ----
+.env
+.env.*
+!.env.example
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ---- Databases / local data ----
+*.db
+*.sqlite
+*.sqlite3
+openchat_history.db
+
+# ---- Node / client ----
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+.vite/
+
+# ---- Large binary assets ----
+client/src/assets/icons/deepspace.png
+
+# ---- Logs / OS / editor ----
+*.log
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
