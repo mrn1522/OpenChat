@@ -1,5 +1,11 @@
+export type SourceAgentSpec = {
+  id: string;
+  model: string;
+};
+
 export type SourceModelResult = {
   model: string;
+  agent_id?: string;
   content: string;
   status: "ok" | "error";
   persona?: PersonaAssignment;
@@ -9,6 +15,7 @@ export type SourceModelResult = {
 
 export type PersonaAssignment = {
   model: string;
+  agent_id?: string;
   title: string;
   temperature: number;
   description: string;
@@ -17,6 +24,8 @@ export type PersonaAssignment = {
 export type DebateResult = {
   target_model: string;
   reviewer_model: string;
+  target_agent_id?: string;
+  reviewer_agent_id?: string;
   content: string;
 };
 
@@ -71,6 +80,7 @@ export type DirectChatStreamEvent =
 export type RunRequest = {
   prompt: string;
   source_models: string[];
+  source_agents?: SourceAgentSpec[];
   fusion_model: string;
   debate_mode?: DebateMode;
   temperature?: number;
@@ -108,7 +118,8 @@ export type FusionRegenerateResponse = {
 
 export type PersonaPreviewRequest = {
   prompt: string;
-  source_models: string[];
+  source_models?: string[];
+  source_agents?: SourceAgentSpec[];
 };
 
 export type PersonaPreviewResponse = {

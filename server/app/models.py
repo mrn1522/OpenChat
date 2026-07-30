@@ -12,11 +12,17 @@ class AttachmentInput(BaseModel):
     name: str = Field(min_length=1, max_length=256)
     size: int = Field(ge=1, le=262144)
     content_type: str = Field(default="application/octet-stream", max_length=128)
-    content: str = Field(min_length=1, max_length=20000)
+    content: str = Field(min_length=1, max_length=100000)
+
+
+class SourceAgentSpec(BaseModel):
+    id: str = Field(min_length=1)
+    model: str = Field(min_length=1)
 
 
 class PersonaAssignment(BaseModel):
     model: str = Field(min_length=1)
+    agent_id: str = ""
     title: str = Field(min_length=1, max_length=120)
     temperature: float = Field(default=0.7, ge=0.5, le=1.2)
     description: str = Field(min_length=1, max_length=1200)
@@ -25,13 +31,14 @@ class PersonaAssignment(BaseModel):
 class RunRequest(BaseModel):
     prompt: str = Field(min_length=1)
     source_models: list[str] = Field(min_length=1)
+    source_agents: list[SourceAgentSpec] = Field(default_factory=list)
     fusion_model: str = Field(min_length=1)
     debate_mode: Literal["off", "partial", "full"] = "partial"
     temperature: float = Field(default=0.2, ge=0, le=2)
     max_output_tokens: int = Field(default=1000, ge=128, le=10000)
     web_search_enabled: bool = False
     persona_enabled: bool = False
-    persona_assignments_override: list[PersonaAssignment] = Field(default_factory=list, max_length=24)
+    persona_assignments_override: list[PersonaAssignment] = Field(default_factory=list, max_length=48)
     reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
     attachments: list[AttachmentInput] = Field(default_factory=list, max_length=5)
 
@@ -52,7 +59,7 @@ class DirectChatRequest(BaseModel):
 
 
 class PromptOptimizeRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=20000)
+    prompt: str = Field(min_length=1, max_length=100000)
 
 
 class PromptOptimizeResponse(BaseModel):
@@ -71,8 +78,9 @@ class FusionRegenerateRequest(BaseModel):
 
 
 class PersonaPreviewRequest(BaseModel):
-    prompt: str = Field(min_length=1, max_length=20000)
-    source_models: list[str] = Field(min_length=1)
+    prompt: str = Field(min_length=1, max_length=100000)
+    source_models: list[str] = Field(default_factory=list)
+    source_agents: list[SourceAgentSpec] = Field(default_factory=list)
 
 
 class PersonaPreviewResponse(BaseModel):
@@ -82,6 +90,7 @@ class PersonaPreviewResponse(BaseModel):
 
 class SourceResult(BaseModel):
     model: str
+    agent_id: str = ""
     content: str
     status: Literal["ok", "error"]
     persona: PersonaAssignment | None = None
@@ -92,6 +101,8 @@ class SourceResult(BaseModel):
 class DebateResult(BaseModel):
     target_model: str
     reviewer_model: str
+    target_agent_id: str = ""
+    reviewer_agent_id: str = ""
     content: str
 
 

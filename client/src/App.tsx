@@ -67,6 +67,7 @@ import type {
   RunRequest,
   SavedWorkflow,
   SavedWorkflowConfig,
+  SourceAgentSpec,
   SourceModelResult,
   StreamEvent,
 } from "./types";
@@ -257,7 +258,7 @@ const DEBATE_MODE_OPTIONS: DebateMode[] = ["off", "partial", "full"];
 const OPENROUTER_TOKEN_LIMIT = 10_000;
 const MAX_ATTACHMENTS = 5;
 const MAX_ATTACHMENT_SIZE_BYTES = 262_144;
-const MAX_ATTACHMENT_CONTENT_CHARS = 20_000;
+const MAX_ATTACHMENT_CONTENT_CHARS = 100_000;
 const SUPPORTED_ATTACHMENT_TYPES = new Set([
   "txt",
   "md",
@@ -392,6 +393,25 @@ const formatAgentStatus = (status: "ready" | "running" | "completed" | "error") 
   return "Ready";
 };
 
+const agentKey = (result: { agent_id?: string; model: string }): string =>
+  result.agent_id?.trim() || result.model;
+
+const MAX_AGENT_COUNT = 8;
+
+const buildRuntimeAgents = (
+  sourceModels: string[],
+  counts: Record<string, number>
+): SourceAgentSpec[] => {
+  const agents: SourceAgentSpec[] = [];
+  for (const modelId of sourceModels) {
+    const count = Math.max(1, Math.min(MAX_AGENT_COUNT, counts[modelId] ?? 1));
+    for (let index = 1; index <= count; index += 1) {
+      agents.push({ id: `${modelId}#${index}`, model: modelId });
+    }
+  }
+  return agents;
+};
+
 const getChatType = (status: string): "fusion" | "direct" =>
   status.startsWith("direct") ? "direct" : "fusion";
 
@@ -420,6 +440,8 @@ function App() {
   const [activePage, setActivePage] = useState<AppPage>("fusion");
   const [prompt, setPrompt] = useState("");
   const [sourceModels, setSourceModels] = useState<string[]>([]);
+  const [agentCounts, setAgentCounts] = useState<Record<string, number>>({});
+  const [activeRuntimeAgents, setActiveRuntimeAgents] = useState<SourceAgentSpec[]>([]);
   const [fusionModel, setFusionModel] = useState("");
   const [temperature, setTemperature] = useState(1.0);
   const [reasoningEffort, setReasoningEffort] = useState<ReasoningEffort>("medium");
@@ -675,28 +697,75 @@ function App() {
     [catalogById, catalogIndexById, sourceModels]
   );
 
-  const sourceResultsByModel = useMemo(() => {
+  const runtimeAgents = useMemo(
+    () => buildRuntimeAgents(sourceModels, agentCounts),
+    [sourceModels, agentCounts]
+  );
+
+  useEffect(() => {
+    setAgentCounts((prev) => {
+      const next: Record<string, number> = {};
+      let changed = false;
+      for (const modelId of sourceModels) {
+        const existing = prev[modelId];
+        if (typeof existing === "number" && existing >= 1) {
+          next[modelId] = Math.min(MAX_AGENT_COUNT, existing);
+        } else {
+          next[modelId] = 1;
+          changed = true;
+        }
+      }
+      if (!changed && Object.keys(prev).length === Object.keys(next).length) {
+        const sameEntries = Object.entries(next).every(
+          ([key, value]) => prev[key] === value
+        );
+        if (sameEntries) return prev;
+      }
+      return next;
+    });
+  }, [sourceModels]);
+
+  const setAgentCount = (modelId: string, count: number) => {
+    const clamped = Math.max(1, Math.min(MAX_AGENT_COUNT, Math.trunc(count) || 1));
+    setAgentCounts((prev) => ({ ...prev, [modelId]: clamped }));
+  };
+
+  const incrementAgentCount = (modelId: string) => {
+    setAgentCounts((prev) => {
+      const current = prev[modelId] ?? 1;
+      return { ...prev, [modelId]: Math.min(MAX_AGENT_COUNT, current + 1) };
+    });
+  };
+
+  const decrementAgentCount = (modelId: string) => {
+    setAgentCounts((prev) => {
+      const current = prev[modelId] ?? 1;
+      return { ...prev, [modelId]: Math.max(1, current - 1) };
+    });
+  };
+
+  const sourceResultsByAgent = useMemo(() => {
     const map = new Map<string, SourceModelResult>();
-    for (const result of sourceResults) map.set(result.model, result);
+    for (const result of sourceResults) map.set(agentKey(result), result);
     return map;
   }, [sourceResults]);
 
-  const personaByModel = useMemo(() => {
+  const personaByAgent = useMemo(() => {
     const map = new Map<string, PersonaAssignment>();
-    for (const assignment of personaAssignments) map.set(assignment.model, assignment);
+    for (const assignment of personaAssignments) map.set(assignment.agent_id?.trim() || assignment.model, assignment);
     for (const result of sourceResults) {
-      if (result.persona) map.set(result.model, result.persona);
+      if (result.persona) map.set(agentKey(result), result.persona);
     }
     return map;
   }, [personaAssignments, sourceResults]);
 
-  const summaryModels = useMemo(
+  const summaryAgents = useMemo(
     () =>
-      selectedSourceModels.filter((model) => {
-        const result = sourceResultsByModel.get(model.id);
+      activeRuntimeAgents.filter((agent) => {
+        const result = sourceResultsByAgent.get(agent.id);
         return !result || result.status === "ok";
       }),
-    [selectedSourceModels, sourceResultsByModel]
+    [activeRuntimeAgents, sourceResultsByAgent]
   );
 
   const filteredModels = useMemo(() => {
@@ -868,8 +937,9 @@ function App() {
 
     if (event.type === "source_result") {
       setSourceResults((prev) => {
-        const withoutModel = prev.filter((item) => item.model !== event.data.model);
-        return [...withoutModel, event.data];
+        const key = agentKey(event.data);
+        const without = prev.filter((item) => agentKey(item) !== key);
+        return [...without, event.data];
       });
       return;
     }
@@ -956,6 +1026,8 @@ function App() {
     setActivePage("fusion");
     setPrompt("");
     setSourceModels([]);
+    setAgentCounts({});
+    setActiveRuntimeAgents([]);
     setFusionModel("");
     setTemperature(1.0);
     setReasoningEffort("medium");
@@ -992,6 +1064,15 @@ function App() {
     setActivePage("fusion");
     setPrompt(chat.request.prompt);
     setSourceModels(chat.request.source_models);
+    setAgentCounts({});
+    const hydratedAgents: SourceAgentSpec[] =
+      chat.request.source_agents && chat.request.source_agents.length > 0
+        ? chat.request.source_agents
+        : chat.source_results.map((result) => ({
+            id: result.agent_id?.trim() || result.model,
+            model: result.model,
+          }));
+    setActiveRuntimeAgents(hydratedAgents);
     setFusionModel(chat.request.fusion_model);
     setDebateMode(chat.request.debate_mode ?? "partial");
     setTemperature(chat.request.temperature ?? 1.0);
@@ -1088,9 +1169,13 @@ function App() {
     setStepState({ route: "active", search: "pending", parallel: "pending", critique: "pending", fusion: "pending" });
     setStepDetail(initialStepDetail());
 
+    const agents = runtimeAgents;
+    setActiveRuntimeAgents(agents);
+
     const payload: RunRequest = {
       prompt: promptToRun,
       source_models: sourceModels,
+      source_agents: agents,
       fusion_model: fusionModel,
       debate_mode: debateMode,
       temperature,
@@ -1139,7 +1224,7 @@ function App() {
       if (personaEnabled) {
         const personaResult = await previewPersonas({
           prompt: optimized,
-          source_models: sourceModels,
+          source_agents: runtimeAgents,
         });
         generatedPersonas = personaResult.items;
       }
@@ -1177,13 +1262,14 @@ function App() {
   };
 
   const updatePendingPersona = (
-    model: string,
+    agentId: string,
     field: "title" | "description" | "temperature",
     value: string
   ) => {
     setPendingPersonaAssignments((prev) =>
       prev.map((item) => {
-        if (item.model !== model) return item;
+        const itemAgentId = item.agent_id?.trim() || item.model;
+        if (itemAgentId !== agentId) return item;
         if (field !== "temperature") return { ...item, [field]: value };
 
         const parsed = Number(value);
@@ -1196,6 +1282,12 @@ function App() {
 
   const removeSourceModel = (model: string) => {
     setSourceModels((prev) => prev.filter((entry) => entry !== model));
+    setAgentCounts((prev) => {
+      if (!(model in prev)) return prev;
+      const next = { ...prev };
+      delete next[model];
+      return next;
+    });
   };
 
   const removeAttachment = (attachmentId: string) => {
@@ -1204,6 +1296,8 @@ function App() {
 
   const applySavedWorkflow = (config: SavedWorkflowConfig) => {
     setSourceModels(config.source_models);
+    setAgentCounts({});
+    setActiveRuntimeAgents([]);
     setFusionModel(config.fusion_model);
     setTemperature(config.temperature);
     setReasoningEffort(config.reasoning_effort);
@@ -1217,6 +1311,8 @@ function App() {
     const preset = EXPERIENCE_MODE_PRESETS[modeId as (typeof EXPERIENCE_MODES)[number]["id"]];
     if (preset) {
       setSourceModels(preset.sourceModels);
+      setAgentCounts({});
+      setActiveRuntimeAgents([]);
       setFusionModel(preset.fusionModel);
       setActiveMode(modeId);
       setWorkflowSaveError(null);
@@ -1480,8 +1576,8 @@ function App() {
     ? ({ "--provider-tint": DirectProviderIcon.tint } as CSSProperties)
     : undefined;
 
-  const getAgentStatus = (modelId: string): "ready" | "running" | "completed" | "error" => {
-    const result = sourceResultsByModel.get(modelId);
+  const getAgentStatus = (agentId: string): "ready" | "running" | "completed" | "error" => {
+    const result = sourceResultsByAgent.get(agentId);
     if (result) return result.status === "ok" ? "completed" : "error";
     if (isRunning && (stepState.search === "active" || stepState.parallel === "active" || stepState.parallel === "done")) {
       return "running";
@@ -1489,12 +1585,61 @@ function App() {
     return "ready";
   };
 
-  const liveAgentRows = selectedSourceModels.map((model) => {
-    const result = sourceResultsByModel.get(model.id);
-    const status = getAgentStatus(model.id);
-    const persona = personaByModel.get(model.id) ?? null;
+  const modelRuntimeAgents = (modelId: string) =>
+    activeRuntimeAgents.filter((agent) => agent.model === modelId);
+
+  const getCardStatus = (modelId: string): "ready" | "running" | "completed" | "error" => {
+    const agents = modelRuntimeAgents(modelId);
+    if (agents.length === 0) {
+      if (isRunning && (stepState.search === "active" || stepState.parallel === "active" || stepState.parallel === "done")) {
+        return "running";
+      }
+      return "ready";
+    }
+    const results = agents
+      .map((agent) => sourceResultsByAgent.get(agent.id))
+      .filter((result): result is SourceModelResult => Boolean(result));
+    if (results.length === 0) {
+      if (isRunning && (stepState.search === "active" || stepState.parallel === "active" || stepState.parallel === "done")) {
+        return "running";
+      }
+      return "ready";
+    }
+    if (results.every((result) => result.status === "ok")) return "completed";
+    if (results.every((result) => result.status === "error")) return "error";
+    return "completed";
+  };
+
+  const personaForModel = (modelId: string): PersonaAssignment | null => {
+    const agents = modelRuntimeAgents(modelId);
+    for (const agent of agents) {
+      const persona = personaByAgent.get(agent.id);
+      if (persona) return persona;
+    }
+    return null;
+  };
+
+  const agentDisplayModel = (modelId: string): DisplayModel =>
+    toDisplayModel(modelId, catalogById.get(modelId), catalogIndexById.get(modelId) ?? null);
+
+  const agentDisplayName = (agent: SourceAgentSpec): string => {
+    const display = agentDisplayModel(agent.model);
+    const siblings = activeRuntimeAgents.filter((entry) => entry.model === agent.model);
+    if (siblings.length > 1) {
+      const instanceIndex = siblings.findIndex((entry) => entry.id === agent.id) + 1;
+      return `${display.name} #${instanceIndex}`;
+    }
+    return display.name;
+  };
+
+  const liveAgentRows = activeRuntimeAgents.map((agent) => {
+    const result = sourceResultsByAgent.get(agent.id);
+    const status = getAgentStatus(agent.id);
+    const persona = personaByAgent.get(agent.id) ?? null;
     return {
-      model,
+      agent,
+      model: agentDisplayModel(agent.model),
+      displayName: agentDisplayName(agent),
       status,
       latency: result?.latency_ms ?? null,
       persona,
@@ -1512,20 +1657,23 @@ function App() {
     if (activeResultTab === "fusion") return fusionOutput || critiqueOutput;
     if (activeResultTab === "sources") {
       return sourceResults
-        .map((result) => `## ${result.model}\n\n${result.status === "ok" ? result.content : result.error || "Error"}`)
+        .map((result) => {
+          const name = agentDisplayName({ id: agentKey(result), model: result.model });
+          return `## ${name}\n\n${result.status === "ok" ? result.content : result.error || "Error"}`;
+        })
         .join("\n\n");
     }
 
-    const summaries = summaryModels
-      .map((model) => {
-        const result = sourceResultsByModel.get(model.id);
+    const summaries = summaryAgents
+      .map((agent) => {
+        const result = sourceResultsByAgent.get(agent.id);
         const initialResponse = result
           ? result.status === "ok"
             ? result.content
             : result.error || "Error"
           : "No response yet.";
 
-        return `## ${model.name}\n\nStatus: ${formatAgentStatus(getAgentStatus(model.id))}\n\n### Initial Response\n${initialResponse}`;
+        return `## ${agentDisplayName(agent)}\n\nStatus: ${formatAgentStatus(getAgentStatus(agent.id))}\n\n### Initial Response\n${initialResponse}`;
       })
       .join("\n\n");
 
@@ -1855,49 +2003,91 @@ function App() {
           {catalogError && <p className="error">{catalogError}</p>}
 
           <div className="agent-card-grid">
-            {selectedSourceModels.map((model, index) => {
-              const result = sourceResultsByModel.get(model.id);
-              const colorName = AGENT_COLORS[index % AGENT_COLORS.length];
-              const providerIcon = resolveProviderIcon(model);
-              const ProviderIcon = providerIcon?.Icon ?? null;
-              const providerTintStyle = providerIcon?.tint
-                ? ({ "--provider-tint": providerIcon.tint } as CSSProperties)
-                : undefined;
-              const agentStatus = getAgentStatus(model.id);
+            {(() => {
+              const firstAgentIdByModel = new Map<string, string>();
+              for (const agent of runtimeAgents) {
+                if (!firstAgentIdByModel.has(agent.model)) firstAgentIdByModel.set(agent.model, agent.id);
+              }
 
-              return (
-                <article key={model.id} className={`agent-card tone-${colorName}`}>
-                  <button type="button" className="card-close" onClick={() => removeSourceModel(model.id)}>
-                    ×
-                  </button>
-                  <div className="agent-avatar" aria-hidden="true" style={providerTintStyle}>
-                    {ProviderIcon ? (
-                      <ProviderIcon size={20} className="model-company-icon" />
-                    ) : (
-                      model.name.slice(0, 2).toUpperCase()
-                    )}
-                  </div>
-                  <h3>{model.name}</h3>
-                  <p>{model.provider}</p>
-                  {(() => {
-                    const persona = personaByModel.get(model.id);
-                    if (!persona) return null;
-                    return (
+              if (runtimeAgents.length === 0) {
+                return (
+                  <div className="empty-card">Select agents from + Add Agent to begin parallel reasoning.</div>
+                );
+              }
+
+              return runtimeAgents.map((agent) => {
+                const modelDisplay = agentDisplayModel(agent.model);
+                const modelIndex = Math.max(0, sourceModels.indexOf(agent.model));
+                const colorName = AGENT_COLORS[modelIndex % AGENT_COLORS.length];
+                const providerIcon = resolveProviderIcon(modelDisplay);
+                const ProviderIcon = providerIcon?.Icon ?? null;
+                const providerTintStyle = providerIcon?.tint
+                  ? ({ "--provider-tint": providerIcon.tint } as CSSProperties)
+                  : undefined;
+                const agentStatus = getAgentStatus(agent.id);
+                const count = agentCounts[agent.model] ?? 1;
+                const isFirstInstance = firstAgentIdByModel.get(agent.model) === agent.id;
+                const persona = personaByAgent.get(agent.id) ?? null;
+
+                const handleClose = () => {
+                  if (isFirstInstance && count <= 1) {
+                    removeSourceModel(agent.model);
+                  } else {
+                    decrementAgentCount(agent.model);
+                  }
+                };
+
+                return (
+                  <article key={agent.id} className={`agent-card tone-${colorName}`}>
+                    <button type="button" className="card-close" onClick={handleClose} aria-label="Remove agent instance">
+                      ×
+                    </button>
+                    <div className="agent-avatar" aria-hidden="true" style={providerTintStyle}>
+                      {ProviderIcon ? (
+                        <ProviderIcon size={20} className="model-company-icon" />
+                      ) : (
+                        modelDisplay.name.slice(0, 2).toUpperCase()
+                      )}
+                    </div>
+                    <h3>{agentDisplayName(agent)}</h3>
+                    <p>{modelDisplay.provider}</p>
+                    {persona && (
                       <div className="persona-card-block">
                         <p className="persona-chip">{persona.title}</p>
                         <p className="persona-chip">Temp {persona.temperature.toFixed(2)}</p>
                         <p className="persona-description">{persona.description}</p>
                       </div>
-                    );
-                  })()}
-                  <p className={`agent-status status-${agentStatus}`}>Status: {formatAgentStatus(agentStatus)}</p>
-                </article>
-              );
-            })}
-
-            {selectedSourceModels.length === 0 && (
-              <div className="empty-card">Select agents from + Add Agent to begin parallel reasoning.</div>
-            )}
+                    )}
+                    <p className={`agent-status status-${agentStatus}`}>Status: {formatAgentStatus(agentStatus)}</p>
+                    {isFirstInstance ? (
+                      <div className="agent-count-control" role="group" aria-label={`Instance count for ${modelDisplay.name}`}>
+                        <button
+                          type="button"
+                          className="agent-count-btn"
+                          onClick={() => decrementAgentCount(agent.model)}
+                          disabled={count <= 1 || isRunning}
+                          aria-label="Decrease instance count"
+                        >
+                          −
+                        </button>
+                        <span className="agent-count-value" aria-live="polite">{count}</span>
+                        <button
+                          type="button"
+                          className="agent-count-btn"
+                          onClick={() => incrementAgentCount(agent.model)}
+                          disabled={count >= MAX_AGENT_COUNT || isRunning}
+                          aria-label="Increase instance count"
+                        >
+                          +
+                        </button>
+                      </div>
+                    ) : (
+                      <p className="agent-instance-label">Instance #{agent.id.split("#")[1] ?? ""}</p>
+                    )}
+                  </article>
+                );
+              });
+            })()}
           </div>
 
           <div className="picker-anchor">{activePicker === "source" && renderPicker()}</div>
@@ -1959,37 +2149,44 @@ function App() {
 
             {isOptimizationReviewPending && pendingPersonaAssignments.length > 0 && (
               <div className="persona-review-grid" role="group" aria-label="Persona review">
-                {pendingPersonaAssignments.map((assignment) => (
-                  <article key={assignment.model} className="persona-review-card">
-                    <h4>{assignment.model}</h4>
-                    <label>
-                      <span>Persona title</span>
-                      <input
-                        value={assignment.title}
-                        onChange={(event) => updatePendingPersona(assignment.model, "title", event.target.value)}
-                      />
-                    </label>
-                    <label>
-                      <span>Persona guidance</span>
-                      <textarea
-                        value={assignment.description}
-                        rows={3}
-                        onChange={(event) => updatePendingPersona(assignment.model, "description", event.target.value)}
-                      />
-                    </label>
-                    <label>
-                      <span>Temperature (0.50–1.20)</span>
-                      <input
-                        type="number"
-                        min={0.5}
-                        max={1.2}
-                        step={0.05}
-                        value={assignment.temperature}
-                        onChange={(event) => updatePendingPersona(assignment.model, "temperature", event.target.value)}
-                      />
-                    </label>
-                  </article>
-                ))}
+                {pendingPersonaAssignments.map((assignment) => {
+                  const assignmentKey = assignment.agent_id?.trim() || assignment.model;
+                  const agentSpec = runtimeAgents.find((agent) => agent.id === assignmentKey);
+                  const label = agentSpec
+                    ? agentDisplayName(agentSpec)
+                    : assignment.model;
+                  return (
+                    <article key={assignmentKey} className="persona-review-card">
+                      <h4>{label}</h4>
+                      <label>
+                        <span>Persona title</span>
+                        <input
+                          value={assignment.title}
+                          onChange={(event) => updatePendingPersona(assignmentKey, "title", event.target.value)}
+                        />
+                      </label>
+                      <label>
+                        <span>Persona guidance</span>
+                        <textarea
+                          value={assignment.description}
+                          rows={3}
+                          onChange={(event) => updatePendingPersona(assignmentKey, "description", event.target.value)}
+                        />
+                      </label>
+                      <label>
+                        <span>Temperature (0.50–1.20)</span>
+                        <input
+                          type="number"
+                          min={0.5}
+                          max={1.2}
+                          step={0.05}
+                          value={assignment.temperature}
+                          onChange={(event) => updatePendingPersona(assignmentKey, "temperature", event.target.value)}
+                        />
+                      </label>
+                    </article>
+                  );
+                })}
               </div>
             )}
 
@@ -2220,17 +2417,24 @@ function App() {
 
             {activeResultTab === "summaries" && (
               <div className="agent-summaries-grid">
-                {summaryModels.map((model) => {
-                  const result = sourceResultsByModel.get(model.id);
-                  const status = getAgentStatus(model.id);
+                {summaryAgents.map((agent) => {
+                  const result = sourceResultsByAgent.get(agent.id);
+                  const status = getAgentStatus(agent.id);
+                  const display = agentDisplayModel(agent.model);
+                  const reviewerLabel = (item: DebateResult) => {
+                    const reviewerId = item.reviewer_agent_id?.trim() || item.reviewer_model;
+                    return reviewerId === item.reviewer_model
+                      ? item.reviewer_model
+                      : agentDisplayName({ id: reviewerId, model: item.reviewer_model });
+                  };
 
                   return (
-                    <article key={model.id} className="summary-card">
+                    <article key={agent.id} className="summary-card">
                       <div className="summary-card-head">
-                        <h4>{model.name}</h4>
+                        <h4>{agentDisplayName(agent)}</h4>
                         <span className={`summary-status status-${status}`}>{formatAgentStatus(status)}</span>
                       </div>
-                      <p className="summary-provider">{model.provider}</p>
+                      <p className="summary-provider">{display.provider}</p>
 
                       <div className="summary-section">
                         <h5>Initial Response</h5>
@@ -2250,17 +2454,19 @@ function App() {
                       <div className="summary-section">
                         <h5>Critique / Debate</h5>
                         {(() => {
-                          const modelDebates = debateResults.filter((item) => item.target_model === model.id);
-                          if (modelDebates.length > 0) {
+                          const agentDebates = debateResults.filter(
+                            (item) => (item.target_agent_id?.trim() || item.target_model) === agent.id
+                          );
+                          if (agentDebates.length > 0) {
                             return (
-                              <details className="debate-dropdown" open={modelDebates.length <= 1}>
+                              <details className="debate-dropdown" open={agentDebates.length <= 1}>
                                 <summary>
-                                  Reviewer critiques ({modelDebates.length})
+                                  Reviewer critiques ({agentDebates.length})
                                 </summary>
                                 <div className="debate-dropdown-body">
-                                  {modelDebates.map((item, idx) => (
-                                    <article key={`${item.target_model}-${item.reviewer_model}-${idx}`} className="debate-entry">
-                                      <h6>{item.reviewer_model}</h6>
+                                  {agentDebates.map((item, idx) => (
+                                    <article key={`${item.target_agent_id ?? item.target_model}-${item.reviewer_agent_id ?? item.reviewer_model}-${idx}`} className="debate-entry">
+                                      <h6>{reviewerLabel(item)}</h6>
                                       <pre>{item.content}</pre>
                                     </article>
                                   ))}
@@ -2283,7 +2489,7 @@ function App() {
                     </article>
                   );
                 })}
-                {summaryModels.length === 0 && (
+                {summaryAgents.length === 0 && (
                   <article className="summary-card">
                     <div className="summary-section">
                       <h5>Agent Summaries</h5>
@@ -2298,9 +2504,9 @@ function App() {
               <div className="output-block">
                 <h3>Source Responses</h3>
                 {sourceResults.map((result) => (
-                  <article key={result.model} className="output-item">
+                  <article key={agentKey(result)} className="output-item">
                     <div className="output-head">
-                      <strong>{result.model}</strong>
+                      <strong>{agentDisplayName({ id: agentKey(result), model: result.model })}</strong>
                       <span className={result.status === "ok" ? "ok" : "error"}>{result.status}</span>
                     </div>
                     {result.persona && (
@@ -2546,9 +2752,9 @@ function App() {
           {liveAgentRows.map((row, index) => {
             const tone = AGENT_COLORS[index % AGENT_COLORS.length];
             return (
-              <div key={row.model.id} className="live-row">
+              <div key={row.agent.id} className="live-row">
                 <span className={`live-dot tone-${tone}`} />
-                <span className="live-name">{row.model.name}</span>
+                <span className="live-name">{row.displayName}</span>
                 <span className="live-bars" aria-hidden="true">
                   <i />
                   <i />
