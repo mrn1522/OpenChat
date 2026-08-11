@@ -4,7 +4,7 @@ from pydantic import BaseModel, Field
 
 
 class ReasoningConfig(BaseModel):
-    effort: Literal["xhigh", "high", "medium", "low", "minimal", "none"] = "medium"
+    effort: Literal["max", "xhigh", "high", "medium", "low", "minimal", "none"] = "medium"
     exclude: bool = False
 
 
@@ -174,7 +174,7 @@ class WorkflowConfig(BaseModel):
     source_models: list[str] = Field(min_length=1)
     fusion_model: str = Field(min_length=1)
     temperature: float = Field(default=0.2, ge=0, le=2)
-    reasoning_effort: Literal["xhigh", "high", "medium", "low", "minimal", "none"] = "medium"
+    reasoning_effort: Literal["max", "xhigh", "high", "medium", "low", "minimal", "none"] = "medium"
     debate_mode: Literal["off", "partial", "full"] = "partial"
     web_search_enabled: bool = False
     persona_enabled: bool = False

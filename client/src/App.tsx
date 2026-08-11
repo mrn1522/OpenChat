@@ -4,6 +4,7 @@ import type { ComponentType } from "react";
 import type { CSSProperties } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import DirectChatTranscript from "./DirectChatTranscript";
 import {
   Anthropic,
   Aws,
@@ -253,7 +254,7 @@ const ORCHESTRATION_FLOW: Array<{ id: OrchestrationStep; label: string; detail: 
   { id: "fusion", label: "Fusion", detail: "Fusion model synthesizes the final answer.", icon: sparklesIcon },
 ];
 
-const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ["xhigh", "high", "medium", "low", "minimal", "none"];
+const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ["max", "xhigh", "high", "medium", "low", "minimal", "none"];
 const DEBATE_MODE_OPTIONS: DebateMode[] = ["off", "partial", "full"];
 const OPENROUTER_TOKEN_LIMIT = 10_000;
 const MAX_ATTACHMENTS = 5;
@@ -2573,28 +2574,7 @@ function App() {
             </section>
 
             <section className="panel composer-panel direct-composer-panel">
-              <div className="direct-chat-transcript" role="log" aria-live="polite" aria-label="Direct chat messages">
-                {directMessages.length === 0 && !isDirectRunning && (
-                  <div className="direct-chat-empty">Send a prompt to begin a direct conversation.</div>
-                )}
-                {directMessages.map((message, index) => (
-                  <article key={`${message.role}-${index}`} className={`direct-chat-bubble ${message.role}`}>
-                    <p className="direct-chat-role">{message.role === "user" ? "You" : "Assistant"}</p>
-                    <div className="markdown-body">
-                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
-                    </div>
-                  </article>
-                ))}
-                {isDirectRunning && (
-                  <article className="direct-chat-bubble assistant pending" aria-label="Assistant is generating a response">
-                    <p className="direct-chat-role">Assistant</p>
-                    <div className="direct-chat-loading">
-                      <span className="loader" />
-                      <span>Thinking...</span>
-                    </div>
-                  </article>
-                )}
-              </div>
+              <DirectChatTranscript messages={directMessages} isRunning={isDirectRunning} />
 
               <textarea
                 value={directPrompt}

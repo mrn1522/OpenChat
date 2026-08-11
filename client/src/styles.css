@@ -1065,9 +1065,38 @@ body {
 .direct-chat-transcript {
   display: grid;
   gap: 10px;
+  min-height: 160px;
   max-height: 54vh;
   overflow: auto;
   padding-right: 2px;
+  margin-bottom: 12px;
+}
+
+.direct-chat-transcript-virtual {
+  display: block;
+  position: relative;
+  /* size containment collapses height to 0 without an explicit block size,
+     which makes the virtualizer think the viewport is empty. */
+  contain: layout paint style;
+  height: min(54vh, 520px);
+  min-height: 160px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.direct-chat-virtual-spacer {
+  position: relative;
+  width: 100%;
+}
+
+.direct-chat-virtual-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  padding-bottom: 10px;
+  box-sizing: border-box;
 }
 
 .direct-chat-empty {

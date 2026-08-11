@@ -29,7 +29,7 @@ export type DebateResult = {
   content: string;
 };
 
-export type ReasoningEffort = "xhigh" | "high" | "medium" | "low" | "minimal" | "none";
+export type ReasoningEffort = "max" | "xhigh" | "high" | "medium" | "low" | "minimal" | "none";
 
 export type ReasoningConfig = {
   effort: ReasoningEffort;
