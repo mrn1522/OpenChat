@@ -1,8 +1,11 @@
+import asyncio
 import json
 import time
 import uuid
+from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
-from typing import Literal
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import httpx
 from fastapi import FastAPI, HTTPException
@@ -42,6 +45,7 @@ from app.models import (
     PromptOptimizeRequest,
     PromptOptimizeResponse,
     RunRequest,
+    SourceAgentSpec,
     SynthesisResult,
     SourceResult,
     WorkflowCreateRequest,
@@ -81,27 +85,199 @@ def sse(event: str, data: dict) -> str:
 
 
 def build_debate_pairs(
-    source_models: list[str],
+    agent_ids: list[str],
     debate_mode: Literal["off", "partial", "full"],
     fusion_model: str,
 ) -> list[tuple[str, str]]:
-    """Return (reviewer_model, target_model) assignments."""
-    if len(source_models) == 1:
-        return [(fusion_model, source_models[0])]
+    """Return (reviewer_agent_id, target_agent_id) assignments."""
+    if len(agent_ids) == 1:
+        return [(fusion_model, agent_ids[0])]
 
     if debate_mode == "full":
         pairs: list[tuple[str, str]] = []
-        for target_model in source_models:
-            for reviewer_model in source_models:
-                if reviewer_model == target_model:
+        for target_id in agent_ids:
+            for reviewer_id in agent_ids:
+                if reviewer_id == target_id:
                     continue
-                pairs.append((reviewer_model, target_model))
+                pairs.append((reviewer_id, target_id))
         return pairs
 
     return [
-        (source_models[(index + 1) % len(source_models)], source_models[index])
-        for index in range(len(source_models))
+        (agent_ids[(index + 1) % len(agent_ids)], agent_ids[index])
+        for index in range(len(agent_ids))
     ]
+
+
+@dataclass(frozen=True)
+class DebateJob:
+    """One independent reviewer→target debate assignment."""
+
+    pair_index: int
+    reviewer_id: str
+    reviewer_model: str
+    target_id: str
+    target_model: str
+    prompt: str
+
+
+@dataclass(frozen=True)
+class DebateJobSuccess:
+    pair_index: int
+    target_model: str
+    target_agent_id: str
+    reviewer_model: str
+    reviewer_agent_id: str
+    content: str
+
+
+@dataclass(frozen=True)
+class DebateJobFailure:
+    pair_index: int
+    target_model: str
+    target_agent_id: str
+    reviewer_model: str
+    reviewer_agent_id: str
+    error: str
+
+
+DebateJobOutcome = DebateJobSuccess | DebateJobFailure
+
+
+def build_debate_jobs(
+    *,
+    debate_pairs: list[tuple[str, str]],
+    source_by_agent: dict[str, SourceResult],
+    agent_by_id: dict[str, SourceAgentSpec],
+    user_prompt: str,
+) -> list[DebateJob]:
+    """Materialize independent debate jobs in stable pair order."""
+    jobs: list[DebateJob] = []
+    for pair_index, (reviewer_id, target_id) in enumerate(debate_pairs):
+        target_result = source_by_agent.get(target_id)
+        if target_result is None:
+            continue
+
+        peer_results = [
+            result
+            for aid, result in source_by_agent.items()
+            if aid != target_id
+        ]
+        debate_prompt = build_debate_prompt(
+            user_prompt=user_prompt,
+            target_result=target_result,
+            peer_results=peer_results,
+        )
+        reviewer_agent = agent_by_id.get(reviewer_id)
+        reviewer_model = reviewer_agent.model if reviewer_agent else reviewer_id
+        jobs.append(
+            DebateJob(
+                pair_index=pair_index,
+                reviewer_id=reviewer_id,
+                reviewer_model=reviewer_model,
+                target_id=target_id,
+                target_model=target_result.model,
+                prompt=debate_prompt,
+            )
+        )
+    return jobs
+
+
+async def run_debate_jobs(
+    *,
+    jobs: list[DebateJob],
+    client: Any,
+    debate_system_prompt: str,
+    temperature: float,
+    reasoning_effort: str,
+    reasoning_exclude: bool,
+    run_model=run_markdown_model,
+) -> AsyncIterator[DebateJobOutcome]:
+    """Run all debate jobs concurrently with no concurrency cap.
+
+    Yields outcomes in completion order so callers can stream ``debate_result``
+    SSE events as soon as each review finishes. The final Debate Report should
+    still be assembled from successful outcomes sorted by ``pair_index``.
+    """
+    if not jobs:
+        return
+
+    async def _run_one(job: DebateJob) -> DebateJobOutcome:
+        try:
+            content = await run_model(
+                client=client,
+                model=job.reviewer_model,
+                prompt=job.prompt,
+                system_prompt=debate_system_prompt,
+                temperature=temperature,
+                web_search_enabled=False,
+                reasoning_effort=reasoning_effort,
+                reasoning_exclude=reasoning_exclude,
+                context="Debate",
+            )
+        except Exception as exc:  # noqa: BLE001
+            return DebateJobFailure(
+                pair_index=job.pair_index,
+                target_model=job.target_model,
+                target_agent_id=job.target_id,
+                reviewer_model=job.reviewer_model,
+                reviewer_agent_id=job.reviewer_id,
+                error=str(exc),
+            )
+
+        return DebateJobSuccess(
+            pair_index=job.pair_index,
+            target_model=job.target_model,
+            target_agent_id=job.target_id,
+            reviewer_model=job.reviewer_model,
+            reviewer_agent_id=job.reviewer_id,
+            content=content,
+        )
+
+    tasks = [asyncio.create_task(_run_one(job)) for job in jobs]
+    try:
+        for completed in asyncio.as_completed(tasks):
+            yield await completed
+    finally:
+        # Ensure no orphaned tasks if the SSE consumer disconnects mid-stream.
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
+
+
+def resolve_agents(request: RunRequest) -> list[SourceAgentSpec]:
+    """Build the effective runtime agent list for a run.
+
+    Prefers explicit ``source_agents`` (which may contain duplicate model
+    instances, each with its own stable id). Falls back to one agent per entry
+    in ``source_models`` for backward compatibility with older clients.
+    """
+    if request.source_agents:
+        return request.source_agents
+
+    return [SourceAgentSpec(id=model_name, model=model_name) for model_name in request.source_models]
+
+
+def _build_synthesis_error_message(exc: BaseException, *, stage: str, model: str) -> str:
+    """Build an actionable, SSE-safe error string from a synthesis failure.
+
+    Uses the sanitized ``diagnostics`` carried by ``CompletionFailure`` (no
+    prompt/answer/API-key data) so the client can report the OpenRouter
+    request id and provider error without leaking sensitive content.
+    """
+    diagnostics = getattr(exc, "diagnostics", None) or {}
+    request_id = (
+        diagnostics.get("x-openrouter-request-id")
+        or diagnostics.get("id")
+        or ""
+    )
+    parts = [f"{stage} model '{model}' failed to produce a final answer: {exc}"]
+    if request_id:
+        parts.append(f"OpenRouter request id: {request_id}")
+    if diagnostics:
+        parts.append(f"Diagnostics: {json.dumps(diagnostics, default=str)}")
+    return " | ".join(parts)
 
 
 @app.get("/health")
@@ -120,10 +296,11 @@ async def run_stream(request: RunRequest):
         run_id = str(uuid.uuid4())
         chat_id = run_id
         started = time.perf_counter()
+        agents = resolve_agents(request)
         source_results: list[SourceResult] = []
         debate_results: list[dict] = []
-        persona_by_model: dict[str, PersonaAssignment] = {}
-        source_system_prompt_by_model: dict[str, str] = {}
+        persona_by_agent: dict[str, PersonaAssignment] = {}
+        source_system_prompt_by_agent: dict[str, str] = {}
         debate_system_prompt = build_system_prompt_with_current_aest(DEBATE_SYSTEM_PROMPT)
         fusion_system_prompt = build_system_prompt_with_current_aest(FUSION_SYSTEM_PROMPT)
 
@@ -138,20 +315,22 @@ async def run_stream(request: RunRequest):
         )
 
         if request.persona_enabled:
-            override_by_model = {
-                assignment.model: assignment for assignment in request.persona_assignments_override
+            override_by_agent = {
+                assignment.agent_id: assignment
+                for assignment in request.persona_assignments_override
+                if assignment.agent_id
             }
 
-            if override_by_model:
-                persona_by_model = {
-                    model_name: override_by_model[model_name]
-                    for model_name in request.source_models
-                    if model_name in override_by_model
+            if override_by_agent:
+                persona_by_agent = {
+                    agent.id: override_by_agent[agent.id]
+                    for agent in agents
+                    if agent.id in override_by_agent
                 }
                 yield sse(
                     "persona_assignments",
                     {
-                        "items": [assignment.model_dump() for assignment in persona_by_model.values()],
+                        "items": [assignment.model_dump() for assignment in persona_by_agent.values()],
                     },
                 )
             else:
@@ -160,7 +339,7 @@ async def run_stream(request: RunRequest):
                     {
                         "step": "route",
                         "status": "active",
-                        "detail": "Assigning unique personas for each source model.",
+                        "detail": "Assigning unique personas for each source agent.",
                     },
                 )
 
@@ -168,10 +347,10 @@ async def run_stream(request: RunRequest):
                     persona_assignments = await generate_persona_assignments(
                         client=client,
                         user_prompt=request.prompt,
-                        source_models=request.source_models,
+                        agents=agents,
                     )
-                    persona_by_model = {
-                        assignment.model: assignment for assignment in persona_assignments
+                    persona_by_agent = {
+                        assignment.agent_id: assignment for assignment in persona_assignments
                     }
                     yield sse(
                         "persona_assignments",
@@ -190,15 +369,15 @@ async def run_stream(request: RunRequest):
                     )
                     yield sse("persona_assignments", {"items": [], "error": str(exc)})
 
-        source_system_prompt_by_model = {
-            model_name: build_source_system_prompt(persona_by_model.get(model_name))
-            for model_name in request.source_models
+        source_system_prompt_by_agent = {
+            agent.id: build_source_system_prompt(persona_by_agent.get(agent.id))
+            for agent in agents
         }
-        source_temperature_by_model = {
-            model_name: persona_by_model.get(model_name).temperature
-            if persona_by_model.get(model_name) is not None
+        source_temperature_by_agent = {
+            agent.id: persona_by_agent.get(agent.id).temperature
+            if persona_by_agent.get(agent.id) is not None
             else request.temperature
-            for model_name in request.source_models
+            for agent in agents
         }
 
         yield sse(
@@ -228,27 +407,27 @@ async def run_stream(request: RunRequest):
 
         async for result in run_source_models(
             client=client,
-            models=request.source_models,
+            agents=agents,
             prompt=request.prompt,
             temperature=request.temperature,
             web_search_enabled=request.web_search_enabled,
             reasoning_effort=request.reasoning.effort,
             reasoning_exclude=request.reasoning.exclude,
             attachments=request.attachments,
-            temperature_by_model=source_temperature_by_model,
-            system_prompt_by_model=source_system_prompt_by_model,
+            temperature_by_agent=source_temperature_by_agent,
+            system_prompt_by_agent=source_system_prompt_by_agent,
         ):
-            result_persona = persona_by_model.get(result.model)
+            result_persona = persona_by_agent.get(result.agent_id or result.model)
             if result_persona is not None and result.persona is None:
                 result = result.model_copy(update={"persona": result_persona})
             source_results.append(result)
             yield sse("source_result", result.model_dump())
 
         successful_source_results = [result for result in source_results if result.status == "ok"]
-        successful_source_models = [
-            model_name
-            for model_name in request.source_models
-            if any(result.model == model_name for result in successful_source_results)
+        successful_agent_ids = [
+            agent.id
+            for agent in agents
+            if any((result.agent_id or result.model) == agent.id for result in successful_source_results)
         ]
 
         yield sse(
@@ -288,61 +467,67 @@ async def run_stream(request: RunRequest):
                 },
             )
 
-            source_by_model = {result.model: result for result in successful_source_results}
+            source_by_agent = {result.agent_id or result.model: result for result in successful_source_results}
+            agent_by_id = {agent.id: agent for agent in agents}
             debate_pairs = build_debate_pairs(
-                source_models=successful_source_models,
+                agent_ids=successful_agent_ids,
                 debate_mode=request.debate_mode,
                 fusion_model=request.fusion_model,
             )
+            debate_jobs = build_debate_jobs(
+                debate_pairs=debate_pairs,
+                source_by_agent=source_by_agent,
+                agent_by_id=agent_by_id,
+                user_prompt=request.prompt,
+            )
 
-            debate_outputs: list[tuple[str, str, str]] = []
-            for reviewer_model, target_model in debate_pairs:
-                target_result = source_by_model.get(target_model)
-                if target_result is None:
-                    continue
-
-                peer_results = [result for model_name, result in source_by_model.items() if model_name != target_model]
-                debate_prompt = build_debate_prompt(
-                    user_prompt=request.prompt,
-                    target_result=target_result,
-                    peer_results=peer_results,
-                )
-                try:
-                    debate_output = await run_markdown_model(
-                        client=client,
-                        model=reviewer_model,
-                        prompt=debate_prompt,
-                        system_prompt=debate_system_prompt,
-                        temperature=request.temperature,
-                        web_search_enabled=False,
-                        reasoning_effort=request.reasoning.effort,
-                        reasoning_exclude=request.reasoning.exclude,
-                    )
-                except Exception as exc:  # noqa: BLE001
+            # Collect successes keyed by original pair order so the final
+            # Debate Report stays deterministic even though SSE events are
+            # emitted in completion order as each concurrent review finishes.
+            successful_by_pair: dict[int, DebateJobSuccess] = {}
+            async for outcome in run_debate_jobs(
+                jobs=debate_jobs,
+                client=client,
+                debate_system_prompt=debate_system_prompt,
+                temperature=request.temperature,
+                reasoning_effort=request.reasoning.effort,
+                reasoning_exclude=request.reasoning.exclude,
+            ):
+                if isinstance(outcome, DebateJobFailure):
                     yield sse(
                         "orchestration_step",
                         {
                             "step": "critique",
                             "status": "active",
                             "detail": (
-                                f"Skipped one debate review after {reviewer_model} failed on {target_model}: {exc}"
+                                f"Skipped one debate review after {outcome.reviewer_model} "
+                                f"failed on {outcome.target_model}: {outcome.error}"
                             ),
                         },
                     )
                     continue
 
-                debate_outputs.append((target_model, reviewer_model, debate_output))
+                successful_by_pair[outcome.pair_index] = outcome
                 debate_result_payload = {
-                    "target_model": target_model,
-                    "reviewer_model": reviewer_model,
-                    "content": debate_output,
+                    "target_model": outcome.target_model,
+                    "target_agent_id": outcome.target_agent_id,
+                    "reviewer_model": outcome.reviewer_model,
+                    "reviewer_agent_id": outcome.reviewer_agent_id,
+                    "content": outcome.content,
                 }
                 debate_results.append(debate_result_payload)
-                yield sse(
-                    "debate_result",
-                    debate_result_payload,
-                )
+                yield sse("debate_result", debate_result_payload)
 
+            debate_outputs = [
+                (
+                    successful_by_pair[index].target_model,
+                    successful_by_pair[index].target_agent_id,
+                    successful_by_pair[index].reviewer_model,
+                    successful_by_pair[index].reviewer_agent_id,
+                    successful_by_pair[index].content,
+                )
+                for index in sorted(successful_by_pair)
+            ]
             judge_output = build_debate_markdown(debate_outputs)
             yield sse("critique_ready", {"model": "multi-debate", "content": judge_output})
             yield sse(
@@ -363,16 +548,56 @@ async def run_stream(request: RunRequest):
         )
 
         synth_prompt = build_synth_prompt(request.prompt, successful_source_results, judge_output)
-        final_output = await run_markdown_model(
-            client=client,
-            model=request.fusion_model,
-            prompt=synth_prompt,
-            system_prompt=fusion_system_prompt,
-            temperature=request.temperature,
-            web_search_enabled=False,
-            reasoning_effort=request.reasoning.effort,
-            reasoning_exclude=request.reasoning.exclude,
-        )
+        try:
+            final_output = await run_markdown_model(
+                client=client,
+                model=request.fusion_model,
+                prompt=synth_prompt,
+                system_prompt=fusion_system_prompt,
+                temperature=request.temperature,
+                web_search_enabled=False,
+                reasoning_effort=request.reasoning.effort,
+                reasoning_exclude=request.reasoning.exclude,
+                context="Fusion",
+            )
+        except Exception as exc:  # noqa: BLE001
+            # Fusion is the terminal stage. Never let a provider failure tear
+            # down the ASGI stream: emit an actionable SSE error, persist the
+            # partial run (sources + debate are still valuable), and close the
+            # stream cleanly so the client can recover / regenerate.
+            error_message = _build_synthesis_error_message(
+                exc, stage="Fusion", model=request.fusion_model
+            )
+            yield sse(
+                "orchestration_step",
+                {
+                    "step": "fusion",
+                    "status": "done",
+                    "detail": f"Fusion failed; source and debate results are preserved. {exc}",
+                },
+            )
+            yield sse("error", {"message": error_message})
+
+            elapsed_ms = int((time.perf_counter() - started) * 1000)
+            try:
+                save_chat_record(
+                    settings.openchat_history_db_path,
+                    chat_id=chat_id,
+                    run_id=run_id,
+                    status="failed_fusion",
+                    elapsed_ms=elapsed_ms,
+                    request_payload=request.model_dump(),
+                    source_results=[result.model_dump() for result in source_results],
+                    debate_results=debate_results,
+                    critique_output=judge_output,
+                    fusion_output="",
+                )
+            except Exception:
+                # History persistence must not mask the fusion error.
+                pass
+
+            yield sse("completed", {"elapsed_ms": elapsed_ms})
+            return
         yield sse("fusion_ready", {"model": request.fusion_model, "content": final_output})
         yield sse(
             "orchestration_step",
@@ -607,11 +832,17 @@ async def preview_personas(request: PersonaPreviewRequest) -> PersonaPreviewResp
     except RuntimeError as exc:
         raise HTTPException(status_code=500, detail=str(exc)) from exc
 
+    agents = request.source_agents or [
+        SourceAgentSpec(id=model_name, model=model_name) for model_name in request.source_models
+    ]
+    if not agents:
+        raise HTTPException(status_code=422, detail="At least one source agent is required.")
+
     try:
         assignments = await generate_persona_assignments(
             client=client,
             user_prompt=request.prompt,
-            source_models=request.source_models,
+            agents=agents,
         )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=502, detail=f"Persona generation failed: {exc}") from exc
@@ -647,8 +878,12 @@ async def regenerate_fusion(request: FusionRegenerateRequest) -> SynthesisResult
             web_search_enabled=False,
             reasoning_effort=request.reasoning.effort,
             reasoning_exclude=request.reasoning.exclude,
+            context="Fusion regeneration",
         )
     except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=502, detail=f"Fusion regeneration failed: {exc}") from exc
+        detail = _build_synthesis_error_message(
+            exc, stage="Fusion regeneration", model=request.fusion_model
+        )
+        raise HTTPException(status_code=502, detail=detail) from exc
 
     return SynthesisResult(model=request.fusion_model, content=final_output)

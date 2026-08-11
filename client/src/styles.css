@@ -456,6 +456,52 @@ body {
   color: #ff9cb5;
 }
 
+.agent-count-control {
+  margin-top: 10px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  border: 1px solid rgb(108 128 190 / 45%);
+  border-radius: 999px;
+  background: rgb(7 15 34 / 72%);
+  padding: 3px 6px;
+}
+
+.agent-count-btn {
+  inline-size: 22px;
+  block-size: 22px;
+  border-radius: 50%;
+  border: 1px solid rgb(114 134 197 / 50%);
+  background: rgb(10 20 43 / 80%);
+  color: #d6e2ff;
+  font: inherit;
+  font-size: 0.9rem;
+  line-height: 1;
+  display: grid;
+  place-items: center;
+  padding: 0;
+}
+
+.agent-count-btn:hover:not(:disabled) {
+  border-color: rgb(138 119 255 / 86%);
+  box-shadow: inset 0 0 0 1px rgb(133 113 255 / 28%), 0 0 14px rgb(125 108 255 / 22%);
+}
+
+.agent-count-value {
+  min-inline-size: 18px;
+  text-align: center;
+  font-size: 0.82rem;
+  font-weight: 650;
+  color: #e7eeff;
+}
+
+.agent-instance-label {
+  margin-top: 10px;
+  font-size: 0.74rem;
+  color: #9db0d9;
+  letter-spacing: 0.3px;
+}
+
 .persona-card-block {
   margin-top: 8px;
   display: grid;
@@ -1019,9 +1065,38 @@ body {
 .direct-chat-transcript {
   display: grid;
   gap: 10px;
+  min-height: 160px;
   max-height: 54vh;
   overflow: auto;
   padding-right: 2px;
+  margin-bottom: 12px;
+}
+
+.direct-chat-transcript-virtual {
+  display: block;
+  position: relative;
+  /* size containment collapses height to 0 without an explicit block size,
+     which makes the virtualizer think the viewport is empty. */
+  contain: layout paint style;
+  height: min(54vh, 520px);
+  min-height: 160px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  overscroll-behavior: contain;
+}
+
+.direct-chat-virtual-spacer {
+  position: relative;
+  width: 100%;
+}
+
+.direct-chat-virtual-row {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 100%;
+  padding-bottom: 10px;
+  box-sizing: border-box;
 }
 
 .direct-chat-empty {
