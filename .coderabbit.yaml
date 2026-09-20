@@ -1,0 +1,6 @@
+# yaml-language-server: $schema=https://coderabbit.ai/integrations/schema.v2.json
+
+reviews:
+  # Allow CodeRabbit to submit formal PR approvals / request-changes reviews.
+  # Enables the top-level `@coderabbitai approve` command (resolve + approve).
+  request_changes_workflow: true
