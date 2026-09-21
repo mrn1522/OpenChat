@@ -408,23 +408,24 @@ type GitHubRelease = {
   assets: GitHubReleaseAsset[];
 };
 
-const versionParts = (version: string): number[] =>
-  version
-    .trim()
-    .replace(/^v/i, "")
-    .split("-")[0]
-    .split(".")
-    .map((part) => Number.parseInt(part, 10) || 0);
+const parseVersion = (version: string): { core: number[]; prerelease: boolean } => {
+  const [core, suffix] = version.trim().replace(/^v/i, "").split("-", 2);
+  return {
+    core: core.split(".").map((part) => Number.parseInt(part, 10) || 0),
+    prerelease: suffix !== undefined && suffix.length > 0,
+  };
+};
 
 export const isNewerVersion = (latest: string, current: string): boolean => {
-  const latestParts = versionParts(latest);
-  const currentParts = versionParts(current);
-  const length = Math.max(latestParts.length, currentParts.length);
+  const latestParts = parseVersion(latest);
+  const currentParts = parseVersion(current);
+  const length = Math.max(latestParts.core.length, currentParts.core.length);
   for (let i = 0; i < length; i += 1) {
-    const diff = (latestParts[i] ?? 0) - (currentParts[i] ?? 0);
+    const diff = (latestParts.core[i] ?? 0) - (currentParts.core[i] ?? 0);
     if (diff !== 0) return diff > 0;
   }
-  return false;
+  // Same core: a stable release outranks a prerelease.
+  return !latestParts.prerelease && currentParts.prerelease;
 };
 
 const pickInstallerAsset = (assets: GitHubReleaseAsset[]): UpdateInstaller | null => {
@@ -471,6 +472,9 @@ export async function checkForUpdate(signal?: AbortSignal): Promise<UpdateCheckR
 }
 
 export async function installDesktopUpdate(installer: UpdateInstaller): Promise<void> {
+  if (!installer.sha256) {
+    throw new Error("Release asset has no integrity digest — download it manually instead.");
+  }
   const { invoke } = await import("@tauri-apps/api/core");
   await invoke("install_update", {
     downloadUrl: installer.url,
