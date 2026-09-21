@@ -1,0 +1,22 @@
+name: Auto-request reviewer
+
+on:
+  pull_request:
+    branches:
+      - main
+    types: [opened, reopened, ready_for_review]
+
+permissions:
+  pull-requests: write
+
+jobs:
+  request-reviewer:
+    # GitHub rejects requesting a review from the PR author.
+    if: github.event.pull_request.user.login != 'mrn1522'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Request review from mrn1522
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: gh api "repos/$GITHUB_REPOSITORY/pulls/$PR_NUMBER/requested_reviewers" -X POST -f "reviewers[]=mrn1522"
