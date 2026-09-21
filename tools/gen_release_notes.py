@@ -80,6 +80,15 @@ def render(tag: str, slug: str, prev: str | None) -> str:
     """Build the patch-notes markdown for commits in the prev..tag range."""
     rng = f"{prev}..{tag}" if prev else tag
     subjects = git("log", rng, "--pretty=%s").splitlines()
+    # Squash-merged release PRs collapse the range into one commit whose body
+    # lists the squashed changes as `* subject (#N)` bullets — pull those in
+    # (fixup commits inside PRs lack the (#N) suffix and are skipped).
+    seen = {s.strip() for s in subjects}
+    for line in git("log", "-1", tag, "--format=%B").splitlines():
+        if b := re.match(r"^\s*\*\s+(.+\(#\d+\))\s*$", line):
+            if b.group(1).strip() not in seen:
+                seen.add(b.group(1).strip())
+                subjects.append(b.group(1).strip())
 
     grouped: dict[str, list[str]] = {}
     order: list[str] = []
