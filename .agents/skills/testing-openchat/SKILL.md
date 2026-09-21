@@ -26,4 +26,4 @@ None for configuration persistence tests: use a clearly fake API key. Real model
 
 ## Clicking small UI targets
 - The desktop is typically 1600x1200 while the computer tool uses 1024x768 (1.5625 scale); screenshots show real pixels, so eyeballing icon positions can miss small targets like the 34px rail buttons by a few px.
-- For precise clicks, query `el.getBoundingClientRect()` via the browser console, then convert: tool_x = real_cx / 1.5625, tool_y = (real_cy + browser-chrome-height) / 1.5625. Browser chrome ≈ (window height − innerHeight); get window geometry via `wmctrl -lG` or `xdotool getactivewindow getwindowgeometry`. Verify scale with `xrandr` if clicks still miss.
+- For precise clicks, query `el.getBoundingClientRect()` via the browser console (returns viewport-relative coords), then convert: `tool_x = (window_x + real_cx) / scale`, `tool_y = (window_y + browser_chrome_height + real_cy) / scale`. Browser chrome ≈ (window height − innerHeight); get window origin and size via `wmctrl -lG` or `xdotool getactivewindow getwindowgeometry`, and the detected scale with `xrandr` instead of hardcoding 1.5625.

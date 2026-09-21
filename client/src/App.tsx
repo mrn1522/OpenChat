@@ -646,7 +646,14 @@ function App() {
         if (!isActive) return;
         setAppSettings(loaded);
         setBaseUrlInput(loaded.base_url);
-        if (!loaded.api_key_configured) setIsAppSettingsOpen(true);
+        if (!loaded.api_key_configured) {
+          const railButton = document.querySelector<HTMLElement>(".rail-settings-btn");
+          appSettingsOpenerRef.current =
+            railButton && railButton.getClientRects().length > 0
+              ? railButton
+              : document.querySelector<HTMLElement>(".mobile-settings-btn");
+          setIsAppSettingsOpen(true);
+        }
       } catch (err) {
         if (!isActive) return;
         if (attempt < 10) {
