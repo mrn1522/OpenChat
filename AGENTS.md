@@ -33,7 +33,7 @@ Otherwise, completely ignore this rule.
 
 ### ACTIVATION CONDITION
 
-Apply when creating or updating a pull request in this repository.
+Apply when creating, updating, or merging a pull request in this repository.
 
 ### BEHAVIOR
 
