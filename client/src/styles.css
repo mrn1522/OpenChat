@@ -96,6 +96,9 @@ body {
   flex-direction: column;
   justify-content: flex-start;
   align-items: center;
+  align-self: end;
+  position: sticky;
+  bottom: 16px;
   padding: 10px 8px;
   gap: 12px;
   border: 1px solid var(--panel-edge);
