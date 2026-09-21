@@ -408,17 +408,21 @@ type GitHubRelease = {
   assets: GitHubReleaseAsset[];
 };
 
-const parseVersion = (version: string): { core: number[]; prerelease: boolean } => {
+const parseVersion = (
+  version: string
+): { core: number[]; prerelease: boolean } | null => {
   const [core, suffix] = version.trim().replace(/^v/i, "").split("-", 2);
+  if (!/^\d+(\.\d+)*$/.test(core)) return null;
   return {
-    core: core.split(".").map((part) => Number.parseInt(part, 10) || 0),
+    core: core.split(".").map(Number),
     prerelease: suffix !== undefined && suffix.length > 0,
   };
 };
 
-export const isNewerVersion = (latest: string, current: string): boolean => {
+export const isNewerVersion = (latest: string, current: string): boolean | null => {
   const latestParts = parseVersion(latest);
   const currentParts = parseVersion(current);
+  if (!latestParts || !currentParts) return null;
   const length = Math.max(latestParts.core.length, currentParts.core.length);
   for (let i = 0; i < length; i += 1) {
     const diff = (latestParts.core[i] ?? 0) - (currentParts.core[i] ?? 0);
@@ -460,8 +464,14 @@ export async function checkForUpdate(signal?: AbortSignal): Promise<UpdateCheckR
 
   const release = (await response.json()) as GitHubRelease;
   const latestVersion = release.tag_name.replace(/^v/i, "");
+  const comparison = isNewerVersion(latestVersion, currentVersion);
+  if (comparison === null) {
+    throw new Error(
+      `Cannot compare release tag "${release.tag_name}" against version ${currentVersion}.`
+    );
+  }
   return {
-    status: isNewerVersion(latestVersion, currentVersion) ? "available" : "up-to-date",
+    status: comparison ? "available" : "up-to-date",
     currentVersion,
     latestVersion,
     tagName: release.tag_name,

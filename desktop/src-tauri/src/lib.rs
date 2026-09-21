@@ -95,8 +95,10 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
     }
 }
 
-// Release downloads come from github.com and redirect to GitHub's CDN hosts.
-const DOWNLOAD_HOST_SUFFIXES: &[&str] = &["github.com", "githubusercontent.com"];
+// Release downloads start on github.com under this repo's release path and
+// redirect to GitHub's CDN hosts.
+const RELEASE_DOWNLOAD_PREFIX: &str = "/mrn1522/openchat/releases/download/";
+const REDIRECT_HOST_SUFFIXES: &[&str] = &["github.com", "githubusercontent.com"];
 
 fn download_host_allowed(url: &reqwest::Url) -> bool {
     if url.scheme() != "https" {
@@ -105,7 +107,7 @@ fn download_host_allowed(url: &reqwest::Url) -> bool {
     let Some(host) = url.host_str() else {
         return false;
     };
-    DOWNLOAD_HOST_SUFFIXES
+    REDIRECT_HOST_SUFFIXES
         .iter()
         .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
 }
@@ -117,8 +119,14 @@ fn download_installer(
 ) -> Result<PathBuf, String> {
     let url = reqwest::Url::parse(download_url)
         .map_err(|e| format!("Invalid installer URL: {e}"))?;
-    if !download_host_allowed(&url) {
-        return Err("Installer URL must be an https GitHub release asset.".to_string());
+    let initial_allowed = url.scheme() == "https"
+        && url.host_str() == Some("github.com")
+        && url
+            .path()
+            .to_lowercase()
+            .starts_with(RELEASE_DOWNLOAD_PREFIX);
+    if !initial_allowed {
+        return Err("Installer URL must be an https OpenChat release asset on github.com.".to_string());
     }
 
     let client = reqwest::blocking::Client::builder()
@@ -144,8 +152,11 @@ fn download_installer(
     {
         let mut file = std::fs::File::create(&dest)
             .map_err(|e| format!("Cannot write installer to {}: {e}", dest.display()))?;
-        std::io::copy(&mut response, &mut file)
-            .map_err(|e| format!("Installer download failed: {e}"))?;
+        if let Err(e) = std::io::copy(&mut response, &mut file) {
+            drop(file);
+            let _ = std::fs::remove_file(&dest);
+            return Err(format!("Installer download failed: {e}"));
+        }
     }
 
     verify_sha256(&dest, expected_sha256)?;
