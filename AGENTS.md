@@ -31,6 +31,10 @@ Otherwise, completely ignore this rule.
 
 ## Rule: Branch & Review Flow (develop -> main)
 
+### ACTIVATION CONDITION
+
+Apply when creating or updating a pull request in this repository.
+
 ### BEHAVIOR
 
 - Feature/improvement PRs target `develop`. CodeRabbit and Devin Review auto-review every push; fix findings in follow-up commits — the review/fix loop on develop is expected and free (no CI build runs).
