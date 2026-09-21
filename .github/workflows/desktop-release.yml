@@ -14,6 +14,10 @@ jobs:
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history + tags are needed to diff against the previous release tag
+          # when generating patch notes.
+          fetch-depth: 0
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -64,3 +68,11 @@ jobs:
           releaseName: OpenChat ${{ github.ref_name }}
           releaseDraft: false
           prerelease: false
+      - name: Write patch notes to release
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python tools/gen_release_notes.py "${{ github.ref_name }}" --out patch-notes.md
+          gh release edit "${{ github.ref_name }}" --repo ${{ github.repository }} --notes-file patch-notes.md
