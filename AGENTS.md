@@ -37,12 +37,12 @@ Apply when creating, updating, or merging a pull request in this repository.
 
 ### BEHAVIOR
 
-- Feature/improvement PRs target `develop`. CodeRabbit and Devin Review auto-review every push; fix findings in follow-up commits — the review/fix loop on develop is expected and free (no CI build runs).
+- Feature/improvement PRs target `develop`. CodeRabbit and Devin Review auto-review every push; fix findings in fixup commits on the same PR — the review/fix loop on develop is expected and free (no CI build runs).
 - Develop PR merge gating (branch protection enforces this): `client-check`, `server-tests`, `CodeRabbit`, and `Devin Review` are required checks, and all review threads must be resolved before merge.
   1. Do NOT arm `gh pr merge --auto` on develop PRs — it fires the moment checks pass, before findings are triaged.
   2. Wait for the CodeRabbit and Devin Review checks to complete, then triage every inline finding: push a fix commit for real bugs, or reply + resolve threads you intentionally skip (stylistic nitpicks, out-of-scope suggestions).
   3. Each push re-triggers both reviewers — repeat until a pass comes back clean or with only intentionally-skipped threads, all resolved.
-  4. Merge only then: `gh pr merge <n> --repo mrn1522/OpenChat --squash --delete-branch` (no `--auto`).
+  4. Merge only then: `GH_TOKEN="$GITHUB_PAT_OPENCHAT" /usr/bin/gh pr merge <n> --repo mrn1522/OpenChat --squash --delete-branch` (no `--auto`).
 - `develop` -> `main` merge PRs are **single-pass** — neither bot supports per-base-branch policies, so enforce it per PR:
   1. Open the PR as a **draft** and include `@coderabbitai ignore` in the description so CodeRabbit does not auto-review each push.
   2. Resolve outstanding feedback while the PR is a draft; the desktop build never runs in draft.
