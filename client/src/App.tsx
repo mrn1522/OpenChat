@@ -1962,7 +1962,6 @@ function App() {
       )}
 
       <aside className="sidebar-rail">
-        <div className="rail-brand">M</div>
         <button type="button" className="rail-new-chat-btn" onClick={handleStartNewChat} aria-label="Start new chat">
           <img src={squarePenIcon} alt="" aria-hidden="true" className="ui-icon rail-new-chat-icon" />
         </button>
@@ -1977,13 +1976,6 @@ function App() {
         >
           <img src={messageSquareIcon} alt="" aria-hidden="true" className="ui-icon rail-direct-icon" />
         </button>
-        <div className="rail-stack">
-          <span>◻</span>
-          <span>◉</span>
-          <span>◌</span>
-          <span>⌁</span>
-          <span>⚙</span>
-        </div>
         <button
           type="button"
           className={`rail-history-btn${activePage === "history" ? " active" : ""}`}
@@ -1992,7 +1984,6 @@ function App() {
         >
           <img src={historyIcon} alt="" aria-hidden="true" className="ui-icon rail-history-icon" />
         </button>
-        <div className="rail-user">JD</div>
       </aside>
 
       <main className="main-column">
