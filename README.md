@@ -16,6 +16,29 @@ OpenChat is a sleek native chat interface for multi-LLM orchestration:
 - `client/`: React + Vite + TypeScript frontend.
 - `server/`: FastAPI proxy that fans out requests and streams events.
 
+## Desktop app (Windows 11)
+
+Download the latest Windows installer from the [GitHub Releases](../../releases) page. Release tags must use semantic versions such as `v1.2.3`. On first launch, OpenChat opens a **Connect OpenRouter** panel for your API key. The key is stored in the desktop app data directory, not returned to the client or included in logs. You can reopen the panel from the **API key** row in the composer settings popover.
+
+OpenChat stores desktop data in `%APPDATA%\com.openchat.desktop`, the Windows app-data directory produced by Tauri for the `com.openchat.desktop` identifier. This includes the local settings `.env` file and chat history database.
+
+### Building the desktop app locally
+
+On Windows with Node.js 20, Python 3.12, Rust, and the Tauri prerequisites installed:
+
+```powershell
+cd OpenChat
+python -m venv server\.venv
+server\.venv\Scripts\pip install -r server\requirements-desktop.txt
+server\.venv\Scripts\pyinstaller server\openchat_server.spec
+Copy-Item server\dist\openchat-server.exe desktop\src-tauri\binaries\openchat-server-x86_64-pc-windows-msvc.exe
+npm ci --prefix client
+npm ci --prefix desktop
+npm run build --prefix desktop
+```
+
+For development, run `npm run dev --prefix desktop`; the Tauri shell starts the client dev server and launches a local FastAPI sidecar.
+
 ## Quick Start
 
 ### 1) Backend
@@ -42,6 +65,7 @@ Frontend runs at `http://localhost:5173` and backend at `http://localhost:8000`.
 ## Notes
 
 - `OPENAI_BASE_URL` defaults to OpenRouter-compatible API format.
+- `CORS_ALLOW_ORIGINS` defaults to `http://localhost:5173,http://tauri.localhost,tauri://localhost`.
 - Source model failures are isolated and surfaced per model.
 - Streamed server events update the UI in sequence: source outputs -> judge analysis -> final synthesis.
 - Auto-Optimize now performs a pre-send prompt rewrite pass through `openai/gpt-oss-20b` with reasoning disabled, then pauses for user confirmation.

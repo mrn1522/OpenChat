@@ -1,6 +1,8 @@
 import type {
   ChatHistoryDetail,
   ChatHistoryListResponse,
+  AppSettings,
+  AppSettingsUpdate,
   DirectChatRequest,
   DirectChatStreamEvent,
   FusionRegenerateRequest,
@@ -18,8 +20,16 @@ import type {
   SavedWorkflow,
 } from "./types";
 
-const API_BASE =
-  import.meta.env.VITE_OPENCHAT_API_BASE ?? "http://localhost:8000";
+let apiBasePromise: Promise<string> | undefined;
+
+const getApiBase = (): Promise<string> => {
+  if (!apiBasePromise) {
+    apiBasePromise = "window" in globalThis && "__TAURI_INTERNALS__" in window
+      ? import("@tauri-apps/api/core").then(({ invoke }) => invoke<string>("api_base"))
+      : Promise.resolve(import.meta.env.VITE_OPENCHAT_API_BASE ?? "http://localhost:8000");
+  }
+  return apiBasePromise;
+};
 
 const extractErrorMessage = async (response: Response): Promise<string> => {
   const text = await response.text();
@@ -40,7 +50,8 @@ export async function streamRun(
   onEvent: (event: StreamEvent) => void,
   signal?: AbortSignal
 ): Promise<void> {
-  const response = await fetch(`${API_BASE}/api/run/stream`, {
+  const base = await getApiBase();
+  const response = await fetch(`${base}/api/run/stream`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -96,7 +107,8 @@ export async function streamDirectChat(
   onEvent: (event: DirectChatStreamEvent) => void,
   signal?: AbortSignal
 ): Promise<void> {
-  const response = await fetch(`${API_BASE}/api/direct-chat/stream`, {
+  const base = await getApiBase();
+  const response = await fetch(`${base}/api/direct-chat/stream`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -151,7 +163,8 @@ export async function regenerateFusion(
   payload: FusionRegenerateRequest,
   signal?: AbortSignal
 ): Promise<FusionRegenerateResponse> {
-  const response = await fetch(`${API_BASE}/api/fusion/regenerate`, {
+  const base = await getApiBase();
+  const response = await fetch(`${base}/api/fusion/regenerate`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -168,7 +181,8 @@ export async function regenerateFusion(
 }
 
 export async function fetchModels(signal?: AbortSignal): Promise<OpenRouterModel[]> {
-  const response = await fetch(`${API_BASE}/api/models`, {
+  const base = await getApiBase();
+  const response = await fetch(`${base}/api/models`, {
     method: "GET",
     headers: {
       "Content-Type": "application/json",
@@ -188,7 +202,8 @@ export async function optimizePrompt(
   payload: PromptOptimizeRequest,
   signal?: AbortSignal
 ): Promise<PromptOptimizeResponse> {
-  const response = await fetch(`${API_BASE}/api/prompt/optimize`, {
+  const base = await getApiBase();
+  const response = await fetch(`${base}/api/prompt/optimize`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -208,7 +223,8 @@ export async function previewPersonas(
   payload: PersonaPreviewRequest,
   signal?: AbortSignal
 ): Promise<PersonaPreviewResponse> {
-  const response = await fetch(`${API_BASE}/api/personas/preview`, {
+  const base = await getApiBase();
+  const response = await fetch(`${base}/api/personas/preview`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -225,7 +241,8 @@ export async function previewPersonas(
 }
 
 export async function fetchChatHistory(signal?: AbortSignal): Promise<ChatHistoryListResponse> {
-  const response = await fetch(`${API_BASE}/api/chats`, {
+  const base = await getApiBase();
+  const response = await fetch(`${base}/api/chats`, {
     method: "GET",
     headers: {
       "Content-Type": "application/json",
@@ -241,7 +258,8 @@ export async function fetchChatHistory(signal?: AbortSignal): Promise<ChatHistor
 }
 
 export async function fetchChatHistoryDetail(chatId: string, signal?: AbortSignal): Promise<ChatHistoryDetail> {
-  const response = await fetch(`${API_BASE}/api/chats/${encodeURIComponent(chatId)}`, {
+  const base = await getApiBase();
+  const response = await fetch(`${base}/api/chats/${encodeURIComponent(chatId)}`, {
     method: "GET",
     headers: {
       "Content-Type": "application/json",
@@ -257,7 +275,8 @@ export async function fetchChatHistoryDetail(chatId: string, signal?: AbortSigna
 }
 
 export async function deleteChatHistory(chatId: string, signal?: AbortSignal): Promise<void> {
-  const response = await fetch(`${API_BASE}/api/chats/${encodeURIComponent(chatId)}`, {
+  const base = await getApiBase();
+  const response = await fetch(`${base}/api/chats/${encodeURIComponent(chatId)}`, {
     method: "DELETE",
     headers: {
       "Content-Type": "application/json",
@@ -271,7 +290,8 @@ export async function deleteChatHistory(chatId: string, signal?: AbortSignal): P
 }
 
 export async function fetchWorkflows(signal?: AbortSignal): Promise<WorkflowListResponse> {
-  const response = await fetch(`${API_BASE}/api/workflows`, {
+  const base = await getApiBase();
+  const response = await fetch(`${base}/api/workflows`, {
     method: "GET",
     headers: {
       "Content-Type": "application/json",
@@ -287,7 +307,8 @@ export async function fetchWorkflows(signal?: AbortSignal): Promise<WorkflowList
 }
 
 export async function createWorkflow(payload: WorkflowCreateRequest, signal?: AbortSignal): Promise<SavedWorkflow> {
-  const response = await fetch(`${API_BASE}/api/workflows`, {
+  const base = await getApiBase();
+  const response = await fetch(`${base}/api/workflows`, {
     method: "POST",
     headers: {
       "Content-Type": "application/json",
@@ -304,7 +325,8 @@ export async function createWorkflow(payload: WorkflowCreateRequest, signal?: Ab
 }
 
 export async function deleteWorkflow(workflowId: string, signal?: AbortSignal): Promise<void> {
-  const response = await fetch(`${API_BASE}/api/workflows/${encodeURIComponent(workflowId)}`, {
+  const base = await getApiBase();
+  const response = await fetch(`${base}/api/workflows/${encodeURIComponent(workflowId)}`, {
     method: "DELETE",
     headers: {
       "Content-Type": "application/json",
@@ -315,4 +337,38 @@ export async function deleteWorkflow(workflowId: string, signal?: AbortSignal): 
   if (!response.ok) {
     throw new Error(await extractErrorMessage(response));
   }
+}
+
+export async function getSettings(signal?: AbortSignal): Promise<AppSettings> {
+  const base = await getApiBase();
+  const response = await fetch(`${base}/api/settings`, {
+    method: "GET",
+    headers: { "Content-Type": "application/json" },
+    signal,
+  });
+
+  if (!response.ok) {
+    throw new Error(await extractErrorMessage(response));
+  }
+
+  return (await response.json()) as AppSettings;
+}
+
+export async function updateSettings(
+  payload: AppSettingsUpdate,
+  signal?: AbortSignal
+): Promise<AppSettings> {
+  const base = await getApiBase();
+  const response = await fetch(`${base}/api/settings`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(payload),
+    signal,
+  });
+
+  if (!response.ok) {
+    throw new Error(await extractErrorMessage(response));
+  }
+
+  return (await response.json()) as AppSettings;
 }

@@ -1,0 +1,66 @@
+name: Desktop release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: |
+            client/package-lock.json
+            desktop/package-lock.json
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: desktop/src-tauri
+      - name: Build FastAPI sidecar
+        shell: pwsh
+        run: |
+          python -m pip install -r server/requirements-desktop.txt
+          Push-Location server
+          pyinstaller openchat_server.spec
+          Pop-Location
+          Copy-Item server/dist/openchat-server.exe desktop/src-tauri/binaries/openchat-server-x86_64-pc-windows-msvc.exe
+      - name: Install client and desktop dependencies
+        run: |
+          npm ci --prefix client
+          npm ci --prefix desktop
+      - name: Set release version from tag
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          $configPath = "desktop/src-tauri/tauri.conf.json"
+          $config = Get-Content $configPath -Raw | ConvertFrom-Json
+          $config.version = $v
+          $config | ConvertTo-Json -Depth 10 | Set-Content $configPath
+          $cargoPath = "desktop/src-tauri/Cargo.toml"
+          $cargo = Get-Content $cargoPath -Raw
+          $cargo = [regex]::Replace($cargo, '(?m)^version = ".*"$', "version = `"$v`"", 1)
+          Set-Content $cargoPath $cargo
+          Write-Output "Building OpenChat version $v"
+      - name: Build and publish installer
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: desktop
+          tagName: ${{ github.ref_name }}
+          releaseName: OpenChat ${{ github.ref_name }}
+          releaseDraft: false
+          prerelease: false

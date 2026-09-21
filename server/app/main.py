@@ -1,10 +1,12 @@
 import asyncio
 import json
+import os
 import time
 import uuid
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, Literal
 
 import httpx
@@ -23,7 +25,7 @@ from app.chat_store import (
     save_chat_record,
     save_workflow_record,
 )
-from app.config import settings
+from app.config import reload_settings, settings, settings_env_file
 from app.llm import (
     build_client,
     fetch_openrouter_models,
@@ -45,6 +47,8 @@ from app.models import (
     PromptOptimizeRequest,
     PromptOptimizeResponse,
     RunRequest,
+    SettingsResponse,
+    SettingsUpdateRequest,
     SourceAgentSpec,
     SynthesisResult,
     SourceResult,
@@ -282,7 +286,76 @@ def _build_synthesis_error_message(exc: BaseException, *, stage: str, model: str
 
 @app.get("/health")
 async def health() -> dict:
-    return {"ok": True, "env": settings.app_env}
+    return {
+        "ok": True,
+        "env": settings.app_env,
+        "api_key_configured": bool(settings.openai_api_key.strip()),
+    }
+
+
+def _upsert_env_values(path: Path, values: dict[str, str | None]) -> None:
+    existing = path.read_text(encoding="utf-8").splitlines() if path.exists() else []
+    updated: list[str] = []
+    remaining = set(values)
+    for line in existing:
+        stripped = line.strip()
+        key = stripped.split("=", 1)[0].strip() if stripped and not stripped.startswith("#") else ""
+        if key in values:
+            value = values[key]
+            if value is not None:
+                updated.append(f"{key}={value}")
+            remaining.discard(key)
+        else:
+            updated.append(line)
+
+    for key in values:
+        if key not in remaining:
+            continue
+        value = values[key]
+        if value is not None:
+            updated.append(f"{key}={value}")
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(updated) + ("\n" if updated else ""), encoding="utf-8")
+    if os.name != "nt":
+        os.chmod(path, 0o600)
+
+
+def _settings_response() -> SettingsResponse:
+    api_key = settings.openai_api_key.strip()
+    api_key_hint = None
+    if api_key:
+        api_key_hint = f"{api_key[:6]}…{api_key[-4:]}" if len(api_key) > 10 else "configured"
+    return SettingsResponse(
+        api_key_configured=bool(api_key),
+        api_key_hint=api_key_hint,
+        base_url=settings.openai_base_url,
+    )
+
+
+@app.get("/api/settings", response_model=SettingsResponse)
+async def get_settings() -> SettingsResponse:
+    return _settings_response()
+
+
+@app.put("/api/settings", response_model=SettingsResponse)
+async def update_settings(request: SettingsUpdateRequest) -> SettingsResponse:
+    values: dict[str, str | None] = {}
+    if request.api_key is not None:
+        values["OPENAI_API_KEY"] = request.api_key.strip() or None
+    if request.base_url is not None:
+        values["OPENAI_BASE_URL"] = request.base_url.strip() or None
+
+    if values:
+        _upsert_env_values(settings_env_file(), values)
+        for key, value in values.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+        reload_settings()
+
+    return _settings_response()
 
 
 @app.post("/api/run/stream")

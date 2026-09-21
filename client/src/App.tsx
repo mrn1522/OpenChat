@@ -48,13 +48,17 @@ import {
   fetchChatHistoryDetail,
   fetchModels,
   fetchWorkflows,
+  getSettings,
   optimizePrompt,
   previewPersonas,
   regenerateFusion,
   streamDirectChat,
   streamRun,
+  updateSettings,
 } from "./api";
 import type {
+  AppSettings,
+  AppSettingsUpdate,
   AttachmentInput,
   ChatHistoryDetail,
   ChatHistorySummary,
@@ -451,6 +455,12 @@ function App() {
   const [personaEnabled, setPersonaEnabled] = useState(false);
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
+  const [isApiSettingsOpen, setIsApiSettingsOpen] = useState(false);
+  const [apiKeyInput, setApiKeyInput] = useState("");
+  const [baseUrlInput, setBaseUrlInput] = useState("");
+  const [isSavingApiSettings, setIsSavingApiSettings] = useState(false);
+  const [apiSettingsError, setApiSettingsError] = useState<string | null>(null);
   const [activeMode, setActiveMode] = useState<string>("custom");
   const [autoOptimizeEnabled, setAutoOptimizeEnabled] = useState(false);
   const [isOptimizingPrompt, setIsOptimizingPrompt] = useState(false);
@@ -512,6 +522,66 @@ function App() {
   const directSettingsRef = useRef<HTMLDivElement | null>(null);
   const directStreamControllerRef = useRef<AbortController | null>(null);
   const directRequestIdRef = useRef(0);
+
+  const openApiSettings = () => {
+    setApiKeyInput("");
+    setBaseUrlInput(appSettings?.base_url ?? "https://openrouter.ai/api/v1");
+    setApiSettingsError(null);
+    setIsApiSettingsOpen(true);
+  };
+
+  const saveApiSettings = async () => {
+    if (isSavingApiSettings) return;
+    if (!apiKeyInput.trim() && !appSettings?.api_key_configured) {
+      setApiSettingsError("Enter an OpenRouter API key to connect.");
+      return;
+    }
+
+    setIsSavingApiSettings(true);
+    setApiSettingsError(null);
+    try {
+      const payload: AppSettingsUpdate = {
+        api_key: apiKeyInput.trim() || null,
+        base_url: baseUrlInput.trim() || null,
+      };
+      const updated = await updateSettings(payload);
+      setAppSettings(updated);
+      setIsApiSettingsOpen(false);
+      setApiKeyInput("");
+    } catch (err) {
+      setApiSettingsError(err instanceof Error ? err.message : "Failed to save API settings.");
+    } finally {
+      setIsSavingApiSettings(false);
+    }
+  };
+
+  useEffect(() => {
+    let isActive = true;
+    let retryTimer: number | undefined;
+
+    const loadSettings = async (attempt: number) => {
+      try {
+        const loaded = await getSettings();
+        if (!isActive) return;
+        setAppSettings(loaded);
+        setBaseUrlInput(loaded.base_url);
+        if (!loaded.api_key_configured) setIsApiSettingsOpen(true);
+      } catch (err) {
+        if (!isActive) return;
+        if (attempt < 10) {
+          retryTimer = window.setTimeout(() => void loadSettings(attempt + 1), 500);
+        } else {
+          setApiSettingsError(err instanceof Error ? err.message : "Unable to reach the OpenChat server.");
+        }
+      }
+    };
+
+    void loadSettings(1);
+    return () => {
+      isActive = false;
+      if (retryTimer !== undefined) window.clearTimeout(retryTimer);
+    };
+  }, []);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -1826,6 +1896,57 @@ function App() {
     <div className="app-shell">
       <div className="bg-lights" aria-hidden="true" />
 
+      {isApiSettingsOpen && (
+        <div className="api-settings-overlay" role="presentation">
+          <section className="api-settings-panel" role="dialog" aria-modal="true" aria-labelledby="api-settings-title">
+            <div className="api-settings-header">
+              <div>
+                <p className="eyebrow">OpenChat connection</p>
+                <h2 id="api-settings-title">Connect OpenRouter</h2>
+              </div>
+              {appSettings?.api_key_configured && (
+                <button type="button" className="api-settings-close" onClick={() => setIsApiSettingsOpen(false)} aria-label="Close">
+                  ×
+                </button>
+              )}
+            </div>
+            <p className="api-settings-copy">
+              Add your OpenRouter API key to use model fusion. It is stored locally in the app data folder.
+            </p>
+            <label className="api-settings-field">
+              <span>API key</span>
+              <input
+                type="password"
+                value={apiKeyInput}
+                onChange={(event) => setApiKeyInput(event.target.value)}
+                placeholder={appSettings?.api_key_hint ?? "sk-or-..."}
+                autoFocus
+              />
+            </label>
+            <label className="api-settings-field">
+              <span>Base URL <small>(optional)</small></span>
+              <input
+                type="url"
+                value={baseUrlInput}
+                onChange={(event) => setBaseUrlInput(event.target.value)}
+                placeholder="https://openrouter.ai/api/v1"
+              />
+            </label>
+            {apiSettingsError && <p className="error">{apiSettingsError}</p>}
+            <div className="api-settings-actions">
+              {appSettings?.api_key_configured && (
+                <button type="button" className="subtle-btn" onClick={() => setIsApiSettingsOpen(false)}>
+                  Cancel
+                </button>
+              )}
+              <button type="button" className="send-btn" onClick={() => void saveApiSettings()} disabled={isSavingApiSettings}>
+                {isSavingApiSettings ? "Saving..." : "Save"}
+              </button>
+            </div>
+          </section>
+        </div>
+      )}
+
       <aside className="sidebar-rail">
         <div className="rail-brand">M</div>
         <button type="button" className="rail-new-chat-btn" onClick={handleStartNewChat} aria-label="Start new chat">
@@ -2296,6 +2417,10 @@ function App() {
                         onChange={(event) => setPersonaEnabled(event.target.checked)}
                       />
                     </label>
+                    <button type="button" className="settings-api-key-row" onClick={openApiSettings}>
+                      <span>API key</span>
+                      <span>{appSettings?.api_key_configured ? appSettings.api_key_hint : "Not configured"} →</span>
+                    </button>
                   </div>
                 )}
               </div>

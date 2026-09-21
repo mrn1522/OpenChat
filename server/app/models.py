@@ -8,6 +8,17 @@ class ReasoningConfig(BaseModel):
     exclude: bool = False
 
 
+class SettingsResponse(BaseModel):
+    api_key_configured: bool
+    api_key_hint: str | None
+    base_url: str
+
+
+class SettingsUpdateRequest(BaseModel):
+    api_key: str | None = None
+    base_url: str | None = None
+
+
 class AttachmentInput(BaseModel):
     name: str = Field(min_length=1, max_length=256)
     size: int = Field(ge=1, le=262144)

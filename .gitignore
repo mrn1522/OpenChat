@@ -10,6 +10,7 @@ __pycache__/
 .venv/
 venv/
 env/
+server/.venv-desktop/
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
@@ -26,6 +27,12 @@ dist/
 build/
 *.tsbuildinfo
 .vite/
+
+# ---- Tauri desktop binaries ----
+desktop/src-tauri/binaries/*
+!desktop/src-tauri/binaries/.gitkeep
+desktop/src-tauri/gen/
+desktop/src-tauri/target/
 
 # ---- Large binary assets ----
 client/src/assets/icons/deepspace.png
