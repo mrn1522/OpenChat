@@ -95,6 +95,12 @@ const readStoredTheme = (): ThemeMode => {
     return "dark";
   }
 };
+
+const visibleSettingsButton = (): HTMLElement | null => {
+  const railButton = document.querySelector<HTMLElement>(".rail-settings-btn");
+  if (railButton && railButton.getClientRects().length > 0) return railButton;
+  return document.querySelector<HTMLElement>(".mobile-settings-btn");
+};
 type ExperienceModeTab = {
   id: string;
   title: string;
@@ -606,8 +612,11 @@ function App() {
   useEffect(() => {
     if (!isAppSettingsOpen) return;
     return () => {
-      appSettingsOpenerRef.current?.focus();
+      const stored = appSettingsOpenerRef.current;
       appSettingsOpenerRef.current = null;
+      const target =
+        stored && stored.getClientRects().length > 0 ? stored : visibleSettingsButton();
+      target?.focus();
     };
   }, [isAppSettingsOpen]);
 
@@ -647,11 +656,7 @@ function App() {
         setAppSettings(loaded);
         setBaseUrlInput(loaded.base_url);
         if (!loaded.api_key_configured) {
-          const railButton = document.querySelector<HTMLElement>(".rail-settings-btn");
-          appSettingsOpenerRef.current =
-            railButton && railButton.getClientRects().length > 0
-              ? railButton
-              : document.querySelector<HTMLElement>(".mobile-settings-btn");
+          appSettingsOpenerRef.current = visibleSettingsButton();
           setIsAppSettingsOpen(true);
         }
       } catch (err) {
