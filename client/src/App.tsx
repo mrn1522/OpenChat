@@ -600,12 +600,16 @@ function App() {
       }
     };
     window.addEventListener("keydown", handleKeydown);
+    return () => window.removeEventListener("keydown", handleKeydown);
+  }, [isAppSettingsOpen, appSettings?.api_key_configured]);
+
+  useEffect(() => {
+    if (!isAppSettingsOpen) return;
     return () => {
-      window.removeEventListener("keydown", handleKeydown);
       appSettingsOpenerRef.current?.focus();
       appSettingsOpenerRef.current = null;
     };
-  }, [isAppSettingsOpen, appSettings?.api_key_configured]);
+  }, [isAppSettingsOpen]);
 
   const saveApiSettings = async () => {
     if (isSavingApiSettings) return;
