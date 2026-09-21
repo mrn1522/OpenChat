@@ -1,7 +1,10 @@
 name: Auto-request reviewer
 
 on:
-  pull_request:
+  # pull_request_target runs in the base-repo context, so GITHUB_TOKEN keeps
+  # pull-requests: write even for fork PRs. Safe here: this workflow never
+  # checks out or executes pull-request code.
+  pull_request_target:
     branches:
       - main
     types: [opened, reopened, ready_for_review]
