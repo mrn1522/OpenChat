@@ -44,6 +44,7 @@ import sunIcon from "./assets/icons/sun.svg";
 import waypointsIcon from "./assets/icons/waypoints.svg";
 import zapIcon from "./assets/icons/zap.svg";
 import {
+  checkForUpdate,
   createWorkflow,
   deleteWorkflow,
   deleteChatHistory,
@@ -53,6 +54,8 @@ import {
   fetchWorkflows,
   getAppVersion,
   getSettings,
+  installDesktopUpdate,
+  isDesktopApp,
   optimizePrompt,
   previewPersonas,
   regenerateFusion,
@@ -79,6 +82,8 @@ import type {
   SourceAgentSpec,
   SourceModelResult,
   StreamEvent,
+  UpdateInstaller,
+  UpdateState,
 } from "./types";
 
 type PickerKind = "source" | "fusion" | "direct";
@@ -458,6 +463,107 @@ const readAttachmentFile = async (file: File): Promise<ComposerAttachment | null
     content_type: file.type || "text/plain",
     content,
   };
+};
+
+const SettingsUpdateSection = ({ appVersion }: { appVersion: string | null }) => {
+  const [updateState, setUpdateState] = useState<UpdateState>({ kind: "idle" });
+
+  const runUpdateCheck = async () => {
+    if (updateState.kind === "checking" || updateState.kind === "installing") return;
+    setUpdateState({ kind: "checking" });
+    try {
+      const result = await checkForUpdate();
+      setUpdateState(
+        result.status === "available"
+          ? { kind: "available", result }
+          : { kind: "up-to-date", latestVersion: result.latestVersion }
+      );
+    } catch (err) {
+      setUpdateState({
+        kind: "error",
+        message: err instanceof Error ? err.message : "Update check failed.",
+      });
+    }
+  };
+
+  const runDesktopUpdate = async (installer: UpdateInstaller) => {
+    setUpdateState({ kind: "installing" });
+    try {
+      await installDesktopUpdate(installer);
+      setUpdateState({ kind: "launched" });
+    } catch (err) {
+      setUpdateState({
+        kind: "error",
+        message: err instanceof Error ? err.message : "Update install failed.",
+      });
+    }
+  };
+
+  const available = updateState.kind === "available" ? updateState.result : null;
+  const installer = available?.installer ?? null;
+
+  return (
+    <div className="settings-section">
+      <h3 className="settings-section-title">App updates</h3>
+      <p className="api-settings-copy">
+        {appVersion ? `You're running v${appVersion}. ` : ""}
+        Check GitHub for a newer release and install it without leaving the app.
+      </p>
+      <div className="update-controls">
+        <button
+          type="button"
+          className="subtle-btn"
+          onClick={() => void runUpdateCheck()}
+          disabled={updateState.kind === "checking" || updateState.kind === "installing"}
+        >
+          {updateState.kind === "checking" ? "Checking..." : "Check for updates"}
+        </button>
+        {updateState.kind === "up-to-date" && (
+          <span className="update-note ok">Latest version installed (v{updateState.latestVersion}).</span>
+        )}
+        {updateState.kind === "installing" && (
+          <span className="update-note">Downloading and launching the installer...</span>
+        )}
+        {updateState.kind === "launched" && (
+          <span className="update-note ok">Installer launched — OpenChat will close and reopen updated.</span>
+        )}
+        {updateState.kind === "error" && (
+          <span className="update-note error">{updateState.message}</span>
+        )}
+      </div>
+      {available && (
+        <div className="update-available">
+          <p className="update-note">
+            v{available.latestVersion} is available
+            {available.publishedAt &&
+              ` (released ${new Date(available.publishedAt).toLocaleDateString()})`}
+            {installer && ` — ${(installer.size / (1024 * 1024)).toFixed(0)} MB download`}
+          </p>
+          <div className="update-controls">
+            {isDesktopApp() && installer && (
+              <button
+                type="button"
+                className="send-btn"
+                onClick={() => void runDesktopUpdate(installer)}
+              >
+                Update now
+              </button>
+            )}
+            {!isDesktopApp() && installer && (
+              <a className="update-link" href={installer.url}>
+                Download installer
+              </a>
+            )}
+            {!isDesktopApp() && (
+              <a className="update-link" href={available.releaseUrl} target="_blank" rel="noreferrer">
+                View release
+              </a>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
 };
 
 function App() {
@@ -2068,6 +2174,8 @@ function App() {
                 />
               </label>
             </div>
+
+            <SettingsUpdateSection appVersion={appVersion} />
 
             {apiSettingsError && <p className="error">{apiSettingsError}</p>}
             <div className="api-settings-actions">

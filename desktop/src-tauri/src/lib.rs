@@ -1,13 +1,14 @@
 use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::Mutex,
     thread,
     time::Duration,
 };
 
-use tauri::{Manager, RunEvent, State};
+use sha2::{Digest, Sha256};
+use tauri::{AppHandle, Manager, RunEvent, State};
 use tauri_plugin_shell::{
     process::{CommandChild, CommandEvent},
     ShellExt,
@@ -58,6 +59,100 @@ fn health_check(port: u16) -> bool {
     response.starts_with("HTTP/1.1 200") || response.starts_with("HTTP/1.0 200")
 }
 
+fn sanitize_installer_name(file_name: &str) -> String {
+    let sanitized: String = file_name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let sanitized = sanitized.trim_matches('.').to_string();
+    if sanitized.is_empty() {
+        "openchat-setup.exe".to_string()
+    } else if sanitized.to_lowercase().ends_with(".exe") {
+        sanitized
+    } else {
+        format!("{sanitized}.exe")
+    }
+}
+
+fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|e| format!("Cannot read downloaded installer: {e}"))?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)
+        .map_err(|e| format!("Cannot hash downloaded installer: {e}"))?;
+    let actual = format!("{:x}", hasher.finalize());
+    if actual.eq_ignore_ascii_case(expected) {
+        Ok(())
+    } else {
+        let _ = std::fs::remove_file(path);
+        Err("Downloaded installer failed integrity verification.".to_string())
+    }
+}
+
+fn download_installer(
+    download_url: &str,
+    file_name: &str,
+    expected_sha256: Option<&str>,
+) -> Result<PathBuf, String> {
+    let client = reqwest::blocking::Client::builder()
+        .user_agent(concat!("openchat-desktop/", env!("CARGO_PKG_VERSION")))
+        .build()
+        .map_err(|e| format!("HTTP client init failed: {e}"))?;
+    let mut response = client
+        .get(download_url)
+        .send()
+        .and_then(|response| response.error_for_status())
+        .map_err(|e| format!("Installer download failed: {e}"))?;
+
+    let dest = std::env::temp_dir().join(sanitize_installer_name(file_name));
+    {
+        let mut file = std::fs::File::create(&dest)
+            .map_err(|e| format!("Cannot write installer to {}: {e}", dest.display()))?;
+        std::io::copy(&mut response, &mut file)
+            .map_err(|e| format!("Installer download failed: {e}"))?;
+    }
+
+    if let Some(expected) = expected_sha256 {
+        verify_sha256(&dest, expected)?;
+    }
+    Ok(dest)
+}
+
+#[tauri::command]
+async fn install_update(
+    app: AppHandle,
+    download_url: String,
+    sha256: Option<String>,
+    file_name: String,
+) -> Result<(), String> {
+    if !cfg!(windows) {
+        return Err("In-app updating is only supported on Windows.".to_string());
+    }
+    let installer = tauri::async_runtime::spawn_blocking(move || {
+        download_installer(&download_url, &file_name, sha256.as_deref())
+    })
+    .await
+    .map_err(|e| format!("Installer download failed: {e}"))??;
+
+    std::process::Command::new(&installer)
+        .spawn()
+        .map_err(|e| format!("Failed to launch the installer: {e}"))?;
+
+    // Give the IPC response a moment to reach the webview before quitting; the
+    // NSIS installer takes over from there and relaunches the app.
+    thread::spawn(move || {
+        thread::sleep(Duration::from_millis(400));
+        app.exit(0);
+    });
+    Ok(())
+}
+
 fn kill_sidecar(state: &SidecarState) {
     if let Ok(mut child) = state.0.lock() {
         if let Some(child) = child.take() {
@@ -70,7 +165,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
         .manage(SidecarState(Mutex::new(None)))
-        .invoke_handler(tauri::generate_handler![api_base])
+        .invoke_handler(tauri::generate_handler![api_base, install_update])
         .setup(|app| {
             let data_dir: PathBuf = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;

@@ -18,15 +18,20 @@ import type {
   WorkflowCreateRequest,
   WorkflowListResponse,
   SavedWorkflow,
+  UpdateCheckResult,
+  UpdateInstaller,
 } from "./types";
 
 import pkg from "../package.json";
+
+export const isDesktopApp = (): boolean =>
+  "window" in globalThis && "__TAURI_INTERNALS__" in window;
 
 let apiBasePromise: Promise<string> | undefined;
 
 const getApiBase = (): Promise<string> => {
   if (!apiBasePromise) {
-    apiBasePromise = "window" in globalThis && "__TAURI_INTERNALS__" in window
+    apiBasePromise = isDesktopApp()
       ? import("@tauri-apps/api/core").then(({ invoke }) => invoke<string>("api_base"))
       : Promise.resolve(import.meta.env.VITE_OPENCHAT_API_BASE ?? "http://localhost:8000");
   }
@@ -37,7 +42,7 @@ let appVersionPromise: Promise<string> | undefined;
 
 export const getAppVersion = (): Promise<string> => {
   if (!appVersionPromise) {
-    appVersionPromise = "window" in globalThis && "__TAURI_INTERNALS__" in window
+    appVersionPromise = isDesktopApp()
       ? import("@tauri-apps/api/app").then(({ getVersion }) => getVersion())
       : Promise.resolve(pkg.version);
   }
@@ -384,4 +389,92 @@ export async function updateSettings(
   }
 
   return (await response.json()) as AppSettings;
+}
+
+const LATEST_RELEASE_URL =
+  "https://api.github.com/repos/mrn1522/OpenChat/releases/latest";
+
+type GitHubReleaseAsset = {
+  name: string;
+  browser_download_url: string;
+  size: number;
+  digest?: string | null;
+};
+
+type GitHubRelease = {
+  tag_name: string;
+  html_url: string;
+  published_at: string | null;
+  assets: GitHubReleaseAsset[];
+};
+
+const versionParts = (version: string): number[] =>
+  version
+    .trim()
+    .replace(/^v/i, "")
+    .split("-")[0]
+    .split(".")
+    .map((part) => Number.parseInt(part, 10) || 0);
+
+export const isNewerVersion = (latest: string, current: string): boolean => {
+  const latestParts = versionParts(latest);
+  const currentParts = versionParts(current);
+  const length = Math.max(latestParts.length, currentParts.length);
+  for (let i = 0; i < length; i += 1) {
+    const diff = (latestParts[i] ?? 0) - (currentParts[i] ?? 0);
+    if (diff !== 0) return diff > 0;
+  }
+  return false;
+};
+
+const pickInstallerAsset = (assets: GitHubReleaseAsset[]): UpdateInstaller | null => {
+  const executables = assets.filter((asset) => /\.exe$/i.test(asset.name));
+  if (executables.length === 0) return null;
+  const installer =
+    executables.find((asset) => /setup|nsis/i.test(asset.name)) ?? executables[0];
+  const digest = installer.digest ?? "";
+  return {
+    name: installer.name,
+    url: installer.browser_download_url,
+    size: installer.size,
+    sha256: digest.toLowerCase().startsWith("sha256:") ? digest.slice(7) : null,
+  };
+};
+
+export async function checkForUpdate(signal?: AbortSignal): Promise<UpdateCheckResult> {
+  const currentVersion = await getAppVersion();
+  const response = await fetch(LATEST_RELEASE_URL, {
+    headers: { Accept: "application/vnd.github+json" },
+    signal,
+  });
+  if (response.status === 404) {
+    throw new Error("No published GitHub release found.");
+  }
+  if (response.status === 403 || response.status === 429) {
+    throw new Error("GitHub rate limit reached — try again later.");
+  }
+  if (!response.ok) {
+    throw new Error(`GitHub release check failed (HTTP ${response.status}).`);
+  }
+
+  const release = (await response.json()) as GitHubRelease;
+  const latestVersion = release.tag_name.replace(/^v/i, "");
+  return {
+    status: isNewerVersion(latestVersion, currentVersion) ? "available" : "up-to-date",
+    currentVersion,
+    latestVersion,
+    tagName: release.tag_name,
+    releaseUrl: release.html_url,
+    publishedAt: release.published_at,
+    installer: pickInstallerAsset(release.assets),
+  };
+}
+
+export async function installDesktopUpdate(installer: UpdateInstaller): Promise<void> {
+  const { invoke } = await import("@tauri-apps/api/core");
+  await invoke("install_update", {
+    downloadUrl: installer.url,
+    sha256: installer.sha256,
+    fileName: installer.name,
+  });
 }
