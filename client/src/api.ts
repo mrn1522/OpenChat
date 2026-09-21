@@ -20,6 +20,8 @@ import type {
   SavedWorkflow,
 } from "./types";
 
+import pkg from "../package.json";
+
 let apiBasePromise: Promise<string> | undefined;
 
 const getApiBase = (): Promise<string> => {
@@ -29,6 +31,17 @@ const getApiBase = (): Promise<string> => {
       : Promise.resolve(import.meta.env.VITE_OPENCHAT_API_BASE ?? "http://localhost:8000");
   }
   return apiBasePromise;
+};
+
+let appVersionPromise: Promise<string> | undefined;
+
+export const getAppVersion = (): Promise<string> => {
+  if (!appVersionPromise) {
+    appVersionPromise = "window" in globalThis && "__TAURI_INTERNALS__" in window
+      ? import("@tauri-apps/api/app").then(({ getVersion }) => getVersion())
+      : Promise.resolve(pkg.version);
+  }
+  return appVersionPromise;
 };
 
 const extractErrorMessage = async (response: Response): Promise<string> => {

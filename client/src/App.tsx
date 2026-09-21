@@ -48,6 +48,7 @@ import {
   fetchChatHistoryDetail,
   fetchModels,
   fetchWorkflows,
+  getAppVersion,
   getSettings,
   optimizePrompt,
   previewPersonas,
@@ -500,6 +501,7 @@ function App() {
   const [isHistoryLoading, setIsHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [historyBusyChatId, setHistoryBusyChatId] = useState<string | null>(null);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
 
   const [directPrompt, setDirectPrompt] = useState("");
   const [directModel, setDirectModel] = useState("");
@@ -522,6 +524,18 @@ function App() {
   const directSettingsRef = useRef<HTMLDivElement | null>(null);
   const directStreamControllerRef = useRef<AbortController | null>(null);
   const directRequestIdRef = useRef(0);
+
+  useEffect(() => {
+    let isActive = true;
+    getAppVersion()
+      .then((version) => {
+        if (isActive) setAppVersion(version);
+      })
+      .catch(() => {});
+    return () => {
+      isActive = false;
+    };
+  }, []);
 
   const openApiSettings = () => {
     setApiKeyInput("");
@@ -2879,6 +2893,8 @@ function App() {
           })}
         </section>
       </aside>}
+
+      {appVersion && <div className="app-version-badge">v{appVersion}</div>}
     </div>
   );
 }
