@@ -95,17 +95,47 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<(), String> {
     }
 }
 
+// Release downloads come from github.com and redirect to GitHub's CDN hosts.
+const DOWNLOAD_HOST_SUFFIXES: &[&str] = &["github.com", "githubusercontent.com"];
+
+fn download_host_allowed(url: &reqwest::Url) -> bool {
+    if url.scheme() != "https" {
+        return false;
+    }
+    let Some(host) = url.host_str() else {
+        return false;
+    };
+    DOWNLOAD_HOST_SUFFIXES
+        .iter()
+        .any(|suffix| host == *suffix || host.ends_with(&format!(".{suffix}")))
+}
+
 fn download_installer(
     download_url: &str,
     file_name: &str,
-    expected_sha256: Option<&str>,
+    expected_sha256: &str,
 ) -> Result<PathBuf, String> {
+    let url = reqwest::Url::parse(download_url)
+        .map_err(|e| format!("Invalid installer URL: {e}"))?;
+    if !download_host_allowed(&url) {
+        return Err("Installer URL must be an https GitHub release asset.".to_string());
+    }
+
     let client = reqwest::blocking::Client::builder()
         .user_agent(concat!("openchat-desktop/", env!("CARGO_PKG_VERSION")))
+        .connect_timeout(Duration::from_secs(15))
+        .timeout(Duration::from_secs(600))
+        .redirect(reqwest::redirect::Policy::custom(|attempt| {
+            if attempt.previous().len() < 5 && download_host_allowed(attempt.url()) {
+                attempt.follow()
+            } else {
+                attempt.stop()
+            }
+        }))
         .build()
         .map_err(|e| format!("HTTP client init failed: {e}"))?;
     let mut response = client
-        .get(download_url)
+        .get(url)
         .send()
         .and_then(|response| response.error_for_status())
         .map_err(|e| format!("Installer download failed: {e}"))?;
@@ -118,9 +148,7 @@ fn download_installer(
             .map_err(|e| format!("Installer download failed: {e}"))?;
     }
 
-    if let Some(expected) = expected_sha256 {
-        verify_sha256(&dest, expected)?;
-    }
+    verify_sha256(&dest, expected_sha256)?;
     Ok(dest)
 }
 
@@ -128,14 +156,18 @@ fn download_installer(
 async fn install_update(
     app: AppHandle,
     download_url: String,
-    sha256: Option<String>,
+    sha256: String,
     file_name: String,
 ) -> Result<(), String> {
     if !cfg!(windows) {
         return Err("In-app updating is only supported on Windows.".to_string());
     }
+    let expected = sha256.trim().to_lowercase();
+    if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err("Installer integrity digest is missing or invalid.".to_string());
+    }
     let installer = tauri::async_runtime::spawn_blocking(move || {
-        download_installer(&download_url, &file_name, sha256.as_deref())
+        download_installer(&download_url, &file_name, &expected)
     })
     .await
     .map_err(|e| format!("Installer download failed: {e}"))??;

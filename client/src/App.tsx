@@ -467,18 +467,31 @@ const readAttachmentFile = async (file: File): Promise<ComposerAttachment | null
 
 const SettingsUpdateSection = ({ appVersion }: { appVersion: string | null }) => {
   const [updateState, setUpdateState] = useState<UpdateState>({ kind: "idle" });
+  const checkAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(
+    () => () => {
+      checkAbortRef.current?.abort();
+    },
+    []
+  );
 
   const runUpdateCheck = async () => {
     if (updateState.kind === "checking" || updateState.kind === "installing") return;
+    checkAbortRef.current?.abort();
+    const controller = new AbortController();
+    checkAbortRef.current = controller;
     setUpdateState({ kind: "checking" });
     try {
-      const result = await checkForUpdate();
+      const result = await checkForUpdate(controller.signal);
+      if (controller.signal.aborted) return;
       setUpdateState(
         result.status === "available"
           ? { kind: "available", result }
           : { kind: "up-to-date", latestVersion: result.latestVersion }
       );
     } catch (err) {
+      if (controller.signal.aborted) return;
       setUpdateState({
         kind: "error",
         message: err instanceof Error ? err.message : "Update check failed.",
@@ -540,7 +553,7 @@ const SettingsUpdateSection = ({ appVersion }: { appVersion: string | null }) =>
             {installer && ` — ${(installer.size / (1024 * 1024)).toFixed(0)} MB download`}
           </p>
           <div className="update-controls">
-            {isDesktopApp() && installer && (
+            {isDesktopApp() && installer?.sha256 && (
               <button
                 type="button"
                 className="send-btn"
@@ -548,6 +561,11 @@ const SettingsUpdateSection = ({ appVersion }: { appVersion: string | null }) =>
               >
                 Update now
               </button>
+            )}
+            {isDesktopApp() && installer && !installer.sha256 && (
+              <span className="update-note">
+                Release asset has no integrity digest — get it from the GitHub release page instead.
+              </span>
             )}
             {!isDesktopApp() && installer && (
               <a className="update-link" href={installer.url}>
