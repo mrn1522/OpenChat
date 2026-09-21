@@ -103,23 +103,6 @@ body {
   background: rgb(6 12 30 / 72%);
 }
 
-.rail-brand {
-  inline-size: 36px;
-  block-size: 36px;
-  border-radius: 10px;
-  border: 1px solid rgb(131 119 255 / 60%);
-  color: #c0b3ff;
-  display: grid;
-  place-items: center;
-  font-weight: 700;
-}
-
-.rail-stack {
-  display: grid;
-  gap: 14px;
-  color: #93a7d5;
-}
-
 .rail-new-chat-btn {
   inline-size: 34px;
   block-size: 34px;
@@ -180,18 +163,6 @@ body {
 .rail-history-icon {
   inline-size: 16px;
   block-size: 16px;
-}
-
-.rail-user {
-  margin-top: auto;
-  inline-size: 32px;
-  block-size: 32px;
-  border-radius: 50%;
-  border: 1px solid rgb(107 127 191 / 60%);
-  display: grid;
-  place-items: center;
-  color: #c6d6ff;
-  font-size: 0.75rem;
 }
 
 .main-column {
