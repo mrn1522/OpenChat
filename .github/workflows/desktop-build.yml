@@ -2,6 +2,9 @@ name: Desktop build
 
 on:
   pull_request:
+    branches:
+      - main
+    types: [opened, synchronize, reopened, ready_for_review]
   push:
     branches:
       - main
@@ -16,9 +19,14 @@ permissions:
 
 jobs:
   build:
+    # Skip draft PRs: bot review/fix loops happen in draft, so the build only
+    # runs once the PR is marked ready for review.
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 20
