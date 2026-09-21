@@ -252,8 +252,9 @@ class TestDirectTranscripts:
 
 
 class TestLegacyMigration:
-    def _create_v1_db(self, path: str) -> None:
+    def _create_v1_db(self, path: str, user_version: int = 0) -> None:
         with sqlite3.connect(path) as connection:
+            connection.execute(f"PRAGMA user_version={user_version}")
             connection.execute(
                 """
                 CREATE TABLE chats (
@@ -328,6 +329,15 @@ class TestLegacyMigration:
                 ).fetchone()[0]
                 == 0
             )
+
+    def test_user_version_1_db_gets_schema_then_migrates(self, tmp_path):
+        path = str(tmp_path / "v1.db")
+        self._create_v1_db(path, user_version=1)
+        init_chat_store(path)
+
+        record = get_chat_record(path, "legacy-1")
+        assert record is not None
+        assert record["fusion_output"] == "fused answer"
 
 
 class TestRetention:

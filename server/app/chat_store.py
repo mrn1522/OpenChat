@@ -151,9 +151,10 @@ def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
 
 def _apply_migrations(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
-    if version < 1:
-        for statement in _SCHEMA_STATEMENTS:
-            connection.execute(statement)
+    # Statements are all CREATE IF NOT EXISTS — always run them so a partially
+    # versioned DB still ends up with the full schema.
+    for statement in _SCHEMA_STATEMENTS:
+        connection.execute(statement)
     if version < 2:
         _migrate_legacy_chats(connection)
     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")

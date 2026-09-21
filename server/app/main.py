@@ -762,10 +762,10 @@ async def direct_chat_stream(request: DirectChatRequest):
                 existing_kind = get_conversation_kind(
                     settings.openchat_history_db_path, conversation_id
                 )
+                if existing_kind is not None and existing_kind != "direct":
+                    conversation_id = chat_id
             except Exception:  # noqa: BLE001
                 logger.exception("conversation kind lookup failed for %s", conversation_id)
-                existing_kind = None
-            if existing_kind is not None and existing_kind != "direct":
                 conversation_id = chat_id
 
         yield sse(
