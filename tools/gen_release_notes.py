@@ -21,7 +21,7 @@ import re
 import subprocess
 import sys
 
-TAG_RE = re.compile(r"^v(\d+)\.(\d+)\.(\d+)$")
+TAG_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
 SUBJECT_RE = re.compile(r"^(?P<type>[a-zA-Z]+)(?:\([^)]*\))?!?:\s*(?P<summary>.+?)\s*(?:\(#(?P<pr>\d+)\))?$")
 
 SECTIONS = [
@@ -40,21 +40,24 @@ FALLBACK_SECTION = "📦 Other Changes"
 
 
 def git(*args: str) -> str:
+    """Run a git command and return its trimmed stdout."""
     result = subprocess.run(["git", *args], capture_output=True, text=True, check=True)
     return result.stdout.strip()
 
 
 def repo_slug() -> str:
+    """Return the owner/repo slug from GITHUB_REPOSITORY or the origin remote."""
     if slug := os.environ.get("GITHUB_REPOSITORY"):
         return slug
     url = git("remote", "get-url", "origin")
-    match = re.search(r"github\.com[:/]([^/]+/[^/.]+?)(?:\.git)?$", url)
+    match = re.search(r"github\.com[:/]([^/]+/[^/]+?)(?:\.git)?$", url)
     if not match:
         sys.exit("Cannot determine repo slug; set GITHUB_REPOSITORY=owner/repo")
     return match.group(1)
 
 
 def semver_tags() -> list[tuple[tuple[int, int, int], str]]:
+    """Return (version_tuple, tag) pairs for strict-semver tags, newest first."""
     tags = []
     for tag in git("tag", "--list", "v*").splitlines():
         if m := TAG_RE.match(tag):
@@ -64,6 +67,7 @@ def semver_tags() -> list[tuple[tuple[int, int, int], str]]:
 
 
 def previous_tag(tag: str, tags: list[tuple[tuple[int, int, int], str]]) -> str | None:
+    """Return the highest semver tag below `tag`, or None for a first release."""
     m = TAG_RE.match(tag)
     if not m:
         sys.exit(f"Tag {tag!r} is not a strict semver tag (vX.Y.Z)")
@@ -73,6 +77,7 @@ def previous_tag(tag: str, tags: list[tuple[tuple[int, int, int], str]]) -> str 
 
 
 def render(tag: str, slug: str, prev: str | None) -> str:
+    """Build the patch-notes markdown for commits in the prev..tag range."""
     rng = f"{prev}..{tag}" if prev else tag
     subjects = git("log", rng, "--pretty=%s").splitlines()
 
@@ -116,6 +121,7 @@ def render(tag: str, slug: str, prev: str | None) -> str:
 
 
 def main() -> None:
+    """Parse args and print or write the generated notes."""
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("tag", help="release tag, e.g. v0.3.0")
     parser.add_argument("--out", help="write notes to this file instead of stdout")

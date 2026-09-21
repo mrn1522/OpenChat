@@ -18,6 +18,7 @@ jobs:
           # Full history + tags are needed to diff against the previous release tag
           # when generating patch notes.
           fetch-depth: 0
+          persist-credentials: false
       - uses: actions/setup-node@v4
         with:
           node-version: 20
@@ -47,8 +48,10 @@ jobs:
       - name: Set release version from tag
         if: github.ref_type == 'tag'
         shell: pwsh
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          $v = "${{ github.ref_name }}".TrimStart("v")
+          $v = "$env:RELEASE_TAG".TrimStart("v")
           $configPath = "desktop/src-tauri/tauri.conf.json"
           $config = Get-Content $configPath -Raw | ConvertFrom-Json
           $config.version = $v
@@ -73,6 +76,7 @@ jobs:
         shell: pwsh
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
-          python tools/gen_release_notes.py "${{ github.ref_name }}" --out patch-notes.md
-          gh release edit "${{ github.ref_name }}" --repo ${{ github.repository }} --notes-file patch-notes.md
+          python tools/gen_release_notes.py "$env:RELEASE_TAG" --out patch-notes.md
+          gh release edit "$env:RELEASE_TAG" --repo "$env:GITHUB_REPOSITORY" --notes-file patch-notes.md
