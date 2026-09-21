@@ -18,7 +18,7 @@ OpenChat is a sleek native chat interface for multi-LLM orchestration:
 
 ## Desktop app (Windows 11)
 
-Download the latest Windows installer from the [GitHub Releases](../../releases) page. On first launch, OpenChat opens a **Connect OpenRouter** panel for your API key. The key is stored in the desktop app data directory, not returned to the client or included in logs. You can reopen the panel from the **API key** row in the composer settings popover.
+Download the latest Windows installer from the [GitHub Releases](../../releases) page. Release tags must use semantic versions such as `v1.2.3`. On first launch, OpenChat opens a **Connect OpenRouter** panel for your API key. The key is stored in the desktop app data directory, not returned to the client or included in logs. You can reopen the panel from the **API key** row in the composer settings popover.
 
 OpenChat stores desktop data in `%APPDATA%\com.openchat.desktop`, the Windows app-data directory produced by Tauri for the `com.openchat.desktop` identifier. This includes the local settings `.env` file and chat history database.
 

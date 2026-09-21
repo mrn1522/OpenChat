@@ -1,7 +1,7 @@
 from PyInstaller.utils.hooks import collect_submodules
 
 
-hiddenimports = collect_submodules("uvicorn")
+hiddenimports = ["app.main", *collect_submodules("uvicorn")]
 
 a = Analysis(
     ["run_server.py"],

@@ -5,9 +5,6 @@ import time
 
 import uvicorn
 
-from app.config import reload_settings
-from app.main import app
-
 
 def _parent_is_alive(parent_pid: int) -> bool:
     if os.name == "nt":
@@ -53,7 +50,9 @@ def main() -> None:
 
     if args.data_dir:
         os.environ["OPENCHAT_DATA_DIR"] = args.data_dir
-        reload_settings()
+
+    from app.main import app
+
     if args.parent_pid is not None:
         _start_parent_watchdog(args.parent_pid)
 

@@ -40,6 +40,20 @@ jobs:
         run: |
           npm ci --prefix client
           npm ci --prefix desktop
+      - name: Set release version from tag
+        if: github.ref_type == 'tag'
+        shell: pwsh
+        run: |
+          $v = "${{ github.ref_name }}".TrimStart("v")
+          $configPath = "desktop/src-tauri/tauri.conf.json"
+          $config = Get-Content $configPath -Raw | ConvertFrom-Json
+          $config.version = $v
+          $config | ConvertTo-Json -Depth 10 | Set-Content $configPath
+          $cargoPath = "desktop/src-tauri/Cargo.toml"
+          $cargo = Get-Content $cargoPath -Raw
+          $cargo = [regex]::Replace($cargo, '(?m)^version = ".*"$', "version = `"$v`"", 1)
+          Set-Content $cargoPath $cargo
+          Write-Output "Building OpenChat version $v"
       - name: Build and publish installer
         uses: tauri-apps/tauri-action@v0
         env:

@@ -317,6 +317,8 @@ def _upsert_env_values(path: Path, values: dict[str, str | None]) -> None:
 
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("\n".join(updated) + ("\n" if updated else ""), encoding="utf-8")
+    if os.name != "nt":
+        os.chmod(path, 0o600)
 
 
 def _settings_response() -> SettingsResponse:

@@ -16,8 +16,22 @@ use tauri_plugin_shell::{
 struct SidecarState(Mutex<Option<CommandChild>>);
 
 #[tauri::command]
-fn api_base(port: State<'_, u16>) -> String {
-    format!("http://127.0.0.1:{}", *port)
+async fn api_base(port: State<'_, u16>) -> Result<String, String> {
+    let port = *port;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while std::time::Instant::now() < deadline {
+        let healthy = tauri::async_runtime::spawn_blocking(move || health_check(port))
+            .await
+            .unwrap_or(false);
+        if healthy {
+            break;
+        }
+        let _ = tauri::async_runtime::spawn_blocking(|| {
+            thread::sleep(Duration::from_millis(250))
+        })
+        .await;
+    }
+    Ok(format!("http://127.0.0.1:{port}"))
 }
 
 fn free_port() -> std::io::Result<u16> {
