@@ -91,7 +91,7 @@ Guided by `FUSION_SYSTEM_PROMPT`, the synthesizer must **not** just copy or aver
 - covers blind spots and partially-covered points,
 - never mentions the orchestration/debate/synthesis process.
 
-The result is streamed as `fusion_ready` and the run closes with a `completed` event. Everything (prompt, source outputs, debate critique, fusion answer, personas) is persisted to a local SQLite history DB so any chat can be reopened later.
+The result is streamed as `fusion_ready` and the run closes with a `completed` event. Everything (prompt, source outputs, debate critique, fusion answer, personas) is persisted to a local SQLite history DB — normalized into `conversations`, `conversation_messages`, `run_source_results`, and `run_debate_results` tables — so any chat can be reopened later. Direct chats store their full message transcript per conversation.
 
 ---
 

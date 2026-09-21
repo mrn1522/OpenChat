@@ -5,6 +5,8 @@ from dotenv import dotenv_values
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from app.secrets_store import unprotect_secret
+
 
 class Settings(BaseSettings):
     openai_api_key: str = Field(default="")
@@ -17,6 +19,7 @@ class Settings(BaseSettings):
     )
     openchat_history_db_path: str = Field(default="openchat_history.db")
     openchat_data_dir: str = Field(default="")
+    openchat_history_limit: str = Field(default="")
 
     model_config = SettingsConfigDict(
         env_file=None,
@@ -53,6 +56,7 @@ def _load_settings() -> Settings:
             configured_history_path = str(dotenv_values(env_file).get("OPENCHAT_HISTORY_DB_PATH") or "")
         if not configured_history_path:
             loaded.openchat_history_db_path = str(data_dir / "openchat_history.db")
+    loaded.openai_api_key = unprotect_secret(loaded.openai_api_key)
     return loaded
 
 

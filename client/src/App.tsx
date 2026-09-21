@@ -526,6 +526,7 @@ function App() {
   const [directPrompt, setDirectPrompt] = useState("");
   const [directModel, setDirectModel] = useState("");
   const [directMessages, setDirectMessages] = useState<DirectChatMessage[]>([]);
+  const [directConversationId, setDirectConversationId] = useState<string | null>(null);
   const [isDirectRunning, setIsDirectRunning] = useState(false);
   const [directError, setDirectError] = useState<string | null>(null);
   const [directRunId, setDirectRunId] = useState<string | null>(null);
@@ -745,12 +746,14 @@ function App() {
         if (!isActive) return;
         setHistoryItems(
           [...payload.data].sort((a, b) => {
-            const aCreatedAt = Date.parse(a.created_at);
-            const bCreatedAt = Date.parse(b.created_at);
-            if (Number.isFinite(aCreatedAt) && Number.isFinite(bCreatedAt) && aCreatedAt !== bCreatedAt) {
-              return bCreatedAt - aCreatedAt;
+            const aActivity = a.updated_at ?? a.created_at;
+            const bActivity = b.updated_at ?? b.created_at;
+            const aTs = Date.parse(aActivity);
+            const bTs = Date.parse(bActivity);
+            if (Number.isFinite(aTs) && Number.isFinite(bTs) && aTs !== bTs) {
+              return bTs - aTs;
             }
-            return b.created_at.localeCompare(a.created_at);
+            return bActivity.localeCompare(aActivity);
           })
         );
       } catch (err) {
@@ -1145,6 +1148,9 @@ function App() {
 
     if (event.type === "run_started") {
       setDirectRunId(event.run_id);
+      // The server may remap a supplied id that collides with a
+      // non-direct conversation — adopt the effective id.
+      if (event.conversation_id) setDirectConversationId(event.conversation_id);
       return;
     }
 
@@ -1176,6 +1182,7 @@ function App() {
     setDirectPrompt("");
     setDirectModel("");
     setDirectMessages([]);
+    setDirectConversationId(null);
     setDirectAttachments([]);
     setIsDirectSettingsOpen(false);
   };
@@ -1280,13 +1287,18 @@ function App() {
     setDirectError(null);
     setDirectRunId(chat.run_id);
     setIsDirectRunning(false);
+    setDirectConversationId(chat.chat_id);
 
-    const latestUserPrompt = chat.request.prompt.trim();
-    const assistantReply = (chat.fusion_output || chat.source_results[0]?.content || "").trim();
-    const rebuiltMessages: DirectChatMessage[] = [];
-    if (latestUserPrompt) rebuiltMessages.push({ role: "user", content: latestUserPrompt });
-    if (assistantReply) rebuiltMessages.push({ role: "assistant", content: assistantReply });
-    setDirectMessages(rebuiltMessages);
+    if (chat.messages && chat.messages.length > 0) {
+      setDirectMessages(chat.messages);
+    } else {
+      const latestUserPrompt = chat.request.prompt.trim();
+      const assistantReply = (chat.fusion_output || chat.source_results[0]?.content || "").trim();
+      const rebuiltMessages: DirectChatMessage[] = [];
+      if (latestUserPrompt) rebuiltMessages.push({ role: "user", content: latestUserPrompt });
+      if (assistantReply) rebuiltMessages.push({ role: "assistant", content: assistantReply });
+      setDirectMessages(rebuiltMessages);
+    }
   };
 
   const handleOpenHistoryChat = async (chatId: string) => {
@@ -1690,6 +1702,8 @@ function App() {
     setIsDirectRunning(true);
     setDirectRunId(null);
 
+    const conversationId = directConversationId ?? crypto.randomUUID();
+    setDirectConversationId(conversationId);
     const nextMessages: DirectChatMessage[] = [...directMessages, { role: "user", content: trimmedPrompt }];
     setDirectMessages(nextMessages);
     setDirectPrompt("");
@@ -1702,6 +1716,7 @@ function App() {
         {
           model: directModel,
           messages: nextMessages,
+          conversation_id: conversationId,
           temperature: directTemperature,
           max_output_tokens: OPENROUTER_TOKEN_LIMIT,
           web_search_enabled: directWebSearchEnabled,

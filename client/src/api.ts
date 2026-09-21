@@ -161,7 +161,7 @@ export async function streamDirectChat(
           {
             type: eventType,
             ...(eventType === "run_started"
-              ? { run_id: data.run_id }
+              ? { run_id: data.run_id, conversation_id: data.conversation_id }
               : { data }),
           } as DirectChatStreamEvent
         );
