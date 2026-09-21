@@ -408,15 +408,24 @@ type GitHubRelease = {
   assets: GitHubReleaseAsset[];
 };
 
+// semver-shaped: digits.digits with optional -prerelease and +build parts.
+const VERSION_RE =
+  /^(\d+(?:\.\d+)*)(?:-([0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*))?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
 const parseVersion = (
   version: string
-): { core: number[]; prerelease: boolean } | null => {
-  const [core, suffix] = version.trim().replace(/^v/i, "").split("-", 2);
-  if (!/^\d+(\.\d+)*$/.test(core)) return null;
-  return {
-    core: core.split(".").map(Number),
-    prerelease: suffix !== undefined && suffix.length > 0,
-  };
+): { core: string[]; prerelease: boolean } | null => {
+  const match = VERSION_RE.exec(version.trim().replace(/^v/i, ""));
+  if (!match) return null;
+  return { core: match[1].split("."), prerelease: match[2] !== undefined };
+};
+
+// Exact ordering for digit strings of any length — no Number precision loss.
+const compareNumericSegments = (a: string, b: string): number => {
+  const left = a.replace(/^0+/, "") || "0";
+  const right = b.replace(/^0+/, "") || "0";
+  if (left.length !== right.length) return left.length - right.length;
+  return left < right ? -1 : left > right ? 1 : 0;
 };
 
 export const isNewerVersion = (latest: string, current: string): boolean | null => {
@@ -425,7 +434,7 @@ export const isNewerVersion = (latest: string, current: string): boolean | null 
   if (!latestParts || !currentParts) return null;
   const length = Math.max(latestParts.core.length, currentParts.core.length);
   for (let i = 0; i < length; i += 1) {
-    const diff = (latestParts.core[i] ?? 0) - (currentParts.core[i] ?? 0);
+    const diff = compareNumericSegments(latestParts.core[i] ?? "0", currentParts.core[i] ?? "0");
     if (diff !== 0) return diff > 0;
   }
   // Same core: a stable release outranks a prerelease.
