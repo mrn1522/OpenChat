@@ -9,6 +9,7 @@ os.environ["OPENCHAT_DATA_DIR"] = _test_data_dir.name
 os.environ["OPENCHAT_HISTORY_DB_PATH"] = os.path.join(
     _test_data_dir.name, "openchat_history.db"
 )
+os.environ.pop("OPENAI_API_KEY", None)
 
 import pytest
 from fastapi.testclient import TestClient
