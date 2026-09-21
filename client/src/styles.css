@@ -2380,6 +2380,10 @@ button:disabled {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
+  .app-shell:has(> .fusion-top) {
+    grid-template-rows: auto;
+  }
+
   .app-shell:has(> .fusion-top) > .right-column {
     grid-column: 1 / -1;
     grid-row: auto;
