@@ -36,6 +36,17 @@ export type ReasoningConfig = {
   exclude: boolean;
 };
 
+export type AppSettings = {
+  api_key_configured: boolean;
+  api_key_hint: string | null;
+  base_url: string;
+};
+
+export type AppSettingsUpdate = {
+  api_key: string | null;
+  base_url: string | null;
+};
+
 export type DebateMode = "off" | "partial" | "full";
 
 export type AttachmentInput = {
