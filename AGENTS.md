@@ -42,7 +42,7 @@ Apply when creating, updating, or merging a pull request in this repository.
   1. Arm auto-merge when opening the PR — it is safe now that the reviewers are required checks: `GH_TOKEN="$GITHUB_PAT_OPENCHAT" /usr/bin/gh pr merge <n> --repo mrn1522/OpenChat --auto --squash --delete-branch`. GitHub holds the merge until every required check is green and all threads are resolved.
   2. Triage every inline finding as it lands: push a fix commit for real bugs, or reply + resolve threads you intentionally skip (stylistic nitpicks, out-of-scope suggestions).
   3. Each push re-triggers both reviewers — repeat until a pass comes back clean or with only intentionally-skipped threads, all resolved. Only then does the armed auto-merge fire.
-  4. Caveat: a bot finding posted as a general (non-inline) comment does not block auto-merge — check for those before walking away from a PR whose checks have gone green.
+  4. Caveat: a bot finding posted as a general (non-inline) comment does not block auto-merge. If a substantive one lands while auto-merge is armed, cancel it (`gh pr merge <n> --disable-auto`), triage, then re-arm.
 - `develop` -> `main` merge PRs are **single-pass** — neither bot supports per-base-branch policies, so enforce it per PR:
   1. Open the PR as a **draft** and include `@coderabbitai ignore` in the description so CodeRabbit does not auto-review each push.
   2. Resolve outstanding feedback while the PR is a draft; the desktop build never runs in draft.
