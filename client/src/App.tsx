@@ -526,6 +526,7 @@ function App() {
   const [directPrompt, setDirectPrompt] = useState("");
   const [directModel, setDirectModel] = useState("");
   const [directMessages, setDirectMessages] = useState<DirectChatMessage[]>([]);
+  const [directConversationId, setDirectConversationId] = useState<string | null>(null);
   const [isDirectRunning, setIsDirectRunning] = useState(false);
   const [directError, setDirectError] = useState<string | null>(null);
   const [directRunId, setDirectRunId] = useState<string | null>(null);
@@ -1176,6 +1177,7 @@ function App() {
     setDirectPrompt("");
     setDirectModel("");
     setDirectMessages([]);
+    setDirectConversationId(null);
     setDirectAttachments([]);
     setIsDirectSettingsOpen(false);
   };
@@ -1280,13 +1282,18 @@ function App() {
     setDirectError(null);
     setDirectRunId(chat.run_id);
     setIsDirectRunning(false);
+    setDirectConversationId(chat.chat_id);
 
-    const latestUserPrompt = chat.request.prompt.trim();
-    const assistantReply = (chat.fusion_output || chat.source_results[0]?.content || "").trim();
-    const rebuiltMessages: DirectChatMessage[] = [];
-    if (latestUserPrompt) rebuiltMessages.push({ role: "user", content: latestUserPrompt });
-    if (assistantReply) rebuiltMessages.push({ role: "assistant", content: assistantReply });
-    setDirectMessages(rebuiltMessages);
+    if (chat.messages && chat.messages.length > 0) {
+      setDirectMessages(chat.messages);
+    } else {
+      const latestUserPrompt = chat.request.prompt.trim();
+      const assistantReply = (chat.fusion_output || chat.source_results[0]?.content || "").trim();
+      const rebuiltMessages: DirectChatMessage[] = [];
+      if (latestUserPrompt) rebuiltMessages.push({ role: "user", content: latestUserPrompt });
+      if (assistantReply) rebuiltMessages.push({ role: "assistant", content: assistantReply });
+      setDirectMessages(rebuiltMessages);
+    }
   };
 
   const handleOpenHistoryChat = async (chatId: string) => {
@@ -1690,6 +1697,8 @@ function App() {
     setIsDirectRunning(true);
     setDirectRunId(null);
 
+    const conversationId = directConversationId ?? crypto.randomUUID();
+    setDirectConversationId(conversationId);
     const nextMessages: DirectChatMessage[] = [...directMessages, { role: "user", content: trimmedPrompt }];
     setDirectMessages(nextMessages);
     setDirectPrompt("");
@@ -1702,6 +1711,7 @@ function App() {
         {
           model: directModel,
           messages: nextMessages,
+          conversation_id: conversationId,
           temperature: directTemperature,
           max_output_tokens: OPENROUTER_TOKEN_LIMIT,
           web_search_enabled: directWebSearchEnabled,

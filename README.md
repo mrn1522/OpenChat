@@ -18,7 +18,7 @@ OpenChat is a sleek native chat interface for multi-LLM orchestration:
 
 ## Desktop app (Windows 11)
 
-Download the latest Windows installer from the [GitHub Releases](../../releases) page. Release tags must use semantic versions such as `v1.2.3`. On first launch, OpenChat opens a **Connect OpenRouter** panel for your API key. The key is stored in the desktop app data directory, not returned to the client or included in logs. You can reopen the panel from the **API key** row in the composer settings popover.
+Download the latest Windows installer from the [GitHub Releases](../../releases) page. Release tags must use semantic versions such as `v1.2.3`. On first launch, OpenChat opens a **Connect OpenRouter** panel for your API key. The key is stored in the desktop app data directory, not returned to the client or included in logs; on Windows it is written DPAPI-encrypted so the `.env` file is only readable by that Windows user. You can reopen the panel from the **API key** row in the composer settings popover.
 
 OpenChat stores desktop data in `%APPDATA%\com.openchat.desktop`, the Windows app-data directory produced by Tauri for the `com.openchat.desktop` identifier. This includes the local settings `.env` file and chat history database.
 
@@ -75,6 +75,7 @@ Frontend runs at `http://localhost:5173` and backend at `http://localhost:8000`.
 - ✓ sends the reviewed prompt and reviewed personas; ✕ immediately sends the original prompt with personas disabled for that run.
 - Persona assignments are shown in the UI per source model, streamed as part of the run, and persisted in chat history records.
 - Saved workflows now store whether Personas are enabled, so workflow replays preserve the same setting.
-- Chat history is now persisted in a local SQLite database (`server/openchat_history.db` by default via `OPENCHAT_HISTORY_DB_PATH`).
+- Chat history is persisted in a local SQLite database (`server/openchat_history.db` by default via `OPENCHAT_HISTORY_DB_PATH`) running in WAL mode; the schema is versioned via `PRAGMA user_version` and migrates older history files in place. Conversations are normalized into a transcript table plus per-run source/debate result rows, so direct-chat threads reopen with their full message history.
+- History growth is bounded: only the `OPENCHAT_HISTORY_LIMIT` (default 500) most recently active conversations are kept.
 - The sidebar History button opens a dedicated history page where each saved chat can be reopened (prompt, source outputs, debate critique, and fusion answer) or deleted.
 - If history is not appearing, ensure the backend process has write access to the `server/` directory and verify `OPENCHAT_HISTORY_DB_PATH` points to a valid location.

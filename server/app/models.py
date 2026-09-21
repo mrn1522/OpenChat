@@ -62,6 +62,7 @@ class DirectChatMessage(BaseModel):
 class DirectChatRequest(BaseModel):
     model: str = Field(min_length=1)
     messages: list[DirectChatMessage] = Field(min_length=1, max_length=200)
+    conversation_id: str = Field(default="", max_length=64)
     temperature: float = Field(default=0.2, ge=0, le=2)
     max_output_tokens: int = Field(default=1000, ge=128, le=10000)
     web_search_enabled: bool = False
@@ -173,6 +174,7 @@ class ChatHistoryDetail(BaseModel):
     debate_results: list[DebateResult]
     critique_output: str
     fusion_output: str
+    messages: list[DirectChatMessage] = []
 
 
 class WorkflowAttachmentMeta(BaseModel):

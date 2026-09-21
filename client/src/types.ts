@@ -106,6 +106,7 @@ export type RunRequest = {
 export type DirectChatRequest = {
   model: string;
   messages: DirectChatMessage[];
+  conversation_id?: string;
   temperature?: number;
   max_output_tokens?: number;
   web_search_enabled?: boolean;
@@ -200,6 +201,7 @@ export type ChatHistoryDetail = {
   debate_results: DebateResult[];
   critique_output: string;
   fusion_output: string;
+  messages?: DirectChatMessage[];
 };
 
 export type WorkflowAttachmentMeta = {
