@@ -321,9 +321,12 @@ def _upsert_env_values(path: Path, values: dict[str, str | None]) -> None:
 
 def _settings_response() -> SettingsResponse:
     api_key = settings.openai_api_key.strip()
+    api_key_hint = None
+    if api_key:
+        api_key_hint = f"{api_key[:6]}…{api_key[-4:]}" if len(api_key) > 10 else "configured"
     return SettingsResponse(
         api_key_configured=bool(api_key),
-        api_key_hint=f"sk-or-...{api_key[-4:]}" if api_key else None,
+        api_key_hint=api_key_hint,
         base_url=settings.openai_base_url,
     )
 

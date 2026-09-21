@@ -61,11 +61,21 @@ pub fn run() {
             let data_dir: PathBuf = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
             let port = free_port()?;
+            let port_arg = port.to_string();
+            let data_dir_arg = data_dir.to_string_lossy().into_owned();
+            let parent_pid_arg = std::process::id().to_string();
 
             let sidecar = app
                 .shell()
                 .sidecar("openchat-server")?
-                .args(["--port", &port.to_string(), "--data-dir", &data_dir.to_string_lossy()])
+                .args([
+                    "--port",
+                    &port_arg,
+                    "--data-dir",
+                    &data_dir_arg,
+                    "--parent-pid",
+                    &parent_pid_arg,
+                ])
                 .spawn()?;
             let (mut events, child) = sidecar;
             if let Ok(mut state) = app.state::<SidecarState>().0.lock() {
