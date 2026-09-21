@@ -237,3 +237,29 @@ export type WorkflowCreateRequest = {
   name: string;
   config: SavedWorkflowConfig;
 };
+
+export type UpdateInstaller = {
+  name: string;
+  url: string;
+  size: number;
+  sha256: string | null;
+};
+
+export type UpdateCheckResult = {
+  status: "up-to-date" | "available";
+  currentVersion: string;
+  latestVersion: string;
+  tagName: string;
+  releaseUrl: string;
+  publishedAt: string | null;
+  installer: UpdateInstaller | null;
+};
+
+export type UpdateState =
+  | { kind: "idle" }
+  | { kind: "checking" }
+  | { kind: "up-to-date"; latestVersion: string }
+  | { kind: "available"; result: UpdateCheckResult }
+  | { kind: "installing" }
+  | { kind: "launched" }
+  | { kind: "error"; message: string };

@@ -1326,6 +1326,36 @@ body {
   margin-top: 22px;
 }
 
+.update-controls {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.update-note {
+  color: var(--th-textmid-7);
+  font-size: 0.84rem;
+  line-height: 1.5;
+}
+
+.update-available {
+  margin-top: 14px;
+  display: grid;
+  gap: 10px;
+}
+
+.update-available .update-note {
+  margin: 0;
+}
+
+.update-link {
+  color: var(--th-chroma-13);
+  font-size: 0.84rem;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
 .send-btn {
   border: none;
   border-radius: 11px;
