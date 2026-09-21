@@ -30,14 +30,17 @@ import gemIcon from "./assets/icons/gem.svg";
 import globeIcon from "./assets/icons/globe.svg";
 import historyIcon from "./assets/icons/history.svg";
 import messageSquareIcon from "./assets/icons/message-square.svg";
+import moonIcon from "./assets/icons/moon.svg";
 import paperclipIcon from "./assets/icons/paperclip.svg";
 import rotateCcwIcon from "./assets/icons/rotate-ccw.svg";
 import searchIcon from "./assets/icons/search.svg";
 import sendIcon from "./assets/icons/send.svg";
+import settingsIcon from "./assets/icons/settings.svg";
 import shieldIcon from "./assets/icons/shield.svg";
 import slidersHorizontalIcon from "./assets/icons/sliders-horizontal.svg";
 import sparklesIcon from "./assets/icons/sparkles.svg";
 import squarePenIcon from "./assets/icons/square-pen.svg";
+import sunIcon from "./assets/icons/sun.svg";
 import waypointsIcon from "./assets/icons/waypoints.svg";
 import zapIcon from "./assets/icons/zap.svg";
 import {
@@ -48,6 +51,7 @@ import {
   fetchChatHistoryDetail,
   fetchModels,
   fetchWorkflows,
+  getAppVersion,
   getSettings,
   optimizePrompt,
   previewPersonas,
@@ -82,6 +86,21 @@ type OrchestrationStep = "route" | "search" | "parallel" | "critique" | "fusion"
 type StepStatus = "pending" | "active" | "done";
 type ResultTab = "fusion" | "summaries" | "sources";
 type AppPage = "fusion" | "direct" | "history";
+type ThemeMode = "dark" | "light";
+
+const readStoredTheme = (): ThemeMode => {
+  try {
+    return window.localStorage.getItem("openchat-theme") === "light" ? "light" : "dark";
+  } catch {
+    return "dark";
+  }
+};
+
+const visibleSettingsButton = (): HTMLElement | null => {
+  const railButton = document.querySelector<HTMLElement>(".rail-settings-btn");
+  if (railButton && railButton.getClientRects().length > 0) return railButton;
+  return document.querySelector<HTMLElement>(".mobile-settings-btn");
+};
 type ExperienceModeTab = {
   id: string;
   title: string;
@@ -456,7 +475,9 @@ function App() {
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
-  const [isApiSettingsOpen, setIsApiSettingsOpen] = useState(false);
+  const [isAppSettingsOpen, setIsAppSettingsOpen] = useState(false);
+  const appSettingsOpenerRef = useRef<HTMLElement | null>(null);
+  const [themeMode, setThemeMode] = useState<ThemeMode>(readStoredTheme);
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [baseUrlInput, setBaseUrlInput] = useState("");
   const [isSavingApiSettings, setIsSavingApiSettings] = useState(false);
@@ -500,6 +521,7 @@ function App() {
   const [isHistoryLoading, setIsHistoryLoading] = useState(false);
   const [historyError, setHistoryError] = useState<string | null>(null);
   const [historyBusyChatId, setHistoryBusyChatId] = useState<string | null>(null);
+  const [appVersion, setAppVersion] = useState<string | null>(null);
 
   const [directPrompt, setDirectPrompt] = useState("");
   const [directModel, setDirectModel] = useState("");
@@ -523,12 +545,80 @@ function App() {
   const directStreamControllerRef = useRef<AbortController | null>(null);
   const directRequestIdRef = useRef(0);
 
-  const openApiSettings = () => {
+  useEffect(() => {
+    let isActive = true;
+    getAppVersion()
+      .then((version) => {
+        if (isActive) setAppVersion(version);
+      })
+      .catch(() => {});
+    return () => {
+      isActive = false;
+    };
+  }, []);
+
+  const openAppSettings = () => {
+    const opener = document.activeElement;
+    appSettingsOpenerRef.current = opener instanceof HTMLElement ? opener : null;
     setApiKeyInput("");
     setBaseUrlInput(appSettings?.base_url ?? "https://openrouter.ai/api/v1");
     setApiSettingsError(null);
-    setIsApiSettingsOpen(true);
+    setIsAppSettingsOpen(true);
   };
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = themeMode;
+    try {
+      window.localStorage.setItem("openchat-theme", themeMode);
+    } catch {
+      // Storage may be blocked; the theme still applies for this session.
+    }
+  }, [themeMode]);
+
+  useEffect(() => {
+    if (!isAppSettingsOpen) return;
+    const canDismiss = Boolean(appSettings?.api_key_configured);
+    const panel = document.querySelector<HTMLElement>(".api-settings-panel");
+    const handleKeydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        if (canDismiss) setIsAppSettingsOpen(false);
+        return;
+      }
+      if (event.key !== "Tab" || !panel) return;
+      const focusables = Array.from(
+        panel.querySelectorAll<HTMLElement>(
+          'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((el) => !el.hasAttribute("disabled"));
+      if (focusables.length === 0) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      if (!panel.contains(active)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && active === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    };
+    window.addEventListener("keydown", handleKeydown);
+    return () => window.removeEventListener("keydown", handleKeydown);
+  }, [isAppSettingsOpen, appSettings?.api_key_configured]);
+
+  useEffect(() => {
+    if (!isAppSettingsOpen) return;
+    return () => {
+      const stored = appSettingsOpenerRef.current;
+      appSettingsOpenerRef.current = null;
+      const target =
+        stored && stored.getClientRects().length > 0 ? stored : visibleSettingsButton();
+      target?.focus();
+    };
+  }, [isAppSettingsOpen]);
 
   const saveApiSettings = async () => {
     if (isSavingApiSettings) return;
@@ -546,7 +636,7 @@ function App() {
       };
       const updated = await updateSettings(payload);
       setAppSettings(updated);
-      setIsApiSettingsOpen(false);
+      setIsAppSettingsOpen(false);
       setApiKeyInput("");
     } catch (err) {
       setApiSettingsError(err instanceof Error ? err.message : "Failed to save API settings.");
@@ -565,7 +655,10 @@ function App() {
         if (!isActive) return;
         setAppSettings(loaded);
         setBaseUrlInput(loaded.base_url);
-        if (!loaded.api_key_configured) setIsApiSettingsOpen(true);
+        if (!loaded.api_key_configured) {
+          appSettingsOpenerRef.current = visibleSettingsButton();
+          setIsAppSettingsOpen(true);
+        }
       } catch (err) {
         if (!isActive) return;
         if (attempt < 10) {
@@ -1896,46 +1989,75 @@ function App() {
     <div className="app-shell">
       <div className="bg-lights" aria-hidden="true" />
 
-      {isApiSettingsOpen && (
+      {isAppSettingsOpen && (
         <div className="api-settings-overlay" role="presentation">
-          <section className="api-settings-panel" role="dialog" aria-modal="true" aria-labelledby="api-settings-title">
+          <section className="api-settings-panel" role="dialog" aria-modal="true" aria-labelledby="app-settings-title">
             <div className="api-settings-header">
               <div>
-                <p className="eyebrow">OpenChat connection</p>
-                <h2 id="api-settings-title">Connect OpenRouter</h2>
+                <p className="eyebrow">OpenChat</p>
+                <h2 id="app-settings-title">Settings</h2>
               </div>
               {appSettings?.api_key_configured && (
-                <button type="button" className="api-settings-close" onClick={() => setIsApiSettingsOpen(false)} aria-label="Close">
+                <button type="button" className="api-settings-close" onClick={() => setIsAppSettingsOpen(false)} aria-label="Close">
                   ×
                 </button>
               )}
             </div>
-            <p className="api-settings-copy">
-              Add your OpenRouter API key to use model fusion. It is stored locally in the app data folder.
-            </p>
-            <label className="api-settings-field">
-              <span>API key</span>
-              <input
-                type="password"
-                value={apiKeyInput}
-                onChange={(event) => setApiKeyInput(event.target.value)}
-                placeholder={appSettings?.api_key_hint ?? "sk-or-..."}
-                autoFocus
-              />
-            </label>
-            <label className="api-settings-field">
-              <span>Base URL <small>(optional)</small></span>
-              <input
-                type="url"
-                value={baseUrlInput}
-                onChange={(event) => setBaseUrlInput(event.target.value)}
-                placeholder="https://openrouter.ai/api/v1"
-              />
-            </label>
+
+            <div className="settings-section">
+              <h3 className="settings-section-title">Appearance</h3>
+              <div className="theme-toggle" role="group" aria-label="Theme">
+                <button
+                  type="button"
+                  className={`theme-toggle-btn${themeMode === "dark" ? " active" : ""}`}
+                  aria-pressed={themeMode === "dark"}
+                  onClick={() => setThemeMode("dark")}
+                >
+                  <img src={moonIcon} alt="" aria-hidden="true" className="ui-icon" />
+                  Dark
+                </button>
+                <button
+                  type="button"
+                  className={`theme-toggle-btn${themeMode === "light" ? " active" : ""}`}
+                  aria-pressed={themeMode === "light"}
+                  onClick={() => setThemeMode("light")}
+                >
+                  <img src={sunIcon} alt="" aria-hidden="true" className="ui-icon" />
+                  Light
+                </button>
+              </div>
+            </div>
+
+            <div className="settings-section">
+              <h3 className="settings-section-title">Connect OpenRouter</h3>
+              <p className="api-settings-copy">
+                Add your OpenRouter API key to use model fusion. It is stored locally in the app data folder.
+              </p>
+              <label className="api-settings-field">
+                <span>API key</span>
+                <input
+                  type="password"
+                  value={apiKeyInput}
+                  onChange={(event) => setApiKeyInput(event.target.value)}
+                  placeholder={appSettings?.api_key_hint ?? "sk-or-..."}
+                  autoFocus
+                />
+              </label>
+              <label className="api-settings-field">
+                <span>Base URL <small>(optional)</small></span>
+                <input
+                  type="url"
+                  value={baseUrlInput}
+                  onChange={(event) => setBaseUrlInput(event.target.value)}
+                  placeholder="https://openrouter.ai/api/v1"
+                />
+              </label>
+            </div>
+
             {apiSettingsError && <p className="error">{apiSettingsError}</p>}
             <div className="api-settings-actions">
               {appSettings?.api_key_configured && (
-                <button type="button" className="subtle-btn" onClick={() => setIsApiSettingsOpen(false)}>
+                <button type="button" className="subtle-btn" onClick={() => setIsAppSettingsOpen(false)}>
                   Cancel
                 </button>
               )}
@@ -1948,7 +2070,6 @@ function App() {
       )}
 
       <aside className="sidebar-rail">
-        <div className="rail-brand">M</div>
         <button type="button" className="rail-new-chat-btn" onClick={handleStartNewChat} aria-label="Start new chat">
           <img src={squarePenIcon} alt="" aria-hidden="true" className="ui-icon rail-new-chat-icon" />
         </button>
@@ -1963,13 +2084,6 @@ function App() {
         >
           <img src={messageSquareIcon} alt="" aria-hidden="true" className="ui-icon rail-direct-icon" />
         </button>
-        <div className="rail-stack">
-          <span>◻</span>
-          <span>◉</span>
-          <span>◌</span>
-          <span>⌁</span>
-          <span>⚙</span>
-        </div>
         <button
           type="button"
           className={`rail-history-btn${activePage === "history" ? " active" : ""}`}
@@ -1978,8 +2092,102 @@ function App() {
         >
           <img src={historyIcon} alt="" aria-hidden="true" className="ui-icon rail-history-icon" />
         </button>
-        <div className="rail-user">JD</div>
+        <button
+          type="button"
+          className={`rail-settings-btn${isAppSettingsOpen ? " active" : ""}`}
+          onClick={openAppSettings}
+          aria-label="Open settings"
+        >
+          <img src={settingsIcon} alt="" aria-hidden="true" className="ui-icon rail-settings-icon" />
+        </button>
       </aside>
+      <button
+        type="button"
+        className={`rail-settings-btn mobile-settings-btn${isAppSettingsOpen ? " active" : ""}`}
+        onClick={openAppSettings}
+        aria-label="Open settings"
+      >
+        <img src={settingsIcon} alt="" aria-hidden="true" className="ui-icon rail-settings-icon" />
+      </button>
+
+      {activePage === "fusion" && (
+        <div className="fusion-top">
+          <header className="hero">
+            <h1>
+              <span className="hero-title-glow">Model Fusion</span> <span className="beta">BETA</span>
+            </h1>
+            <p>Multiple models think, search, and synthesize into one answer.</p>
+          </header>
+
+          <section className="top-controls panel">
+            <div className="mode-tabs">
+              {modeTabs.map((mode) => (
+                <div className="mode-tab-wrap" key={mode.id}>
+                  <button
+                    type="button"
+                    className={`mode-tab${activeMode === mode.id ? " active" : ""}`}
+                    onClick={() => handleSelectMode(mode.id)}
+                  >
+                    <img src={mode.icon} alt="" aria-hidden="true" className="ui-icon mode-icon" />
+                    <span>
+                      <strong>{mode.title}</strong>
+                      <small>{mode.sub}</small>
+                    </span>
+                  </button>
+                  {mode.workflowId && (
+                    <button
+                      type="button"
+                      className="mode-tab-delete"
+                      aria-label={`Delete workflow ${mode.title}`}
+                      title="Delete workflow"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void handleDeleteSavedWorkflow(mode.workflowId as string);
+                      }}
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {isSaveWorkflowEditing ? (
+              <div className={`save-btn save-btn-editing${isSavingWorkflow ? " saving" : ""}`}>
+                <img src={bookmarkIcon} alt="" aria-hidden="true" className="ui-icon" />
+                <input
+                  className="save-btn-input"
+                  value={workflowNameInput}
+                  onChange={(event) => setWorkflowNameInput(event.target.value)}
+                  onBlur={() => {
+                    void saveCurrentWorkflow(workflowNameInput);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void saveCurrentWorkflow(workflowNameInput);
+                    }
+                    if (event.key === "Escape") {
+                      setIsSaveWorkflowEditing(false);
+                      setWorkflowNameInput("");
+                    }
+                  }}
+                  placeholder="Workflow name"
+                  disabled={isSavingWorkflow}
+                  autoFocus
+                />
+              </div>
+            ) : (
+              <button type="button" className="save-btn" onClick={beginWorkflowSave}>
+                <img src={bookmarkIcon} alt="" aria-hidden="true" className="ui-icon" />
+                Save Workflow
+              </button>
+            )}
+          </section>
+
+          {(workflowSaveError || workflowsError) && <p className="error workflow-save-error">{workflowSaveError ?? workflowsError}</p>}
+        </div>
+      )}
 
       <main className="main-column">
         {activePage === "history" && (
@@ -2034,81 +2242,6 @@ function App() {
 
         {activePage === "fusion" && (
           <>
-        <header className="hero">
-          <h1>
-            <span className="hero-title-glow">Model Fusion</span> <span className="beta">BETA</span>
-          </h1>
-          <p>Multiple models think, search, and synthesize into one answer.</p>
-        </header>
-
-        <section className="top-controls panel">
-          <div className="mode-tabs">
-            {modeTabs.map((mode) => (
-              <div className="mode-tab-wrap" key={mode.id}>
-                <button
-                  type="button"
-                  className={`mode-tab${activeMode === mode.id ? " active" : ""}`}
-                  onClick={() => handleSelectMode(mode.id)}
-                >
-                  <img src={mode.icon} alt="" aria-hidden="true" className="ui-icon mode-icon" />
-                  <span>
-                    <strong>{mode.title}</strong>
-                    <small>{mode.sub}</small>
-                  </span>
-                </button>
-                {mode.workflowId && (
-                  <button
-                    type="button"
-                    className="mode-tab-delete"
-                    aria-label={`Delete workflow ${mode.title}`}
-                    title="Delete workflow"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      void handleDeleteSavedWorkflow(mode.workflowId as string);
-                    }}
-                  >
-                    ×
-                  </button>
-                )}
-              </div>
-            ))}
-          </div>
-
-          {isSaveWorkflowEditing ? (
-            <div className={`save-btn save-btn-editing${isSavingWorkflow ? " saving" : ""}`}>
-              <img src={bookmarkIcon} alt="" aria-hidden="true" className="ui-icon" />
-              <input
-                className="save-btn-input"
-                value={workflowNameInput}
-                onChange={(event) => setWorkflowNameInput(event.target.value)}
-                onBlur={() => {
-                  void saveCurrentWorkflow(workflowNameInput);
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    void saveCurrentWorkflow(workflowNameInput);
-                  }
-                  if (event.key === "Escape") {
-                    setIsSaveWorkflowEditing(false);
-                    setWorkflowNameInput("");
-                  }
-                }}
-                placeholder="Workflow name"
-                disabled={isSavingWorkflow}
-                autoFocus
-              />
-            </div>
-          ) : (
-            <button type="button" className="save-btn" onClick={beginWorkflowSave}>
-              <img src={bookmarkIcon} alt="" aria-hidden="true" className="ui-icon" />
-              Save Workflow
-            </button>
-          )}
-        </section>
-
-        {(workflowSaveError || workflowsError) && <p className="error workflow-save-error">{workflowSaveError ?? workflowsError}</p>}
-
         <section className="panel agents-panel">
           <div className="panel-heading">
             <h2>AGENTS <span>(Parallel Reasoning)</span></h2>
@@ -2417,10 +2550,6 @@ function App() {
                         onChange={(event) => setPersonaEnabled(event.target.checked)}
                       />
                     </label>
-                    <button type="button" className="settings-api-key-row" onClick={openApiSettings}>
-                      <span>API key</span>
-                      <span>{appSettings?.api_key_configured ? appSettings.api_key_hint : "Not configured"} →</span>
-                    </button>
                   </div>
                 )}
               </div>
@@ -2879,6 +3008,8 @@ function App() {
           })}
         </section>
       </aside>}
+
+      {appVersion && <div className="app-version-badge">v{appVersion}</div>}
     </div>
   );
 }
