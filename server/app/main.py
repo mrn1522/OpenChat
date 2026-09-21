@@ -1,5 +1,6 @@
 import asyncio
 import json
+import logging
 import os
 import time
 import uuid
@@ -10,6 +11,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import httpx
+from dotenv import dotenv_values
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
@@ -19,6 +21,7 @@ from app.chat_store import (
     delete_chat_record,
     delete_workflow_record,
     get_chat_record,
+    get_conversation_kind,
     init_chat_store,
     list_chat_records,
     list_workflow_records,
@@ -26,6 +29,7 @@ from app.chat_store import (
     save_workflow_record,
 )
 from app.config import reload_settings, settings, settings_env_file
+from app.secrets_store import DPAPI_PREFIX, protect_secret
 from app.llm import (
     build_client,
     fetch_openrouter_models,
@@ -66,10 +70,13 @@ from app.prompting import (
     build_synth_prompt,
 )
 
+logger = logging.getLogger(__name__)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> None:
     init_chat_store(settings.openchat_history_db_path)
+    _protect_api_key_at_rest()
     yield
 
 
@@ -321,6 +328,27 @@ def _upsert_env_values(path: Path, values: dict[str, str | None]) -> None:
         os.chmod(path, 0o600)
 
 
+def _protect_api_key_at_rest() -> None:
+    """Re-write a plaintext OPENAI_API_KEY in the settings file DPAPI-encrypted.
+
+    No-op off Windows; on Windows this runs once at startup so keys saved by
+    older builds are upgraded without a settings round-trip.
+    """
+    if os.name != "nt":
+        return
+    env_file = settings_env_file()
+    if not env_file.exists():
+        return
+    stored = (dotenv_values(env_file).get("OPENAI_API_KEY") or "").strip()
+    if not stored or stored.startswith(DPAPI_PREFIX):
+        return
+    try:
+        _upsert_env_values(env_file, {"OPENAI_API_KEY": protect_secret(stored)})
+        logger.info("Encrypted stored OPENAI_API_KEY at rest")
+    except Exception:
+        logger.exception("Failed to encrypt stored OPENAI_API_KEY")
+
+
 def _settings_response() -> SettingsResponse:
     api_key = settings.openai_api_key.strip()
     api_key_hint = None
@@ -342,13 +370,20 @@ async def get_settings() -> SettingsResponse:
 async def update_settings(request: SettingsUpdateRequest) -> SettingsResponse:
     values: dict[str, str | None] = {}
     if request.api_key is not None:
-        values["OPENAI_API_KEY"] = request.api_key.strip() or None
+        api_key = request.api_key.strip()
+        values["OPENAI_API_KEY"] = protect_secret(api_key) or None
+        if api_key:
+            os.environ["OPENAI_API_KEY"] = api_key
+        else:
+            os.environ.pop("OPENAI_API_KEY", None)
     if request.base_url is not None:
         values["OPENAI_BASE_URL"] = request.base_url.strip() or None
 
     if values:
         _upsert_env_values(settings_env_file(), values)
         for key, value in values.items():
+            if key == "OPENAI_API_KEY":
+                continue  # process env already holds the plaintext key
             if value is None:
                 os.environ.pop(key, None)
             else:
@@ -667,7 +702,7 @@ async def run_stream(request: RunRequest):
                 )
             except Exception:
                 # History persistence must not mask the fusion error.
-                pass
+                logger.exception("Failed to persist chat %s after fusion failure", chat_id)
 
             yield sse("completed", {"elapsed_ms": elapsed_ms})
             return
@@ -698,7 +733,7 @@ async def run_stream(request: RunRequest):
             )
         except Exception:
             # Do not break streaming completion when history persistence fails.
-            pass
+            logger.exception("Failed to persist chat %s", chat_id)
 
         yield sse("completed", {"elapsed_ms": elapsed_ms})
 
@@ -718,7 +753,24 @@ async def direct_chat_stream(request: DirectChatRequest):
         started = time.perf_counter()
         direct_system_prompt = build_source_system_prompt(None)
 
-        yield sse("run_started", {"run_id": run_id})
+        # A caller-supplied id may only continue a direct thread — never
+        # overwrite an orchestrated chat's record. On lookup failure fall
+        # back to a fresh id rather than risk a clobbered record.
+        conversation_id = request.conversation_id or chat_id
+        if request.conversation_id:
+            try:
+                existing_kind = get_conversation_kind(
+                    settings.openchat_history_db_path, conversation_id
+                )
+                if existing_kind is not None and existing_kind != "direct":
+                    conversation_id = chat_id
+            except Exception:  # noqa: BLE001
+                logger.exception("conversation kind lookup failed for %s", conversation_id)
+                conversation_id = chat_id
+
+        yield sse(
+            "run_started", {"run_id": run_id, "conversation_id": conversation_id}
+        )
 
         try:
             assistant_output = await run_direct_chat_model(
@@ -743,11 +795,19 @@ async def direct_chat_stream(request: DirectChatRequest):
             (message.content for message in reversed(request.messages) if message.role == "user"),
             "",
         )
+        transcript: list[dict[str, str]] = [
+            {"role": message.role, "content": message.content}
+            for message in request.messages
+        ]
+        if assistant_output.strip():
+            transcript.append(
+                {"role": "assistant", "content": assistant_output, "model": request.model}
+            )
 
         try:
             save_chat_record(
                 settings.openchat_history_db_path,
-                chat_id=chat_id,
+                chat_id=conversation_id,
                 run_id=run_id,
                 status="direct_completed",
                 elapsed_ms=elapsed_ms,
@@ -777,9 +837,11 @@ async def direct_chat_stream(request: DirectChatRequest):
                 debate_results=[],
                 critique_output="",
                 fusion_output=assistant_output,
+                kind="direct",
+                messages=transcript,
             )
         except Exception:
-            pass
+            logger.exception("Failed to persist direct chat %s", conversation_id)
 
         yield sse("completed", {"elapsed_ms": elapsed_ms})
 

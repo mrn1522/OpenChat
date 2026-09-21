@@ -44,6 +44,7 @@ import sunIcon from "./assets/icons/sun.svg";
 import waypointsIcon from "./assets/icons/waypoints.svg";
 import zapIcon from "./assets/icons/zap.svg";
 import {
+  checkForUpdate,
   createWorkflow,
   deleteWorkflow,
   deleteChatHistory,
@@ -53,6 +54,8 @@ import {
   fetchWorkflows,
   getAppVersion,
   getSettings,
+  installDesktopUpdate,
+  isDesktopApp,
   optimizePrompt,
   previewPersonas,
   regenerateFusion,
@@ -79,6 +82,8 @@ import type {
   SourceAgentSpec,
   SourceModelResult,
   StreamEvent,
+  UpdateInstaller,
+  UpdateState,
 } from "./types";
 
 type PickerKind = "source" | "fusion" | "direct";
@@ -460,6 +465,125 @@ const readAttachmentFile = async (file: File): Promise<ComposerAttachment | null
   };
 };
 
+const SettingsUpdateSection = ({ appVersion }: { appVersion: string | null }) => {
+  const [updateState, setUpdateState] = useState<UpdateState>({ kind: "idle" });
+  const checkAbortRef = useRef<AbortController | null>(null);
+
+  useEffect(
+    () => () => {
+      checkAbortRef.current?.abort();
+    },
+    []
+  );
+
+  const runUpdateCheck = async () => {
+    if (updateState.kind === "checking" || updateState.kind === "installing") return;
+    checkAbortRef.current?.abort();
+    const controller = new AbortController();
+    checkAbortRef.current = controller;
+    setUpdateState({ kind: "checking" });
+    try {
+      const result = await checkForUpdate(controller.signal);
+      if (controller.signal.aborted) return;
+      setUpdateState(
+        result.status === "available"
+          ? { kind: "available", result }
+          : { kind: "up-to-date", latestVersion: result.latestVersion }
+      );
+    } catch (err) {
+      if (controller.signal.aborted) return;
+      setUpdateState({
+        kind: "error",
+        message: err instanceof Error ? err.message : "Update check failed.",
+      });
+    }
+  };
+
+  const runDesktopUpdate = async (installer: UpdateInstaller) => {
+    setUpdateState({ kind: "installing" });
+    try {
+      await installDesktopUpdate(installer);
+      setUpdateState({ kind: "launched" });
+    } catch (err) {
+      setUpdateState({
+        kind: "error",
+        message: err instanceof Error ? err.message : "Update install failed.",
+      });
+    }
+  };
+
+  const available = updateState.kind === "available" ? updateState.result : null;
+  const installer = available?.installer ?? null;
+
+  return (
+    <div className="settings-section">
+      <h3 className="settings-section-title">App updates</h3>
+      <p className="api-settings-copy">
+        {appVersion ? `You're running v${appVersion}. ` : ""}
+        Check GitHub for a newer release and install it without leaving the app.
+      </p>
+      <div className="update-controls">
+        <button
+          type="button"
+          className="subtle-btn"
+          onClick={() => void runUpdateCheck()}
+          disabled={updateState.kind === "checking" || updateState.kind === "installing"}
+        >
+          {updateState.kind === "checking" ? "Checking..." : "Check for updates"}
+        </button>
+        {updateState.kind === "up-to-date" && (
+          <span className="update-note ok">Latest version installed (v{updateState.latestVersion}).</span>
+        )}
+        {updateState.kind === "installing" && (
+          <span className="update-note">Downloading and launching the installer...</span>
+        )}
+        {updateState.kind === "launched" && (
+          <span className="update-note ok">Installer launched — OpenChat will close and reopen updated.</span>
+        )}
+        {updateState.kind === "error" && (
+          <span className="update-note error">{updateState.message}</span>
+        )}
+      </div>
+      {available && (
+        <div className="update-available">
+          <p className="update-note">
+            v{available.latestVersion} is available
+            {available.publishedAt &&
+              ` (released ${new Date(available.publishedAt).toLocaleDateString()})`}
+            {installer && ` — ${(installer.size / (1024 * 1024)).toFixed(0)} MB download`}
+          </p>
+          <div className="update-controls">
+            {isDesktopApp() && installer?.sha256 && (
+              <button
+                type="button"
+                className="send-btn"
+                onClick={() => void runDesktopUpdate(installer)}
+              >
+                Update now
+              </button>
+            )}
+            {isDesktopApp() && installer && !installer.sha256 && (
+              <span className="update-note">
+                Release asset has no integrity digest — get it from the GitHub release page instead.
+              </span>
+            )}
+            {!isDesktopApp() && installer && (
+              <a className="update-link" href={installer.url}>
+                Download installer
+              </a>
+            )}
+            {!isDesktopApp() && (
+              <a className="update-link" href={available.releaseUrl} target="_blank" rel="noreferrer">
+                View release
+              </a>
+            )}
+          </div>
+        </div>
+      )}
+    </div>
+  );
+};
+
 function App() {
   const [activePage, setActivePage] = useState<AppPage>("fusion");
   const [prompt, setPrompt] = useState("");
@@ -526,6 +650,7 @@ function App() {
   const [directPrompt, setDirectPrompt] = useState("");
   const [directModel, setDirectModel] = useState("");
   const [directMessages, setDirectMessages] = useState<DirectChatMessage[]>([]);
+  const [directConversationId, setDirectConversationId] = useState<string | null>(null);
   const [isDirectRunning, setIsDirectRunning] = useState(false);
   const [directError, setDirectError] = useState<string | null>(null);
   const [directRunId, setDirectRunId] = useState<string | null>(null);
@@ -745,12 +870,14 @@ function App() {
         if (!isActive) return;
         setHistoryItems(
           [...payload.data].sort((a, b) => {
-            const aCreatedAt = Date.parse(a.created_at);
-            const bCreatedAt = Date.parse(b.created_at);
-            if (Number.isFinite(aCreatedAt) && Number.isFinite(bCreatedAt) && aCreatedAt !== bCreatedAt) {
-              return bCreatedAt - aCreatedAt;
+            const aActivity = a.updated_at ?? a.created_at;
+            const bActivity = b.updated_at ?? b.created_at;
+            const aTs = Date.parse(aActivity);
+            const bTs = Date.parse(bActivity);
+            if (Number.isFinite(aTs) && Number.isFinite(bTs) && aTs !== bTs) {
+              return bTs - aTs;
             }
-            return b.created_at.localeCompare(a.created_at);
+            return bActivity.localeCompare(aActivity);
           })
         );
       } catch (err) {
@@ -1145,6 +1272,9 @@ function App() {
 
     if (event.type === "run_started") {
       setDirectRunId(event.run_id);
+      // The server may remap a supplied id that collides with a
+      // non-direct conversation — adopt the effective id.
+      if (event.conversation_id) setDirectConversationId(event.conversation_id);
       return;
     }
 
@@ -1176,6 +1306,7 @@ function App() {
     setDirectPrompt("");
     setDirectModel("");
     setDirectMessages([]);
+    setDirectConversationId(null);
     setDirectAttachments([]);
     setIsDirectSettingsOpen(false);
   };
@@ -1280,13 +1411,18 @@ function App() {
     setDirectError(null);
     setDirectRunId(chat.run_id);
     setIsDirectRunning(false);
+    setDirectConversationId(chat.chat_id);
 
-    const latestUserPrompt = chat.request.prompt.trim();
-    const assistantReply = (chat.fusion_output || chat.source_results[0]?.content || "").trim();
-    const rebuiltMessages: DirectChatMessage[] = [];
-    if (latestUserPrompt) rebuiltMessages.push({ role: "user", content: latestUserPrompt });
-    if (assistantReply) rebuiltMessages.push({ role: "assistant", content: assistantReply });
-    setDirectMessages(rebuiltMessages);
+    if (chat.messages && chat.messages.length > 0) {
+      setDirectMessages(chat.messages);
+    } else {
+      const latestUserPrompt = chat.request.prompt.trim();
+      const assistantReply = (chat.fusion_output || chat.source_results[0]?.content || "").trim();
+      const rebuiltMessages: DirectChatMessage[] = [];
+      if (latestUserPrompt) rebuiltMessages.push({ role: "user", content: latestUserPrompt });
+      if (assistantReply) rebuiltMessages.push({ role: "assistant", content: assistantReply });
+      setDirectMessages(rebuiltMessages);
+    }
   };
 
   const handleOpenHistoryChat = async (chatId: string) => {
@@ -1690,6 +1826,8 @@ function App() {
     setIsDirectRunning(true);
     setDirectRunId(null);
 
+    const conversationId = directConversationId ?? crypto.randomUUID();
+    setDirectConversationId(conversationId);
     const nextMessages: DirectChatMessage[] = [...directMessages, { role: "user", content: trimmedPrompt }];
     setDirectMessages(nextMessages);
     setDirectPrompt("");
@@ -1702,6 +1840,7 @@ function App() {
         {
           model: directModel,
           messages: nextMessages,
+          conversation_id: conversationId,
           temperature: directTemperature,
           max_output_tokens: OPENROUTER_TOKEN_LIMIT,
           web_search_enabled: directWebSearchEnabled,
@@ -2053,6 +2192,8 @@ function App() {
                 />
               </label>
             </div>
+
+            <SettingsUpdateSection appVersion={appVersion} />
 
             {apiSettingsError && <p className="error">{apiSettingsError}</p>}
             <div className="api-settings-actions">

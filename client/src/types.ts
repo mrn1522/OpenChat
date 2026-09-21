@@ -82,7 +82,7 @@ export type StreamEvent =
   | { type: "error"; data: { message: string } };
 
 export type DirectChatStreamEvent =
-  | { type: "run_started"; run_id: string }
+  | { type: "run_started"; run_id: string; conversation_id?: string }
   | { type: "assistant_chunk"; data: { content: string } }
   | { type: "assistant_ready"; data: { model: string; content: string } }
   | { type: "completed"; data: { elapsed_ms: number } }
@@ -106,6 +106,7 @@ export type RunRequest = {
 export type DirectChatRequest = {
   model: string;
   messages: DirectChatMessage[];
+  conversation_id?: string;
   temperature?: number;
   max_output_tokens?: number;
   web_search_enabled?: boolean;
@@ -178,6 +179,7 @@ export type OpenRouterModelsResponse = {
 export type ChatHistorySummary = {
   chat_id: string;
   created_at: string;
+  updated_at?: string;
   status: string;
   prompt_preview: string;
   source_models: string[];
@@ -200,6 +202,7 @@ export type ChatHistoryDetail = {
   debate_results: DebateResult[];
   critique_output: string;
   fusion_output: string;
+  messages?: DirectChatMessage[];
 };
 
 export type WorkflowAttachmentMeta = {
@@ -234,3 +237,29 @@ export type WorkflowCreateRequest = {
   name: string;
   config: SavedWorkflowConfig;
 };
+
+export type UpdateInstaller = {
+  name: string;
+  url: string;
+  size: number;
+  sha256: string | null;
+};
+
+export type UpdateCheckResult = {
+  status: "up-to-date" | "available";
+  currentVersion: string;
+  latestVersion: string;
+  tagName: string;
+  releaseUrl: string;
+  publishedAt: string | null;
+  installer: UpdateInstaller | null;
+};
+
+export type UpdateState =
+  | { kind: "idle" }
+  | { kind: "checking" }
+  | { kind: "up-to-date"; latestVersion: string }
+  | { kind: "available"; result: UpdateCheckResult }
+  | { kind: "installing" }
+  | { kind: "launched" }
+  | { kind: "error"; message: string };
