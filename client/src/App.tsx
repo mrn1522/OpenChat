@@ -1148,6 +1148,9 @@ function App() {
 
     if (event.type === "run_started") {
       setDirectRunId(event.run_id);
+      // The server may remap a supplied id that collides with a
+      // non-direct conversation — adopt the effective id.
+      if (event.conversation_id) setDirectConversationId(event.conversation_id);
       return;
     }
 

@@ -753,7 +753,24 @@ async def direct_chat_stream(request: DirectChatRequest):
         started = time.perf_counter()
         direct_system_prompt = build_source_system_prompt(None)
 
-        yield sse("run_started", {"run_id": run_id})
+        # A caller-supplied id may only continue a direct thread — never
+        # overwrite an orchestrated chat's record. On lookup failure fall
+        # back to a fresh id rather than risk a clobbered record.
+        conversation_id = request.conversation_id or chat_id
+        if request.conversation_id:
+            try:
+                existing_kind = get_conversation_kind(
+                    settings.openchat_history_db_path, conversation_id
+                )
+            except Exception:  # noqa: BLE001
+                logger.exception("conversation kind lookup failed for %s", conversation_id)
+                existing_kind = None
+            if existing_kind is not None and existing_kind != "direct":
+                conversation_id = chat_id
+
+        yield sse(
+            "run_started", {"run_id": run_id, "conversation_id": conversation_id}
+        )
 
         try:
             assistant_output = await run_direct_chat_model(
@@ -778,16 +795,6 @@ async def direct_chat_stream(request: DirectChatRequest):
             (message.content for message in reversed(request.messages) if message.role == "user"),
             "",
         )
-        conversation_id = request.conversation_id or chat_id
-        if request.conversation_id:
-            # A caller-supplied id may only continue a direct thread — never
-            # overwrite an orchestrated chat's record.
-            existing_kind = get_conversation_kind(
-                settings.openchat_history_db_path, conversation_id
-            )
-            if existing_kind is not None and existing_kind != "direct":
-                conversation_id = chat_id
-
         transcript: list[dict[str, str]] = [
             {"role": message.role, "content": message.content}
             for message in request.messages

@@ -82,7 +82,7 @@ export type StreamEvent =
   | { type: "error"; data: { message: string } };
 
 export type DirectChatStreamEvent =
-  | { type: "run_started"; run_id: string }
+  | { type: "run_started"; run_id: string; conversation_id?: string }
   | { type: "assistant_chunk"; data: { content: string } }
   | { type: "assistant_ready"; data: { model: string; content: string } }
   | { type: "completed"; data: { elapsed_ms: number } }
