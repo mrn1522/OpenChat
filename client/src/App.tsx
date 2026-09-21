@@ -1986,6 +1986,85 @@ function App() {
         </button>
       </aside>
 
+      {activePage === "fusion" && (
+        <div className="fusion-top">
+          <header className="hero">
+            <h1>
+              <span className="hero-title-glow">Model Fusion</span> <span className="beta">BETA</span>
+            </h1>
+            <p>Multiple models think, search, and synthesize into one answer.</p>
+          </header>
+
+          <section className="top-controls panel">
+            <div className="mode-tabs">
+              {modeTabs.map((mode) => (
+                <div className="mode-tab-wrap" key={mode.id}>
+                  <button
+                    type="button"
+                    className={`mode-tab${activeMode === mode.id ? " active" : ""}`}
+                    onClick={() => handleSelectMode(mode.id)}
+                  >
+                    <img src={mode.icon} alt="" aria-hidden="true" className="ui-icon mode-icon" />
+                    <span>
+                      <strong>{mode.title}</strong>
+                      <small>{mode.sub}</small>
+                    </span>
+                  </button>
+                  {mode.workflowId && (
+                    <button
+                      type="button"
+                      className="mode-tab-delete"
+                      aria-label={`Delete workflow ${mode.title}`}
+                      title="Delete workflow"
+                      onClick={(event) => {
+                        event.stopPropagation();
+                        void handleDeleteSavedWorkflow(mode.workflowId as string);
+                      }}
+                    >
+                      ×
+                    </button>
+                  )}
+                </div>
+              ))}
+            </div>
+
+            {isSaveWorkflowEditing ? (
+              <div className={`save-btn save-btn-editing${isSavingWorkflow ? " saving" : ""}`}>
+                <img src={bookmarkIcon} alt="" aria-hidden="true" className="ui-icon" />
+                <input
+                  className="save-btn-input"
+                  value={workflowNameInput}
+                  onChange={(event) => setWorkflowNameInput(event.target.value)}
+                  onBlur={() => {
+                    void saveCurrentWorkflow(workflowNameInput);
+                  }}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter") {
+                      event.preventDefault();
+                      void saveCurrentWorkflow(workflowNameInput);
+                    }
+                    if (event.key === "Escape") {
+                      setIsSaveWorkflowEditing(false);
+                      setWorkflowNameInput("");
+                    }
+                  }}
+                  placeholder="Workflow name"
+                  disabled={isSavingWorkflow}
+                  autoFocus
+                />
+              </div>
+            ) : (
+              <button type="button" className="save-btn" onClick={beginWorkflowSave}>
+                <img src={bookmarkIcon} alt="" aria-hidden="true" className="ui-icon" />
+                Save Workflow
+              </button>
+            )}
+          </section>
+
+          {(workflowSaveError || workflowsError) && <p className="error workflow-save-error">{workflowSaveError ?? workflowsError}</p>}
+        </div>
+      )}
+
       <main className="main-column">
         {activePage === "history" && (
           <section className="panel history-panel">
@@ -2039,81 +2118,6 @@ function App() {
 
         {activePage === "fusion" && (
           <>
-        <header className="hero">
-          <h1>
-            <span className="hero-title-glow">Model Fusion</span> <span className="beta">BETA</span>
-          </h1>
-          <p>Multiple models think, search, and synthesize into one answer.</p>
-        </header>
-
-        <section className="top-controls panel">
-          <div className="mode-tabs">
-            {modeTabs.map((mode) => (
-              <div className="mode-tab-wrap" key={mode.id}>
-                <button
-                  type="button"
-                  className={`mode-tab${activeMode === mode.id ? " active" : ""}`}
-                  onClick={() => handleSelectMode(mode.id)}
-                >
-                  <img src={mode.icon} alt="" aria-hidden="true" className="ui-icon mode-icon" />
-                  <span>
-                    <strong>{mode.title}</strong>
-                    <small>{mode.sub}</small>
-                  </span>
-                </button>
-                {mode.workflowId && (
-                  <button
-                    type="button"
-                    className="mode-tab-delete"
-                    aria-label={`Delete workflow ${mode.title}`}
-                    title="Delete workflow"
-                    onClick={(event) => {
-                      event.stopPropagation();
-                      void handleDeleteSavedWorkflow(mode.workflowId as string);
-                    }}
-                  >
-                    ×
-                  </button>
-                )}
-              </div>
-            ))}
-          </div>
-
-          {isSaveWorkflowEditing ? (
-            <div className={`save-btn save-btn-editing${isSavingWorkflow ? " saving" : ""}`}>
-              <img src={bookmarkIcon} alt="" aria-hidden="true" className="ui-icon" />
-              <input
-                className="save-btn-input"
-                value={workflowNameInput}
-                onChange={(event) => setWorkflowNameInput(event.target.value)}
-                onBlur={() => {
-                  void saveCurrentWorkflow(workflowNameInput);
-                }}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault();
-                    void saveCurrentWorkflow(workflowNameInput);
-                  }
-                  if (event.key === "Escape") {
-                    setIsSaveWorkflowEditing(false);
-                    setWorkflowNameInput("");
-                  }
-                }}
-                placeholder="Workflow name"
-                disabled={isSavingWorkflow}
-                autoFocus
-              />
-            </div>
-          ) : (
-            <button type="button" className="save-btn" onClick={beginWorkflowSave}>
-              <img src={bookmarkIcon} alt="" aria-hidden="true" className="ui-icon" />
-              Save Workflow
-            </button>
-          )}
-        </section>
-
-        {(workflowSaveError || workflowsError) && <p className="error workflow-save-error">{workflowSaveError ?? workflowsError}</p>}
-
         <section className="panel agents-panel">
           <div className="panel-heading">
             <h2>AGENTS <span>(Parallel Reasoning)</span></h2>
