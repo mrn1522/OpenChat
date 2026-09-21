@@ -179,6 +179,7 @@ export type OpenRouterModelsResponse = {
 export type ChatHistorySummary = {
   chat_id: string;
   created_at: string;
+  updated_at?: string;
   status: string;
   prompt_preview: string;
   source_models: string[];

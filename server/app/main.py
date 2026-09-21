@@ -21,6 +21,7 @@ from app.chat_store import (
     delete_chat_record,
     delete_workflow_record,
     get_chat_record,
+    get_conversation_kind,
     init_chat_store,
     list_chat_records,
     list_workflow_records,
@@ -778,6 +779,14 @@ async def direct_chat_stream(request: DirectChatRequest):
             "",
         )
         conversation_id = request.conversation_id or chat_id
+        if request.conversation_id:
+            # A caller-supplied id may only continue a direct thread — never
+            # overwrite an orchestrated chat's record.
+            existing_kind = get_conversation_kind(
+                settings.openchat_history_db_path, conversation_id
+            )
+            if existing_kind is not None and existing_kind != "direct":
+                conversation_id = chat_id
 
         transcript: list[dict[str, str]] = [
             {"role": message.role, "content": message.content}

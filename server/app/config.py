@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     )
     openchat_history_db_path: str = Field(default="openchat_history.db")
     openchat_data_dir: str = Field(default="")
+    openchat_history_limit: str = Field(default="")
 
     model_config = SettingsConfigDict(
         env_file=None,

@@ -746,12 +746,14 @@ function App() {
         if (!isActive) return;
         setHistoryItems(
           [...payload.data].sort((a, b) => {
-            const aCreatedAt = Date.parse(a.created_at);
-            const bCreatedAt = Date.parse(b.created_at);
-            if (Number.isFinite(aCreatedAt) && Number.isFinite(bCreatedAt) && aCreatedAt !== bCreatedAt) {
-              return bCreatedAt - aCreatedAt;
+            const aActivity = a.updated_at ?? a.created_at;
+            const bActivity = b.updated_at ?? b.created_at;
+            const aTs = Date.parse(aActivity);
+            const bTs = Date.parse(bActivity);
+            if (Number.isFinite(aTs) && Number.isFinite(bTs) && aTs !== bTs) {
+              return bTs - aTs;
             }
-            return b.created_at.localeCompare(a.created_at);
+            return bActivity.localeCompare(aActivity);
           })
         );
       } catch (err) {

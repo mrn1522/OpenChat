@@ -76,6 +76,6 @@ Frontend runs at `http://localhost:5173` and backend at `http://localhost:8000`.
 - Persona assignments are shown in the UI per source model, streamed as part of the run, and persisted in chat history records.
 - Saved workflows now store whether Personas are enabled, so workflow replays preserve the same setting.
 - Chat history is persisted in a local SQLite database (`server/openchat_history.db` by default via `OPENCHAT_HISTORY_DB_PATH`) running in WAL mode; the schema is versioned via `PRAGMA user_version` and migrates older history files in place. Conversations are normalized into a transcript table plus per-run source/debate result rows, so direct-chat threads reopen with their full message history.
-- History growth is bounded: only the `OPENCHAT_HISTORY_LIMIT` (default 500) most recently active conversations are kept.
+- History growth is bounded and destructive: conversations beyond the `OPENCHAT_HISTORY_LIMIT` (default 500) most recently active are permanently deleted on the next save.
 - The sidebar History button opens a dedicated history page where each saved chat can be reopened (prompt, source outputs, debate critique, and fusion answer) or deleted.
 - If history is not appearing, ensure the backend process has write access to the `server/` directory and verify `OPENCHAT_HISTORY_DB_PATH` points to a valid location.

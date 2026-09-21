@@ -232,11 +232,20 @@ def init_chat_store(db_path: str) -> None:
 
 
 def _history_limit() -> int:
+    raw = os.environ.get("OPENCHAT_HISTORY_LIMIT", "").strip()
+    if not raw:
+        # Settings picks up the desktop data-dir .env; read lazily so this
+        # module stays importable without the app config loaded.
+        try:
+            from app.config import settings
+
+            raw = str(settings.openchat_history_limit).strip()
+        except Exception:
+            raw = ""
     try:
-        limit = int(os.environ.get("OPENCHAT_HISTORY_LIMIT", ""))
+        return max(int(raw), 1)
     except ValueError:
         return DEFAULT_HISTORY_LIMIT
-    return max(limit, 1)
 
 
 def _prune_conversations(connection: sqlite3.Connection) -> None:
@@ -449,10 +458,10 @@ def list_chat_records(db_path: str, *, limit: int = 100) -> list[dict[str, Any]]
     with _connect(db_path) as connection:
         rows = connection.execute(
             """
-            SELECT conversation_id, created_at, status, title, request_json,
-                   fusion_output
+            SELECT conversation_id, created_at, updated_at, status, title,
+                   request_json, fusion_output
             FROM conversations
-            ORDER BY datetime(created_at) DESC
+            ORDER BY datetime(updated_at) DESC, updated_at DESC, rowid DESC
             LIMIT ?
             """,
             (limit,),
@@ -469,6 +478,7 @@ def list_chat_records(db_path: str, *, limit: int = 100) -> list[dict[str, Any]]
             {
                 "chat_id": row["conversation_id"],
                 "created_at": row["created_at"],
+                "updated_at": row["updated_at"],
                 "status": row["status"],
                 "prompt_preview": preview,
                 "source_models": request_payload.get("source_models", []),
@@ -571,6 +581,15 @@ def get_chat_record(db_path: str, chat_id: str) -> dict[str, Any] | None:
         "fusion_output": row["fusion_output"],
         "messages": messages,
     }
+
+
+def get_conversation_kind(db_path: str, conversation_id: str) -> str | None:
+    with _connect(db_path) as connection:
+        row = connection.execute(
+            "SELECT kind FROM conversations WHERE conversation_id = ?",
+            (conversation_id,),
+        ).fetchone()
+    return str(row["kind"]) if row is not None else None
 
 
 def delete_chat_record(db_path: str, chat_id: str) -> bool:

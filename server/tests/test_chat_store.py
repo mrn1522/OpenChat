@@ -9,6 +9,7 @@ from app.chat_store import (
     delete_chat_record,
     delete_workflow_record,
     get_chat_record,
+    get_conversation_kind,
     init_chat_store,
     list_chat_records,
     list_workflow_records,
@@ -345,3 +346,53 @@ class TestRetention:
         monkeypatch.setenv("OPENCHAT_HISTORY_LIMIT", "bogus")
         _save_chat(db_path, "chat-1")
         assert len(list_chat_records(db_path)) == 1
+
+    def test_limit_from_settings_file(self, db_path, monkeypatch):
+        from app.config import settings
+
+        monkeypatch.delenv("OPENCHAT_HISTORY_LIMIT", raising=False)
+        monkeypatch.setattr(settings, "openchat_history_limit", "2")
+        for index in range(3):
+            _save_chat(db_path, f"chat-{index}", prompt=f"p{index}")
+
+        remaining = {row["chat_id"] for row in list_chat_records(db_path, limit=50)}
+        assert remaining == {"chat-1", "chat-2"}
+
+
+class TestConversationKinds:
+    def test_kind_lookup(self, db_path):
+        _save_chat(db_path, "chat-1")
+        _save_direct_turn(
+            db_path,
+            "conv-1",
+            [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "a"}],
+        )
+        assert get_conversation_kind(db_path, "chat-1") == "orchestrated"
+        assert get_conversation_kind(db_path, "conv-1") == "direct"
+        assert get_conversation_kind(db_path, "missing") is None
+
+    def test_resumed_thread_sorts_to_top(self, db_path, monkeypatch):
+        import time as _time
+
+        _save_direct_turn(
+            db_path,
+            "conv-1",
+            [{"role": "user", "content": "hi"}, {"role": "assistant", "content": "a"}],
+        )
+        _time.sleep(0.01)
+        for index in range(3):
+            _save_chat(db_path, f"chat-{index}", prompt=f"p{index}")
+            _time.sleep(0.01)
+        _save_direct_turn(
+            db_path,
+            "conv-1",
+            [
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": "a"},
+                {"role": "user", "content": "more"},
+                {"role": "assistant", "content": "a2"},
+            ],
+        )
+
+        ids = [row["chat_id"] for row in list_chat_records(db_path, limit=50)]
+        assert ids[0] == "conv-1"

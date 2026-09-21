@@ -152,6 +152,7 @@ class OpenRouterModelsResponse(BaseModel):
 class ChatHistorySummary(BaseModel):
     chat_id: str
     created_at: str
+    updated_at: str
     status: str
     prompt_preview: str
     source_models: list[str]
