@@ -4,3 +4,13 @@ reviews:
   # Allow CodeRabbit to submit formal PR approvals / request-changes reviews.
   # Enables the top-level `@coderabbitai approve` command (resolve + approve).
   request_changes_workflow: true
+  auto_review:
+    # Review PRs into develop, not just PRs into the default branch (main).
+    base_branches:
+      - "develop"
+    # Review draft PRs: develop->main PRs stay in draft while bot feedback is
+    # resolved, so no CI build runs until they are marked ready for review.
+    drafts: true
+    # Re-review on every pushed commit; never auto-pause after N commits.
+    auto_incremental_review: true
+    auto_pause_after_reviewed_commits: 0
