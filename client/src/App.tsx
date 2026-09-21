@@ -30,14 +30,17 @@ import gemIcon from "./assets/icons/gem.svg";
 import globeIcon from "./assets/icons/globe.svg";
 import historyIcon from "./assets/icons/history.svg";
 import messageSquareIcon from "./assets/icons/message-square.svg";
+import moonIcon from "./assets/icons/moon.svg";
 import paperclipIcon from "./assets/icons/paperclip.svg";
 import rotateCcwIcon from "./assets/icons/rotate-ccw.svg";
 import searchIcon from "./assets/icons/search.svg";
 import sendIcon from "./assets/icons/send.svg";
+import settingsIcon from "./assets/icons/settings.svg";
 import shieldIcon from "./assets/icons/shield.svg";
 import slidersHorizontalIcon from "./assets/icons/sliders-horizontal.svg";
 import sparklesIcon from "./assets/icons/sparkles.svg";
 import squarePenIcon from "./assets/icons/square-pen.svg";
+import sunIcon from "./assets/icons/sun.svg";
 import waypointsIcon from "./assets/icons/waypoints.svg";
 import zapIcon from "./assets/icons/zap.svg";
 import {
@@ -83,6 +86,7 @@ type OrchestrationStep = "route" | "search" | "parallel" | "critique" | "fusion"
 type StepStatus = "pending" | "active" | "done";
 type ResultTab = "fusion" | "summaries" | "sources";
 type AppPage = "fusion" | "direct" | "history";
+type ThemeMode = "dark" | "light";
 type ExperienceModeTab = {
   id: string;
   title: string;
@@ -457,7 +461,10 @@ function App() {
   const [attachments, setAttachments] = useState<ComposerAttachment[]>([]);
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
-  const [isApiSettingsOpen, setIsApiSettingsOpen] = useState(false);
+  const [isAppSettingsOpen, setIsAppSettingsOpen] = useState(false);
+  const [themeMode, setThemeMode] = useState<ThemeMode>(() =>
+    window.localStorage.getItem("openchat-theme") === "light" ? "light" : "dark",
+  );
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [baseUrlInput, setBaseUrlInput] = useState("");
   const [isSavingApiSettings, setIsSavingApiSettings] = useState(false);
@@ -537,12 +544,26 @@ function App() {
     };
   }, []);
 
-  const openApiSettings = () => {
+  const openAppSettings = () => {
     setApiKeyInput("");
     setBaseUrlInput(appSettings?.base_url ?? "https://openrouter.ai/api/v1");
     setApiSettingsError(null);
-    setIsApiSettingsOpen(true);
+    setIsAppSettingsOpen(true);
   };
+
+  useEffect(() => {
+    document.documentElement.dataset.theme = themeMode;
+    window.localStorage.setItem("openchat-theme", themeMode);
+  }, [themeMode]);
+
+  useEffect(() => {
+    if (!isAppSettingsOpen || !appSettings?.api_key_configured) return;
+    const handleEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setIsAppSettingsOpen(false);
+    };
+    window.addEventListener("keydown", handleEscape);
+    return () => window.removeEventListener("keydown", handleEscape);
+  }, [isAppSettingsOpen, appSettings?.api_key_configured]);
 
   const saveApiSettings = async () => {
     if (isSavingApiSettings) return;
@@ -560,7 +581,7 @@ function App() {
       };
       const updated = await updateSettings(payload);
       setAppSettings(updated);
-      setIsApiSettingsOpen(false);
+      setIsAppSettingsOpen(false);
       setApiKeyInput("");
     } catch (err) {
       setApiSettingsError(err instanceof Error ? err.message : "Failed to save API settings.");
@@ -579,7 +600,7 @@ function App() {
         if (!isActive) return;
         setAppSettings(loaded);
         setBaseUrlInput(loaded.base_url);
-        if (!loaded.api_key_configured) setIsApiSettingsOpen(true);
+        if (!loaded.api_key_configured) setIsAppSettingsOpen(true);
       } catch (err) {
         if (!isActive) return;
         if (attempt < 10) {
@@ -1910,46 +1931,75 @@ function App() {
     <div className="app-shell">
       <div className="bg-lights" aria-hidden="true" />
 
-      {isApiSettingsOpen && (
+      {isAppSettingsOpen && (
         <div className="api-settings-overlay" role="presentation">
-          <section className="api-settings-panel" role="dialog" aria-modal="true" aria-labelledby="api-settings-title">
+          <section className="api-settings-panel" role="dialog" aria-modal="true" aria-labelledby="app-settings-title">
             <div className="api-settings-header">
               <div>
-                <p className="eyebrow">OpenChat connection</p>
-                <h2 id="api-settings-title">Connect OpenRouter</h2>
+                <p className="eyebrow">OpenChat</p>
+                <h2 id="app-settings-title">Settings</h2>
               </div>
               {appSettings?.api_key_configured && (
-                <button type="button" className="api-settings-close" onClick={() => setIsApiSettingsOpen(false)} aria-label="Close">
+                <button type="button" className="api-settings-close" onClick={() => setIsAppSettingsOpen(false)} aria-label="Close">
                   ×
                 </button>
               )}
             </div>
-            <p className="api-settings-copy">
-              Add your OpenRouter API key to use model fusion. It is stored locally in the app data folder.
-            </p>
-            <label className="api-settings-field">
-              <span>API key</span>
-              <input
-                type="password"
-                value={apiKeyInput}
-                onChange={(event) => setApiKeyInput(event.target.value)}
-                placeholder={appSettings?.api_key_hint ?? "sk-or-..."}
-                autoFocus
-              />
-            </label>
-            <label className="api-settings-field">
-              <span>Base URL <small>(optional)</small></span>
-              <input
-                type="url"
-                value={baseUrlInput}
-                onChange={(event) => setBaseUrlInput(event.target.value)}
-                placeholder="https://openrouter.ai/api/v1"
-              />
-            </label>
+
+            <div className="settings-section">
+              <h3 className="settings-section-title">Appearance</h3>
+              <div className="theme-toggle" role="group" aria-label="Theme">
+                <button
+                  type="button"
+                  className={`theme-toggle-btn${themeMode === "dark" ? " active" : ""}`}
+                  aria-pressed={themeMode === "dark"}
+                  onClick={() => setThemeMode("dark")}
+                >
+                  <img src={moonIcon} alt="" aria-hidden="true" className="ui-icon" />
+                  Dark
+                </button>
+                <button
+                  type="button"
+                  className={`theme-toggle-btn${themeMode === "light" ? " active" : ""}`}
+                  aria-pressed={themeMode === "light"}
+                  onClick={() => setThemeMode("light")}
+                >
+                  <img src={sunIcon} alt="" aria-hidden="true" className="ui-icon" />
+                  Light
+                </button>
+              </div>
+            </div>
+
+            <div className="settings-section">
+              <h3 className="settings-section-title">Connect OpenRouter</h3>
+              <p className="api-settings-copy">
+                Add your OpenRouter API key to use model fusion. It is stored locally in the app data folder.
+              </p>
+              <label className="api-settings-field">
+                <span>API key</span>
+                <input
+                  type="password"
+                  value={apiKeyInput}
+                  onChange={(event) => setApiKeyInput(event.target.value)}
+                  placeholder={appSettings?.api_key_hint ?? "sk-or-..."}
+                  autoFocus
+                />
+              </label>
+              <label className="api-settings-field">
+                <span>Base URL <small>(optional)</small></span>
+                <input
+                  type="url"
+                  value={baseUrlInput}
+                  onChange={(event) => setBaseUrlInput(event.target.value)}
+                  placeholder="https://openrouter.ai/api/v1"
+                />
+              </label>
+            </div>
+
             {apiSettingsError && <p className="error">{apiSettingsError}</p>}
             <div className="api-settings-actions">
               {appSettings?.api_key_configured && (
-                <button type="button" className="subtle-btn" onClick={() => setIsApiSettingsOpen(false)}>
+                <button type="button" className="subtle-btn" onClick={() => setIsAppSettingsOpen(false)}>
                   Cancel
                 </button>
               )}
@@ -1983,6 +2033,14 @@ function App() {
           aria-label="Open chat history"
         >
           <img src={historyIcon} alt="" aria-hidden="true" className="ui-icon rail-history-icon" />
+        </button>
+        <button
+          type="button"
+          className={`rail-settings-btn${isAppSettingsOpen ? " active" : ""}`}
+          onClick={openAppSettings}
+          aria-label="Open settings"
+        >
+          <img src={settingsIcon} alt="" aria-hidden="true" className="ui-icon rail-settings-icon" />
         </button>
       </aside>
 
@@ -2426,10 +2484,6 @@ function App() {
                         onChange={(event) => setPersonaEnabled(event.target.checked)}
                       />
                     </label>
-                    <button type="button" className="settings-api-key-row" onClick={openApiSettings}>
-                      <span>API key</span>
-                      <span>{appSettings?.api_key_configured ? appSettings.api_key_hint : "Not configured"} →</span>
-                    </button>
                   </div>
                 )}
               </div>

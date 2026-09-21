@@ -4,6 +4,10 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>OpenChat</title>
+    <script>
+      document.documentElement.dataset.theme =
+        localStorage.getItem("openchat-theme") === "light" ? "light" : "dark";
+    </script>
     <!-- Preload the background image so it is fetched and ready before CSS
          applies it, avoiding a decode stall on first paint / tab refocus. -->
     <link rel="preload" as="image" href="/src/assets/icons/deepspace.webp" fetchpriority="high" />
