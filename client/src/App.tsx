@@ -2252,7 +2252,7 @@ function App() {
       </button>
 
       {activePage === "fusion" && (
-        <div className="fusion-top">
+        <div className="page-top">
           <header className="hero">
             <h1>
               <span className="hero-title-glow">Model Fusion</span> <span className="beta">BETA</span>
@@ -2327,6 +2327,53 @@ function App() {
           </section>
 
           {(workflowSaveError || workflowsError) && <p className="error workflow-save-error">{workflowSaveError ?? workflowsError}</p>}
+        </div>
+      )}
+
+      {activePage === "direct" && (
+        <div className="page-top">
+          <header className="hero">
+            <h1>
+              <span className="hero-title-glow">Direct Chat</span> <span className="beta">BETA</span>
+            </h1>
+            <p>Single-model chat with persistent browser-session transcript.</p>
+          </header>
+
+          <section className="panel direct-model-panel">
+            <div className="panel-heading">
+              <h2>MODEL</h2>
+              <button
+                type="button"
+                className="subtle-btn"
+                disabled={isCatalogLoading || modelCatalog.length === 0}
+                onClick={() => setActivePicker("direct")}
+              >
+                Select Model
+              </button>
+            </div>
+
+            <button
+              type="button"
+              className="fusion-model-row"
+              onClick={() => setActivePicker("direct")}
+              disabled={isCatalogLoading || modelCatalog.length === 0}
+            >
+              {directModelDisplay ? (
+                <div className="fusion-left">
+                  <span className={`fusion-star${DirectIcon ? " has-icon" : ""}`} style={directProviderTintStyle}>
+                    {DirectIcon ? <DirectIcon size={18} className="model-company-icon" /> : "✧"}
+                  </span>
+                  <span>
+                    <strong>{directModelDisplay.name}</strong>
+                    <small>{directModelDisplay.provider}</small>
+                  </span>
+                </div>
+              ) : (
+                <span className="muted">Select direct chat model</span>
+              )}
+            </button>
+            <div className="picker-anchor">{activePicker === "direct" && renderPicker()}</div>
+          </section>
         </div>
       )}
 
@@ -2925,49 +2972,6 @@ function App() {
 
         {activePage === "direct" && (
           <>
-            <header className="hero">
-              <h1>
-                <span className="hero-title-glow">Direct Chat</span> <span className="beta">BETA</span>
-              </h1>
-              <p>Single-model chat with persistent browser-session transcript.</p>
-            </header>
-
-            <section className="panel direct-model-panel">
-              <div className="panel-heading">
-                <h2>MODEL</h2>
-                <button
-                  type="button"
-                  className="subtle-btn"
-                  disabled={isCatalogLoading || modelCatalog.length === 0}
-                  onClick={() => setActivePicker("direct")}
-                >
-                  Select Model
-                </button>
-              </div>
-
-              <button
-                type="button"
-                className="fusion-model-row"
-                onClick={() => setActivePicker("direct")}
-                disabled={isCatalogLoading || modelCatalog.length === 0}
-              >
-                {directModelDisplay ? (
-                  <div className="fusion-left">
-                    <span className={`fusion-star${DirectIcon ? " has-icon" : ""}`} style={directProviderTintStyle}>
-                      {DirectIcon ? <DirectIcon size={18} className="model-company-icon" /> : "✧"}
-                    </span>
-                    <span>
-                      <strong>{directModelDisplay.name}</strong>
-                      <small>{directModelDisplay.provider}</small>
-                    </span>
-                  </div>
-                ) : (
-                  <span className="muted">Select direct chat model</span>
-                )}
-              </button>
-              <div className="picker-anchor">{activePicker === "direct" && renderPicker()}</div>
-            </section>
-
             <section className="panel composer-panel direct-composer-panel">
               <DirectChatTranscript messages={directMessages} isRunning={isDirectRunning} />
 
