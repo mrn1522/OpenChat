@@ -87,6 +87,14 @@ type StepStatus = "pending" | "active" | "done";
 type ResultTab = "fusion" | "summaries" | "sources";
 type AppPage = "fusion" | "direct" | "history";
 type ThemeMode = "dark" | "light";
+
+const readStoredTheme = (): ThemeMode => {
+  try {
+    return window.localStorage.getItem("openchat-theme") === "light" ? "light" : "dark";
+  } catch {
+    return "dark";
+  }
+};
 type ExperienceModeTab = {
   id: string;
   title: string;
@@ -462,9 +470,8 @@ function App() {
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
   const [appSettings, setAppSettings] = useState<AppSettings | null>(null);
   const [isAppSettingsOpen, setIsAppSettingsOpen] = useState(false);
-  const [themeMode, setThemeMode] = useState<ThemeMode>(() =>
-    window.localStorage.getItem("openchat-theme") === "light" ? "light" : "dark",
-  );
+  const appSettingsOpenerRef = useRef<HTMLElement | null>(null);
+  const [themeMode, setThemeMode] = useState<ThemeMode>(readStoredTheme);
   const [apiKeyInput, setApiKeyInput] = useState("");
   const [baseUrlInput, setBaseUrlInput] = useState("");
   const [isSavingApiSettings, setIsSavingApiSettings] = useState(false);
@@ -545,6 +552,8 @@ function App() {
   }, []);
 
   const openAppSettings = () => {
+    const opener = document.activeElement;
+    appSettingsOpenerRef.current = opener instanceof HTMLElement ? opener : null;
     setApiKeyInput("");
     setBaseUrlInput(appSettings?.base_url ?? "https://openrouter.ai/api/v1");
     setApiSettingsError(null);
@@ -553,16 +562,49 @@ function App() {
 
   useEffect(() => {
     document.documentElement.dataset.theme = themeMode;
-    window.localStorage.setItem("openchat-theme", themeMode);
+    try {
+      window.localStorage.setItem("openchat-theme", themeMode);
+    } catch {
+      // Storage may be blocked; the theme still applies for this session.
+    }
   }, [themeMode]);
 
   useEffect(() => {
-    if (!isAppSettingsOpen || !appSettings?.api_key_configured) return;
-    const handleEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setIsAppSettingsOpen(false);
+    if (!isAppSettingsOpen) return;
+    const canDismiss = Boolean(appSettings?.api_key_configured);
+    const panel = document.querySelector<HTMLElement>(".api-settings-panel");
+    const handleKeydown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        if (canDismiss) setIsAppSettingsOpen(false);
+        return;
+      }
+      if (event.key !== "Tab" || !panel) return;
+      const focusables = Array.from(
+        panel.querySelectorAll<HTMLElement>(
+          'button, input, select, textarea, a[href], [tabindex]:not([tabindex="-1"])',
+        ),
+      ).filter((el) => !el.hasAttribute("disabled"));
+      if (focusables.length === 0) return;
+      const first = focusables[0];
+      const last = focusables[focusables.length - 1];
+      const active = document.activeElement;
+      if (!panel.contains(active)) {
+        event.preventDefault();
+        (event.shiftKey ? last : first).focus();
+      } else if (event.shiftKey && active === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && active === last) {
+        event.preventDefault();
+        first.focus();
+      }
     };
-    window.addEventListener("keydown", handleEscape);
-    return () => window.removeEventListener("keydown", handleEscape);
+    window.addEventListener("keydown", handleKeydown);
+    return () => {
+      window.removeEventListener("keydown", handleKeydown);
+      appSettingsOpenerRef.current?.focus();
+      appSettingsOpenerRef.current = null;
+    };
   }, [isAppSettingsOpen, appSettings?.api_key_configured]);
 
   const saveApiSettings = async () => {
@@ -2043,6 +2085,14 @@ function App() {
           <img src={settingsIcon} alt="" aria-hidden="true" className="ui-icon rail-settings-icon" />
         </button>
       </aside>
+      <button
+        type="button"
+        className={`rail-settings-btn mobile-settings-btn${isAppSettingsOpen ? " active" : ""}`}
+        onClick={openAppSettings}
+        aria-label="Open settings"
+      >
+        <img src={settingsIcon} alt="" aria-hidden="true" className="ui-icon rail-settings-icon" />
+      </button>
 
       {activePage === "fusion" && (
         <div className="fusion-top">
