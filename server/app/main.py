@@ -15,6 +15,8 @@ from dotenv import dotenv_values
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
+from starlette.middleware.gzip import GZipResponder
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.chat_store import (
     WorkflowNameExistsError,
@@ -31,6 +33,7 @@ from app.chat_store import (
 from app.config import reload_settings, settings, settings_env_file
 from app.secrets_store import DPAPI_PREFIX, protect_secret
 from app.llm import (
+    aclose_clients,
     build_client,
     fetch_openrouter_models,
     generate_persona_assignments,
@@ -72,12 +75,19 @@ from app.prompting import (
 
 logger = logging.getLogger(__name__)
 
+# Serializes PUT /api/settings: the env-file read-modify-write used to be
+# atomic with respect to other requests because it ran synchronously on the
+# event loop; now that it runs in a worker thread the lock is required to
+# keep two concurrent updates from interleaving.
+_settings_write_lock = asyncio.Lock()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> None:
     init_chat_store(settings.openchat_history_db_path)
     _protect_api_key_at_rest()
     yield
+    await aclose_clients()
 
 
 app = FastAPI(title="OpenChat MoA Proxy", version="0.1.0", lifespan=lifespan)
@@ -90,9 +100,104 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+class _SSEAwareGZipResponder(GZipResponder):
+    """GZipResponder that passes ``text/event-stream`` responses through raw.
+
+    Starlette's streaming gzip path writes each body chunk into the
+    compressor but never flushes it, so a gzipped SSE response would emit
+    empty chunks and withhold every event — including heartbeats — until
+    zlib's internal block fills or the stream ends.
+    """
+
+    passthrough = False
+
+    async def send_with_gzip(self, message: Message) -> None:
+        if message["type"] == "http.response.start":
+            headers = dict(message["headers"])
+            content_type = headers.get(b"content-type", b"").decode("latin-1")
+            self.passthrough = (
+                content_type.split(";", 1)[0].strip() == "text/event-stream"
+            )
+        if self.passthrough:
+            await self.send(message)
+            return
+        await super().send_with_gzip(message)
+
+
+class GZipUnlessSSEMiddleware:
+    """Apply gzip compression to every response except SSE streams."""
+
+    def __init__(self, app: ASGIApp, minimum_size: int = 1024) -> None:
+        self.app = app
+        self.minimum_size = minimum_size
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            accept_encoding = dict(scope["headers"]).get(b"accept-encoding", b"")
+            if b"gzip" in accept_encoding:
+                responder = _SSEAwareGZipResponder(self.app, self.minimum_size)
+                await responder(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+# Compress large JSON responses (model catalog, history lists); SSE routes
+# must not be compressed or their events would be buffered by the
+# compressor instead of flushing per event.
+app.add_middleware(GZipUnlessSSEMiddleware, minimum_size=1024)
+
 
 def sse(event: str, data: dict) -> str:
     return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+SSE_HEADERS = {
+    # no-cache keeps intermediaries from caching; X-Accel-Buffering disables
+    # proxy buffering so events are delivered as they are produced.
+    "Cache-Control": "no-cache",
+    "X-Accel-Buffering": "no",
+}
+
+SSE_HEARTBEAT_INTERVAL_SECONDS = 15.0
+
+
+async def _stream_with_heartbeat(stream: AsyncIterator[str]) -> AsyncIterator[str]:
+    """Interleave SSE comment heartbeats into a possibly-quiet event stream.
+
+    Long upstream model calls can leave the response silent for tens of
+    seconds; proxies may drop idle connections. Periodic ``: heartbeat``
+    comment lines keep the stream alive and are ignored by the client's
+    event parser (they carry no ``event:``/``data:`` lines).
+    """
+    queue: asyncio.Queue[str | BaseException | None] = asyncio.Queue()
+
+    async def pump() -> None:
+        try:
+            async for event in stream:
+                await queue.put(event)
+        except BaseException as exc:  # noqa: BLE001
+            await queue.put(exc)
+        else:
+            await queue.put(None)
+
+    task = asyncio.create_task(pump())
+    try:
+        while True:
+            try:
+                item = await asyncio.wait_for(
+                    queue.get(), timeout=SSE_HEARTBEAT_INTERVAL_SECONDS
+                )
+            except asyncio.TimeoutError:
+                yield ": heartbeat\n\n"
+                continue
+            if item is None:
+                return
+            if isinstance(item, BaseException):
+                raise item
+            yield item
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
 
 
 def build_debate_pairs(
@@ -203,7 +308,11 @@ async def run_debate_jobs(
     reasoning_exclude: bool,
     run_model=run_markdown_model,
 ) -> AsyncIterator[DebateJobOutcome]:
-    """Run all debate jobs concurrently with no concurrency cap.
+    """Run all debate jobs concurrently, capped like the source stage.
+
+    Full debate produces N*(N-1) jobs; without a bound that many requests
+    fan out at once and trip provider rate limits. Jobs share the
+    ``openchat_max_parallel_sources`` budget.
 
     Yields outcomes in completion order so callers can stream ``debate_result``
     SSE events as soon as each review finishes. The final Debate Report should
@@ -212,19 +321,22 @@ async def run_debate_jobs(
     if not jobs:
         return
 
+    semaphore = asyncio.Semaphore(max(1, settings.openchat_max_parallel_sources))
+
     async def _run_one(job: DebateJob) -> DebateJobOutcome:
         try:
-            content = await run_model(
-                client=client,
-                model=job.reviewer_model,
-                prompt=job.prompt,
-                system_prompt=debate_system_prompt,
-                temperature=temperature,
-                web_search_enabled=False,
-                reasoning_effort=reasoning_effort,
-                reasoning_exclude=reasoning_exclude,
-                context="Debate",
-            )
+            async with semaphore:
+                content = await run_model(
+                    client=client,
+                    model=job.reviewer_model,
+                    prompt=job.prompt,
+                    system_prompt=debate_system_prompt,
+                    temperature=temperature,
+                    web_search_enabled=False,
+                    reasoning_effort=reasoning_effort,
+                    reasoning_exclude=reasoning_exclude,
+                    context="Debate",
+                )
         except Exception as exc:  # noqa: BLE001
             return DebateJobFailure(
                 pair_index=job.pair_index,
@@ -368,27 +480,28 @@ async def get_settings() -> SettingsResponse:
 
 @app.put("/api/settings", response_model=SettingsResponse)
 async def update_settings(request: SettingsUpdateRequest) -> SettingsResponse:
-    values: dict[str, str | None] = {}
-    if request.api_key is not None:
-        api_key = request.api_key.strip()
-        values["OPENAI_API_KEY"] = protect_secret(api_key) or None
-        if api_key:
-            os.environ["OPENAI_API_KEY"] = api_key
-        else:
-            os.environ.pop("OPENAI_API_KEY", None)
-    if request.base_url is not None:
-        values["OPENAI_BASE_URL"] = request.base_url.strip() or None
-
-    if values:
-        _upsert_env_values(settings_env_file(), values)
-        for key, value in values.items():
-            if key == "OPENAI_API_KEY":
-                continue  # process env already holds the plaintext key
-            if value is None:
-                os.environ.pop(key, None)
+    async with _settings_write_lock:
+        values: dict[str, str | None] = {}
+        if request.api_key is not None:
+            api_key = request.api_key.strip()
+            values["OPENAI_API_KEY"] = protect_secret(api_key) or None
+            if api_key:
+                os.environ["OPENAI_API_KEY"] = api_key
             else:
-                os.environ[key] = value
-        reload_settings()
+                os.environ.pop("OPENAI_API_KEY", None)
+        if request.base_url is not None:
+            values["OPENAI_BASE_URL"] = request.base_url.strip() or None
+
+        if values:
+            await asyncio.to_thread(_upsert_env_values, settings_env_file(), values)
+            for key, value in values.items():
+                if key == "OPENAI_API_KEY":
+                    continue  # process env already holds the plaintext key
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            await asyncio.to_thread(reload_settings)
 
     return _settings_response()
 
@@ -688,7 +801,8 @@ async def run_stream(request: RunRequest):
 
             elapsed_ms = int((time.perf_counter() - started) * 1000)
             try:
-                save_chat_record(
+                await asyncio.to_thread(
+                    save_chat_record,
                     settings.openchat_history_db_path,
                     chat_id=chat_id,
                     run_id=run_id,
@@ -719,7 +833,8 @@ async def run_stream(request: RunRequest):
         elapsed_ms = int((time.perf_counter() - started) * 1000)
 
         try:
-            save_chat_record(
+            await asyncio.to_thread(
+                save_chat_record,
                 settings.openchat_history_db_path,
                 chat_id=chat_id,
                 run_id=run_id,
@@ -737,7 +852,11 @@ async def run_stream(request: RunRequest):
 
         yield sse("completed", {"elapsed_ms": elapsed_ms})
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        _stream_with_heartbeat(event_stream()),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
 
 
 @app.post("/api/direct-chat/stream")
@@ -759,8 +878,10 @@ async def direct_chat_stream(request: DirectChatRequest):
         conversation_id = request.conversation_id or chat_id
         if request.conversation_id:
             try:
-                existing_kind = get_conversation_kind(
-                    settings.openchat_history_db_path, conversation_id
+                existing_kind = await asyncio.to_thread(
+                    get_conversation_kind,
+                    settings.openchat_history_db_path,
+                    conversation_id,
                 )
                 if existing_kind is not None and existing_kind != "direct":
                     conversation_id = chat_id
@@ -805,7 +926,8 @@ async def direct_chat_stream(request: DirectChatRequest):
             )
 
         try:
-            save_chat_record(
+            await asyncio.to_thread(
+                save_chat_record,
                 settings.openchat_history_db_path,
                 chat_id=conversation_id,
                 run_id=run_id,
@@ -845,7 +967,11 @@ async def direct_chat_stream(request: DirectChatRequest):
 
         yield sse("completed", {"elapsed_ms": elapsed_ms})
 
-    return StreamingResponse(event_stream(), media_type="text/event-stream")
+    return StreamingResponse(
+        _stream_with_heartbeat(event_stream()),
+        media_type="text/event-stream",
+        headers=SSE_HEADERS,
+    )
 
 
 @app.get("/api/models", response_model=OpenRouterModelsResponse)
@@ -862,7 +988,9 @@ async def get_models() -> OpenRouterModelsResponse:
 @app.get("/api/chats", response_model=ChatHistoryListResponse)
 async def list_chats() -> ChatHistoryListResponse:
     try:
-        records = list_chat_records(settings.openchat_history_db_path)
+        records = await asyncio.to_thread(
+            list_chat_records, settings.openchat_history_db_path
+        )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed to load chat history: {exc}") from exc
 
@@ -872,7 +1000,9 @@ async def list_chats() -> ChatHistoryListResponse:
 @app.get("/api/workflows", response_model=WorkflowListResponse)
 async def list_workflows() -> WorkflowListResponse:
     try:
-        records = list_workflow_records(settings.openchat_history_db_path)
+        records = await asyncio.to_thread(
+            list_workflow_records, settings.openchat_history_db_path
+        )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed to load workflows: {exc}") from exc
 
@@ -888,7 +1018,8 @@ async def create_workflow(request: WorkflowCreateRequest) -> WorkflowSummary:
     workflow_id = str(uuid.uuid4())
 
     try:
-        record = save_workflow_record(
+        record = await asyncio.to_thread(
+            save_workflow_record,
             settings.openchat_history_db_path,
             workflow_id=workflow_id,
             name=workflow_name,
@@ -905,7 +1036,9 @@ async def create_workflow(request: WorkflowCreateRequest) -> WorkflowSummary:
 @app.delete("/api/workflows/{workflow_id}")
 async def delete_workflow(workflow_id: str) -> dict:
     try:
-        deleted = delete_workflow_record(settings.openchat_history_db_path, workflow_id)
+        deleted = await asyncio.to_thread(
+            delete_workflow_record, settings.openchat_history_db_path, workflow_id
+        )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed to delete workflow: {exc}") from exc
 
@@ -918,7 +1051,9 @@ async def delete_workflow(workflow_id: str) -> dict:
 @app.get("/api/chats/{chat_id}", response_model=ChatHistoryDetail)
 async def get_chat(chat_id: str) -> ChatHistoryDetail:
     try:
-        record = get_chat_record(settings.openchat_history_db_path, chat_id)
+        record = await asyncio.to_thread(
+            get_chat_record, settings.openchat_history_db_path, chat_id
+        )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed to load chat: {exc}") from exc
 
@@ -931,7 +1066,9 @@ async def get_chat(chat_id: str) -> ChatHistoryDetail:
 @app.delete("/api/chats/{chat_id}")
 async def delete_chat(chat_id: str) -> dict:
     try:
-        deleted = delete_chat_record(settings.openchat_history_db_path, chat_id)
+        deleted = await asyncio.to_thread(
+            delete_chat_record, settings.openchat_history_db_path, chat_id
+        )
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Failed to delete chat: {exc}") from exc
 

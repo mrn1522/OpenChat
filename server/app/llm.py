@@ -2,8 +2,8 @@ import asyncio
 import json
 import logging
 import time
-from collections.abc import AsyncGenerator
-from typing import Any
+from collections.abc import AsyncGenerator, Awaitable, Callable
+from typing import Any, TypeVar
 
 import httpx
 from openai import AsyncOpenAI
@@ -28,6 +28,8 @@ from app.prompting import (
     build_persona_generation_prompt,
     build_source_system_prompt,
 )
+
+T = TypeVar("T")
 
 WEB_SEARCH_TOOLS = [
     {
@@ -117,29 +119,135 @@ Return exactly this schema:
 """
 
 
+# One long-lived connection pool is shared by the OpenAI SDK and the models
+# endpoint: previously every request built a fresh AsyncOpenAI/httpx client,
+# paying TCP+TLS setup per call and leaking an unclosed pool each time.
+_shared_http_client: httpx.AsyncClient | None = None
+_openai_client: AsyncOpenAI | None = None
+_openai_client_key: tuple[str, str, float] | None = None
+
+_MODELS_CACHE_TTL_SECONDS = 300.0
+# (base_url, fetched_at, response): the catalog belongs to the provider it was
+# fetched from — after a base_url change it is neither fresh nor a valid
+# stale fallback.
+_models_cache: tuple[str, float, OpenRouterModelsResponse] | None = None
+_models_cache_lock = asyncio.Lock()
+
+
+def _shared_http() -> httpx.AsyncClient:
+    global _shared_http_client
+    if _shared_http_client is None:
+        # Match the SDK's DefaultAsyncHttpxClient (follow_redirects + its
+        # connection limits) so injecting this client changes pooling only,
+        # not redirect or connection-limit behavior.
+        _shared_http_client = httpx.AsyncClient(
+            timeout=settings.openchat_timeout_seconds,
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=1000, max_keepalive_connections=100),
+        )
+    return _shared_http_client
+
+
 def build_client() -> AsyncOpenAI:
+    """Return the shared AsyncOpenAI client, rebuilding when settings change.
+
+    Reuses one connection pool across all requests. A settings change rebuilds
+    only the thin SDK wrapper; the shared pool persists until app shutdown
+    (``aclose_clients``).
+    """
     if not settings.openai_api_key:
         raise RuntimeError("Missing OPENAI_API_KEY in server environment")
 
-    return AsyncOpenAI(
+    global _openai_client, _openai_client_key
+    key = (
+        settings.openai_api_key,
+        settings.openai_base_url,
+        settings.openchat_timeout_seconds,
+    )
+    if _openai_client is not None and _openai_client_key == key:
+        return _openai_client
+
+    _openai_client = AsyncOpenAI(
         api_key=settings.openai_api_key,
         base_url=settings.openai_base_url,
         timeout=settings.openchat_timeout_seconds,
+        http_client=_shared_http(),
     )
+    _openai_client_key = key
+    return _openai_client
+
+
+async def aclose_clients() -> None:
+    """Close the shared connection pool (app shutdown)."""
+    global _shared_http_client, _openai_client, _openai_client_key
+    client = _shared_http_client
+    _shared_http_client = None
+    _openai_client = None
+    _openai_client_key = None
+    if client is not None:
+        await client.aclose()
 
 
 async def fetch_openrouter_models() -> OpenRouterModelsResponse:
+    """Fetch the model catalog, cached for ``_MODELS_CACHE_TTL_SECONDS``.
+
+    The catalog is large (hundreds of KB) and changes rarely; on a refresh
+    failure a stale cached response is served instead of erroring.
+    """
     base_url = settings.openai_base_url.rstrip("/")
     models_url = f"{base_url}/models"
 
-    async with httpx.AsyncClient(timeout=settings.openchat_timeout_seconds) as client:
-        response = await client.get(models_url)
-        response.raise_for_status()
+    global _models_cache
 
-    payload = response.json()
-    models = payload.get("data", []) if isinstance(payload, dict) else []
-    parsed = [OpenRouterModel.model_validate(item) for item in models if isinstance(item, dict)]
-    return OpenRouterModelsResponse(data=parsed)
+    def _stale() -> OpenRouterModelsResponse | None:
+        """The cached catalog, only when it came from the current base_url."""
+        if _models_cache is not None and _models_cache[0] == base_url:
+            return _models_cache[2]
+        return None
+
+    now = time.monotonic()
+    cached = _stale()
+    if cached is not None and now - _models_cache[1] < _MODELS_CACHE_TTL_SECONDS:
+        return cached
+
+    async with _models_cache_lock:
+        # Re-check inside the lock: a concurrent caller may have refreshed.
+        now = time.monotonic()
+        cached = _stale()
+        if cached is not None and now - _models_cache[1] < _MODELS_CACHE_TTL_SECONDS:
+            return cached
+
+        try:
+            response = await _shared_http().get(models_url)
+            response.raise_for_status()
+            payload = response.json()
+            # ValueError covers JSON decoding, shape mismatches, and pydantic
+            # model validation: a malformed or empty 200 triggers the same
+            # stale fallback as a 5xx instead of replacing the good cache
+            # with an empty catalog.
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, list):
+                raise ValueError("Models catalog missing 'data' list")
+            result = OpenRouterModelsResponse(
+                data=[
+                    OpenRouterModel.model_validate(item)
+                    for item in data
+                    if isinstance(item, dict)
+                ]
+            )
+            if not result.data:
+                raise ValueError("Models catalog contains no usable models")
+        except (httpx.HTTPError, ValueError):
+            if cached is not None:
+                logger.warning(
+                    "OpenRouter models refresh failed; serving stale catalog.",
+                    exc_info=True,
+                )
+                return cached
+            raise
+
+        _models_cache = (base_url, time.monotonic(), result)
+        return result
 
 
 def _build_prompt_with_attachments(prompt: str, attachments: list[AttachmentInput]) -> str:
@@ -567,6 +675,47 @@ def _is_retryable_exception(exc: BaseException) -> bool:
     return False
 
 
+async def _with_transient_retry(
+    operation: Callable[[], Awaitable[T]],
+    *,
+    context: str,
+    model: str,
+    max_retries: int = MARKDOWN_MODEL_RETRY_COUNT,
+) -> T:
+    """Run ``operation`` with bounded retry on transient failures.
+
+    Retries only errors classified by ``_is_retryable_exception`` (empty
+    ``choices``, timeouts, connection errors, 429/5xx). Non-retryable errors
+    propagate immediately; on final failure the last exception (with any
+    sanitized ``CompletionFailure`` diagnostics) is re-raised.
+    """
+    last_exc: BaseException | None = None
+    total_attempts = 1 + max(0, max_retries)
+
+    for attempt_index in range(total_attempts):
+        try:
+            return await operation()
+        except Exception as exc:  # noqa: BLE001
+            last_exc = exc
+            if attempt_index == total_attempts - 1 or not _is_retryable_exception(exc):
+                raise
+            logger.warning(
+                "%s for model '%s' failed on attempt %d/%d with a retryable error; "
+                "retrying after backoff. Error: %s",
+                context,
+                model,
+                attempt_index + 1,
+                total_attempts,
+                exc,
+            )
+            await asyncio.sleep(MARKDOWN_MODEL_RETRY_BACKOFF_SECONDS)
+
+    # Unreachable: the loop either returns or raises. Kept for type safety.
+    if last_exc is not None:
+        raise last_exc
+    raise RuntimeError(f"{context} for model '{model}' failed without a captured exception.")
+
+
 async def _run_chat_completion_with_tool_loop(
     *,
     client: AsyncOpenAI,
@@ -670,15 +819,33 @@ async def run_single_model(
         messages.append({"role": "user", "content": composed_prompt})
 
         total_attempts = 1 + SOURCE_EMPTY_RETRY_COUNT
+        content = ""
 
         for attempt_index in range(total_attempts):
-            content = await _run_chat_completion_with_tool_loop(
-                client=client,
-                model=model,
-                temperature=temperature,
-                messages=messages,
-                extra_body=extra_body,
-            )
+            try:
+                content = await _run_chat_completion_with_tool_loop(
+                    client=client,
+                    model=model,
+                    temperature=temperature,
+                    messages=messages,
+                    extra_body=extra_body,
+                )
+            except Exception as exc:  # noqa: BLE001
+                # Transient failures (timeout, 429/5xx, no-choices) retry within
+                # the same bounded budget as empty-content retries; anything
+                # else propagates to the error SourceResult below.
+                if attempt_index < total_attempts - 1 and _is_retryable_exception(exc):
+                    logger.warning(
+                        "Source model '%s' failed on attempt %d/%d with a retryable "
+                        "error; retrying after backoff. Error: %s",
+                        model,
+                        attempt_index + 1,
+                        total_attempts,
+                        exc,
+                    )
+                    await asyncio.sleep(MARKDOWN_MODEL_RETRY_BACKOFF_SECONDS)
+                    continue
+                raise
             if content.strip():
                 elapsed = int((time.perf_counter() - start) * 1000)
                 return SourceResult(
@@ -689,19 +856,18 @@ async def run_single_model(
                     latency_ms=elapsed,
                 )
 
-            if attempt_index == total_attempts - 1:
-                elapsed = int((time.perf_counter() - start) * 1000)
-                return SourceResult(
-                    model=model,
-                    agent_id=agent_id or model,
-                    content="",
-                    status="error",
-                    error=(
-                        "Model returned empty content after "
-                        f"{total_attempts} attempts."
-                    ),
-                    latency_ms=elapsed,
-                )
+        elapsed = int((time.perf_counter() - start) * 1000)
+        return SourceResult(
+            model=model,
+            agent_id=agent_id or model,
+            content="",
+            status="error",
+            error=(
+                "Model returned empty content after "
+                f"{total_attempts} attempts."
+            ),
+            latency_ms=elapsed,
+        )
     except Exception as exc:  # noqa: BLE001
         elapsed = int((time.perf_counter() - start) * 1000)
         return SourceResult(
@@ -739,7 +905,7 @@ async def run_source_models(
     system_prompt: str | None = None,
     system_prompt_by_agent: dict[str, str] | None = None,
 ) -> AsyncGenerator[SourceResult, None]:
-    semaphore = asyncio.Semaphore(settings.openchat_max_parallel_sources)
+    semaphore = asyncio.Semaphore(max(1, settings.openchat_max_parallel_sources))
 
     async def runner(agent: SourceAgentSpec) -> SourceResult:
         async with semaphore:
@@ -767,9 +933,16 @@ async def run_source_models(
             )
 
     tasks = [asyncio.create_task(runner(agent)) for agent in agents]
-
-    for completed in asyncio.as_completed(tasks):
-        yield await completed
+    try:
+        for completed in asyncio.as_completed(tasks):
+            yield await completed
+    finally:
+        # Ensure no orphaned tasks if the SSE consumer disconnects mid-stream.
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
 
 async def run_markdown_model(
@@ -804,38 +977,19 @@ async def run_markdown_model(
         messages.append({"role": "system", "content": system_prompt.strip()})
     messages.append({"role": "user", "content": prompt})
 
-    last_exc: BaseException | None = None
-    total_attempts = 1 + max(0, max_retries)
-
-    for attempt_index in range(total_attempts):
-        try:
-            return await _run_chat_completion_with_tool_loop(
-                client=client,
-                model=model,
-                temperature=temperature,
-                messages=messages,
-                extra_body=extra_body,
-                context=context,
-            )
-        except Exception as exc:  # noqa: BLE001
-            last_exc = exc
-            if attempt_index == total_attempts - 1 or not _is_retryable_exception(exc):
-                raise
-            logger.warning(
-                "%s for model '%s' failed on attempt %d/%d with a retryable error; "
-                "retrying after backoff. Error: %s",
-                context,
-                model,
-                attempt_index + 1,
-                total_attempts,
-                exc,
-            )
-            await asyncio.sleep(MARKDOWN_MODEL_RETRY_BACKOFF_SECONDS)
-
-    # Unreachable: the loop either returns or raises. Kept for type safety.
-    if last_exc is not None:
-        raise last_exc
-    raise RuntimeError(f"{context} for model '{model}' failed without a captured exception.")
+    return await _with_transient_retry(
+        lambda: _run_chat_completion_with_tool_loop(
+            client=client,
+            model=model,
+            temperature=temperature,
+            messages=messages,
+            extra_body=extra_body,
+            context=context,
+        ),
+        context=context,
+        model=model,
+        max_retries=max_retries,
+    )
 
 
 async def run_direct_chat_model(
@@ -861,12 +1015,17 @@ async def run_direct_chat_model(
         reasoning_exclude=reasoning_exclude,
     )
 
-    return await _run_chat_completion_with_tool_loop(
-        client=client,
+    return await _with_transient_retry(
+        lambda: _run_chat_completion_with_tool_loop(
+            client=client,
+            model=model,
+            temperature=temperature,
+            messages=normalized_messages,
+            extra_body=extra_body,
+            context="Direct chat",
+        ),
+        context="Direct chat",
         model=model,
-        temperature=temperature,
-        messages=normalized_messages,
-        extra_body=extra_body,
     )
 
 
@@ -893,24 +1052,33 @@ def _build_direct_chat_messages(
 
 
 async def optimize_prompt_text(client: AsyncOpenAI, prompt: str) -> str:
-    response = await client.chat.completions.create(
+    async def _call() -> str:
+        # Extraction runs inside the retry boundary so an empty-choices
+        # completion (CompletionFailure) retries like a transport failure.
+        response = await client.chat.completions.create(
+            model=PROMPT_OPTIMIZER_MODEL,
+            temperature=0.1,
+            max_tokens=OPENROUTER_TOKEN_LIMIT,
+            max_completion_tokens=OPENROUTER_TOKEN_LIMIT,
+            messages=[
+                {"role": "system", "content": PROMPT_OPTIMIZER_SYSTEM_PROMPT},
+                {"role": "user", "content": prompt},
+            ],
+            extra_body={
+                "reasoning": {
+                    "effort": "low",
+                    "exclude": True,
+                }
+            },
+        )
+        return _extract_first_choice_message_content(response, context="Prompt optimizer")
+
+    content = await _with_transient_retry(
+        _call,
+        context="Prompt optimizer",
         model=PROMPT_OPTIMIZER_MODEL,
-        temperature=0.1,
-        max_tokens=OPENROUTER_TOKEN_LIMIT,
-        max_completion_tokens=OPENROUTER_TOKEN_LIMIT,
-        messages=[
-            {"role": "system", "content": PROMPT_OPTIMIZER_SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        extra_body={
-            "reasoning": {
-                "effort": "low",
-                "exclude": True,
-            }
-        },
     )
 
-    content = _extract_first_choice_message_content(response, context="Prompt optimizer")
     optimized = _extract_optimized_prompt(content)
     return optimized or prompt.strip()
 
@@ -925,24 +1093,33 @@ async def generate_persona_assignments(
 
     user_content = build_persona_generation_prompt(user_prompt, agents)
 
-    response = await client.chat.completions.create(
+    async def _call() -> str:
+        # Extraction runs inside the retry boundary so an empty-choices
+        # completion (CompletionFailure) retries like a transport failure.
+        response = await client.chat.completions.create(
+            model=PERSONA_GENERATOR_MODEL,
+            temperature=0.1,
+            max_tokens=OPENROUTER_TOKEN_LIMIT,
+            max_completion_tokens=OPENROUTER_TOKEN_LIMIT,
+            messages=[
+                {"role": "system", "content": PERSONA_GENERATOR_SYSTEM_PROMPT},
+                {"role": "user", "content": user_content},
+            ],
+            extra_body=_build_openrouter_extra_body(
+                web_search_enabled=False,
+                reasoning_effort="high",
+                reasoning_exclude=True,
+                allow_tools=False,
+            ),
+        )
+        return _extract_first_choice_message_content(response, context="Persona generator")
+
+    content = await _with_transient_retry(
+        _call,
+        context="Persona generator",
         model=PERSONA_GENERATOR_MODEL,
-        temperature=0.1,
-        max_tokens=OPENROUTER_TOKEN_LIMIT,
-        max_completion_tokens=OPENROUTER_TOKEN_LIMIT,
-        messages=[
-            {"role": "system", "content": PERSONA_GENERATOR_SYSTEM_PROMPT},
-            {"role": "user", "content": user_content},
-        ],
-        extra_body=_build_openrouter_extra_body(
-            web_search_enabled=False,
-            reasoning_effort="high",
-            reasoning_exclude=True,
-            allow_tools=False,
-        ),
     )
 
-    content = _extract_first_choice_message_content(response, context="Persona generator")
     assignments = _extract_persona_assignments(content, agents)
     if assignments is None:
         raise RuntimeError("Persona generator returned invalid or incomplete persona assignments.")
