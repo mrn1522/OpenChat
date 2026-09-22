@@ -22,7 +22,7 @@ import subprocess
 import sys
 
 TAG_RE = re.compile(r"^v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$")
-SUBJECT_RE = re.compile(r"^(?P<type>[a-zA-Z]+)(?:\([^)]*\))?!?:\s*(?P<summary>.+?)\s*(?:\(#(?P<pr>\d+)\))?$")
+SUBJECT_RE = re.compile(r"^(?P<type>[a-zA-Z]+)(?:\([^)]*\))?!?:\s*(?P<summary>.+?)\s*(?:\(#(?P<pr>[1-9]\d*)\))?$")
 
 SECTIONS = [
     ("feat", "✨ New Features"),
@@ -80,6 +80,18 @@ def render(tag: str, slug: str, prev: str | None) -> str:
     """Build the patch-notes markdown for commits in the prev..tag range."""
     rng = f"{prev}..{tag}" if prev else tag
     subjects = git("log", rng, "--pretty=%s").splitlines()
+    # Squash-merged release PRs collapse the range into one `release:` commit
+    # whose body lists the squashed changes as `* subject (#N)` bullets — pull
+    # those in (fixup commits inside PRs lack the (#N) suffix and are skipped).
+    # Only scan bullets on release commits; ordinary squash tags keep
+    # range-only semantics so their nested bullets can't leak in.
+    if git("log", "-1", tag, "--pretty=%s").strip().startswith("release:"):
+        seen = {s.strip() for s in subjects}
+        for line in git("log", "-1", tag, "--format=%B").splitlines():
+            if b := re.match(r"^\s*\*\s+(.+\(#[1-9]\d*\))\s*$", line):
+                if b.group(1).strip() not in seen:
+                    seen.add(b.group(1).strip())
+                    subjects.append(b.group(1).strip())
 
     grouped: dict[str, list[str]] = {}
     order: list[str] = []

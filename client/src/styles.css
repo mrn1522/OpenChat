@@ -364,26 +364,26 @@ body {
   background: var(--th-ink-33);
 }
 
-.fusion-top {
+.page-top {
   grid-column: 2;
   display: grid;
   gap: 12px;
   align-content: start;
 }
 
-.app-shell:has(> .fusion-top) {
+.app-shell:has(> .page-top) {
   grid-template-rows: auto 1fr;
 }
 
-.app-shell:has(> .fusion-top) > .sidebar-rail {
+.app-shell:has(> .page-top) > .sidebar-rail {
   grid-row: 2;
 }
 
-.app-shell:has(> .fusion-top) > .main-column {
+.app-shell:has(> .page-top) > .main-column {
   grid-column: 2;
 }
 
-.app-shell:has(> .fusion-top) > .right-column {
+.app-shell:has(> .page-top) > .right-column {
   grid-column: 3;
   grid-row: 1 / -1;
 }
@@ -2410,11 +2410,11 @@ button:disabled {
     grid-template-columns: repeat(2, minmax(0, 1fr));
   }
 
-  .app-shell:has(> .fusion-top) {
+  .app-shell:has(> .page-top) {
     grid-template-rows: auto;
   }
 
-  .app-shell:has(> .fusion-top) > .right-column {
+  .app-shell:has(> .page-top) > .right-column {
     grid-column: 1 / -1;
     grid-row: auto;
   }
@@ -2446,11 +2446,11 @@ button:disabled {
     padding: 12px;
   }
 
-  .fusion-top {
+  .page-top {
     grid-column: 1;
   }
 
-  .app-shell:has(> .fusion-top) > .main-column {
+  .app-shell:has(> .page-top) > .main-column {
     grid-column: 1;
   }
 

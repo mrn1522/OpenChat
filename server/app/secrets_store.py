@@ -19,6 +19,12 @@ logger = logging.getLogger(__name__)
 DPAPI_PREFIX = "dpapi:"
 
 
+def _crypt32() -> "ctypes.WinDLL":
+    # use_last_error is required or get_last_error() returns ctypes' private
+    # (always-zero) copy instead of the real Windows error code.
+    return ctypes.WinDLL("crypt32", use_last_error=True)
+
+
 class _DataBlob(ctypes.Structure):
     _fields_ = [
         ("cbData", ctypes.wintypes.DWORD),
@@ -37,7 +43,7 @@ def _to_blob(data: bytes) -> tuple[_DataBlob, ctypes.Array]:
 def _crypt_protect(data: bytes) -> bytes:
     blob_in, _keep = _to_blob(data)
     blob_out = _DataBlob()
-    crypt32 = ctypes.windll.crypt32
+    crypt32 = _crypt32()
     kernel32 = ctypes.windll.kernel32
     if not crypt32.CryptProtectData(
         ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
@@ -52,7 +58,7 @@ def _crypt_protect(data: bytes) -> bytes:
 def _crypt_unprotect(data: bytes) -> bytes:
     blob_in, _keep = _to_blob(data)
     blob_out = _DataBlob()
-    crypt32 = ctypes.windll.crypt32
+    crypt32 = _crypt32()
     kernel32 = ctypes.windll.kernel32
     if not crypt32.CryptUnprotectData(
         ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)

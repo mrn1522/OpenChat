@@ -134,7 +134,13 @@ def _connect(db_path: str) -> sqlite3.Connection:
     # WAL + NORMAL sync is the standard desktop-app profile: readers never block
     # the writer and a crash leaves the journal recoverable. busy_timeout covers
     # the brief overlap between the streaming write and a history-list read.
-    connection.execute("PRAGMA journal_mode=WAL")
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError as exc:
+        # A transient lock can busy-timeout the pragma; later writes still
+        # carry busy_timeout protection in whatever journal mode remains.
+        if not exc.sqlite_errorname.startswith("SQLITE_BUSY"):
+            raise
     connection.execute("PRAGMA synchronous=NORMAL")
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA busy_timeout=5000")
@@ -457,10 +463,20 @@ def save_chat_record(
 
 def list_chat_records(db_path: str, *, limit: int = 100) -> list[dict[str, Any]]:
     with _connect(db_path) as connection:
+        # fusion_output can be tens of KB per row; the list view only needs to
+        # know whether it is non-empty, so compute that in SQL instead of
+        # hauling every blob into memory. TRIM's second argument lists every
+        # codepoint Python's str.strip() removes (its full str.isspace() set:
+        # ASCII whitespace incl. \x1c-\x1f, NEL, NBSP, and the Unicode
+        # space separators).
         rows = connection.execute(
             """
             SELECT conversation_id, created_at, updated_at, status, title,
-                   request_json, fusion_output
+                   request_json,
+                   (LENGTH(TRIM(fusion_output, char(9,10,11,12,13,28,29,30,31,32,
+                           133,160,5760,8192,8193,8194,8195,8196,8197,8198,8199,
+                           8200,8201,8202,8232,8233,8239,8287,12288))) > 0)
+                       AS has_fusion_output
             FROM conversations
             ORDER BY datetime(updated_at) DESC, updated_at DESC, rowid DESC
             LIMIT ?
@@ -484,7 +500,7 @@ def list_chat_records(db_path: str, *, limit: int = 100) -> list[dict[str, Any]]
                 "prompt_preview": preview,
                 "source_models": request_payload.get("source_models", []),
                 "fusion_model": request_payload.get("fusion_model", ""),
-                "has_fusion_output": bool(str(row["fusion_output"]).strip()),
+                "has_fusion_output": bool(row["has_fusion_output"]),
             }
         )
 
