@@ -16,11 +16,13 @@ OpenChat is a sleek native chat interface for multi-LLM orchestration:
 - `client/`: React + Vite + TypeScript frontend.
 - `server/`: FastAPI proxy that fans out requests and streams events.
 
-## Desktop app (Windows 11)
+## Desktop app (Windows and Linux)
 
-Download the latest Windows installer from the [GitHub Releases](../../releases) page. Release tags must use semantic versions such as `v1.2.3`. On first launch, OpenChat opens a **Connect OpenRouter** panel for your API key. The key is stored in the desktop app data directory, not returned to the client or included in logs; on Windows it is written DPAPI-encrypted so the `.env` file is only readable by that Windows user. You can reopen the panel from the **API key** row in the composer settings popover.
+Download the latest Windows installer from the [GitHub Releases](../../releases) page. Release tags must use semantic versions such as `v1.2.3`. On first launch, OpenChat opens a **Connect OpenRouter** panel for your API key. The key is stored in the desktop app data directory, not returned to the client or included in logs; on Windows it is written DPAPI-encrypted so the `.env` file is only readable by that Windows user (on Linux the `.env` stays plaintext with `0600` permissions). You can reopen the panel from the **API key** row in the composer settings popover.
 
-OpenChat stores desktop data in `%APPDATA%\com.openchat.desktop`, the Windows app-data directory produced by Tauri for the `com.openchat.desktop` identifier. This includes the local settings `.env` file and chat history database.
+OpenChat stores desktop data in the app-data directory produced by Tauri for the `com.openchat.desktop` identifier — `%APPDATA%\com.openchat.desktop` on Windows, `~/.local/share/com.openchat.desktop` on Linux. This includes the local settings `.env` file and chat history database.
+
+Release installers are produced per-OS by CI: the Windows NSIS installer is built by `.github/workflows/desktop-build.yml` on `windows-latest`. Linux builds are supported (the shell compiles and the app runs standalone) but no Linux installer bundle is produced yet — `tauri.conf.json` only declares `nsis` bundle targets, so on Linux `npm run build --prefix desktop` yields the `target/release/openchat-desktop` binary you can run directly. In-app updating is Windows-only; on Linux the updater reports that it is unsupported.
 
 ### Building the desktop app locally
 
@@ -37,7 +39,20 @@ npm ci --prefix desktop
 npm run build --prefix desktop
 ```
 
-For development, run `npm run dev --prefix desktop`; the Tauri shell starts the client dev server and launches a local FastAPI sidecar.
+On Linux the same steps apply with POSIX equivalents (sidecar name: `openchat-server-x86_64-unknown-linux-gnu`):
+
+```bash
+cd OpenChat
+python -m venv server/.venv-desktop
+server/.venv-desktop/bin/pip install -r server/requirements-desktop.txt
+server/.venv-desktop/bin/pyinstaller server/openchat_server.spec
+cp server/dist/openchat-server desktop/src-tauri/binaries/openchat-server-x86_64-unknown-linux-gnu
+npm ci --prefix client
+npm ci --prefix desktop
+npm run build --prefix desktop   # produces desktop/src-tauri/target/release/openchat-desktop
+```
+
+For development, run `npm run dev --prefix desktop`; the Tauri shell starts the client dev server and launches a local FastAPI sidecar. Note that `cargo build` debug binaries load `devUrl` and therefore also need the client dev server running; only release builds embed the frontend.
 
 ## Quick Start
 
