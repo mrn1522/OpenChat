@@ -218,7 +218,10 @@ async def fetch_openrouter_models() -> OpenRouterModelsResponse:
             return cached
 
         try:
-            response = await _shared_http().get(models_url)
+            response = await _shared_http().get(
+                models_url,
+                timeout=settings.openchat_timeout_seconds,
+            )
             response.raise_for_status()
             payload = response.json()
             # ValueError covers JSON decoding, shape mismatches, and pydantic
