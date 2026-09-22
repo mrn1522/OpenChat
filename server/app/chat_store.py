@@ -134,7 +134,13 @@ def _connect(db_path: str) -> sqlite3.Connection:
     # WAL + NORMAL sync is the standard desktop-app profile: readers never block
     # the writer and a crash leaves the journal recoverable. busy_timeout covers
     # the brief overlap between the streaming write and a history-list read.
-    connection.execute("PRAGMA journal_mode=WAL")
+    try:
+        connection.execute("PRAGMA journal_mode=WAL")
+    except sqlite3.OperationalError as exc:
+        # A transient lock can busy-timeout the pragma; later writes still
+        # carry busy_timeout protection in whatever journal mode remains.
+        if not exc.sqlite_errorname.startswith("SQLITE_BUSY"):
+            raise
     connection.execute("PRAGMA synchronous=NORMAL")
     connection.execute("PRAGMA foreign_keys=ON")
     connection.execute("PRAGMA busy_timeout=5000")
