@@ -58,13 +58,26 @@ For development, run `npm run dev --prefix desktop`; the Tauri shell starts the 
 
 ### 1) Backend
 
-```bash
-cd OpenChat/server
+On Windows:
+
+```bat
+cd OpenChat\server
 python -m venv .venv
 .venv\Scripts\activate
 pip install -r requirements.txt
 copy ..\.env.example .env
 .venv\Scripts\python -m uvicorn app.main:app --reload --port 8000
+```
+
+On Linux:
+
+```bash
+cd OpenChat/server
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+cp ../.env.example .env
+python -m uvicorn app.main:app --reload --port 8000
 ```
 
 ### 2) Frontend
