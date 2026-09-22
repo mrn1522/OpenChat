@@ -27,6 +27,11 @@ import pkg from "../package.json";
 export const isDesktopApp = (): boolean =>
   "window" in globalThis && "__TAURI_INTERNALS__" in window;
 
+// In-app install is implemented only on Windows; other desktop platforms
+// get the release-page link instead of an "Update now" button.
+export const isWindowsDesktop = (): boolean =>
+  isDesktopApp() && navigator.platform.startsWith("Win");
+
 let apiBasePromise: Promise<string> | undefined;
 
 const getApiBase = (): Promise<string> => {
