@@ -573,7 +573,7 @@ const SettingsUpdateSection = ({ appVersion }: { appVersion: string | null }) =>
                 Download installer
               </a>
             )}
-            {!isWindowsDesktop() && (
+            {(!isWindowsDesktop() || !installer?.sha256) && (
               <a className="update-link" href={available.releaseUrl} target="_blank" rel="noreferrer">
                 View release
               </a>
