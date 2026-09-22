@@ -56,6 +56,7 @@ import {
   getSettings,
   installDesktopUpdate,
   isDesktopApp,
+  isWindowsDesktop,
   optimizePrompt,
   previewPersonas,
   regenerateFusion,
@@ -553,7 +554,7 @@ const SettingsUpdateSection = ({ appVersion }: { appVersion: string | null }) =>
             {installer && ` — ${(installer.size / (1024 * 1024)).toFixed(0)} MB download`}
           </p>
           <div className="update-controls">
-            {isDesktopApp() && installer?.sha256 && (
+            {isWindowsDesktop() && installer?.sha256 && (
               <button
                 type="button"
                 className="send-btn"
@@ -562,7 +563,7 @@ const SettingsUpdateSection = ({ appVersion }: { appVersion: string | null }) =>
                 Update now
               </button>
             )}
-            {isDesktopApp() && installer && !installer.sha256 && (
+            {isWindowsDesktop() && installer && !installer.sha256 && (
               <span className="update-note">
                 Release asset has no integrity digest — get it from the GitHub release page instead.
               </span>
@@ -572,7 +573,7 @@ const SettingsUpdateSection = ({ appVersion }: { appVersion: string | null }) =>
                 Download installer
               </a>
             )}
-            {!isDesktopApp() && (
+            {!isWindowsDesktop() && (
               <a className="update-link" href={available.releaseUrl} target="_blank" rel="noreferrer">
                 View release
               </a>
