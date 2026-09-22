@@ -18,11 +18,11 @@ OpenChat is a sleek native chat interface for multi-LLM orchestration:
 
 ## Desktop app (Windows and Linux)
 
-Download the latest Windows installer from the [GitHub Releases](../../releases) page. Release tags must use semantic versions such as `v1.2.3`. On first launch, OpenChat opens a **Connect OpenRouter** panel for your API key. The key is stored in the desktop app data directory, not returned to the client or included in logs; on Windows it is written DPAPI-encrypted so the `.env` file is only readable by that Windows user (on Linux the `.env` stays plaintext with `0600` permissions). You can reopen the panel from the **API key** row in the composer settings popover.
+Download the latest installer for your OS from the [GitHub Releases](../../releases) page — Windows NSIS installer, plus Debian `.deb` and AppImage packages for Linux. Release tags must use semantic versions such as `v1.2.3`. On first launch, OpenChat opens a **Connect OpenRouter** panel for your API key. The key is stored in the desktop app data directory, not returned to the client or included in logs; on Windows it is written DPAPI-encrypted so the `.env` file is only readable by that Windows user (on Linux the `.env` stays plaintext with `0600` permissions). You can reopen the panel from the **API key** row in the composer settings popover.
 
 OpenChat stores desktop data in the app-data directory produced by Tauri for the `com.openchat.desktop` identifier — `%APPDATA%\com.openchat.desktop` on Windows, `~/.local/share/com.openchat.desktop` on Linux. This includes the local settings `.env` file and chat history database.
 
-Release installers are produced per-OS by CI: the Windows NSIS installer is built by `.github/workflows/desktop-build.yml` on `windows-latest`. Linux builds are supported (the shell compiles and the app runs standalone) but no Linux installer bundle is produced yet — `tauri.conf.json` only declares `nsis` bundle targets, so on Linux `npm run build --prefix desktop` yields the `target/release/openchat-desktop` binary you can run directly. In-app updating is Windows-only; on Linux the updater reports that it is unsupported.
+Release installers are produced per-OS by CI: `.github/workflows/desktop-build.yml` builds the Windows NSIS installer on `windows-latest` and the Linux `.deb` + AppImage packages on `ubuntu-latest` — each platform produces its own artifacts (a single build cannot serve both). On a tagged release, `.github/workflows/desktop-release.yml` publishes all of them to the same GitHub Release. In-app updating is Windows-only; on Linux the updater reports that it is unsupported, so Linux users upgrade by installing the newer package manually.
 
 ### Building the desktop app locally
 
