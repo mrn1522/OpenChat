@@ -459,12 +459,14 @@ def list_chat_records(db_path: str, *, limit: int = 100) -> list[dict[str, Any]]
     with _connect(db_path) as connection:
         # fusion_output can be tens of KB per row; the list view only needs to
         # know whether it is non-empty, so compute that in SQL instead of
-        # hauling every blob into memory.
+        # hauling every blob into memory. TRIM's second argument supplies the
+        # same whitespace Python's str.strip() removes (space + \t\n\r\v\f).
         rows = connection.execute(
             """
             SELECT conversation_id, created_at, updated_at, status, title,
                    request_json,
-                   (LENGTH(TRIM(fusion_output)) > 0) AS has_fusion_output
+                   (LENGTH(TRIM(fusion_output, char(9,10,11,12,13,32))) > 0)
+                       AS has_fusion_output
             FROM conversations
             ORDER BY datetime(updated_at) DESC, updated_at DESC, rowid DESC
             LIMIT ?

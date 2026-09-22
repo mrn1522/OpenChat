@@ -127,7 +127,10 @@ _openai_client: AsyncOpenAI | None = None
 _openai_client_key: tuple[str, str, float] | None = None
 
 _MODELS_CACHE_TTL_SECONDS = 300.0
-_models_cache: tuple[float, OpenRouterModelsResponse] | None = None
+# (base_url, fetched_at, response): the catalog belongs to the provider it was
+# fetched from — after a base_url change it is neither fresh nor a valid
+# stale fallback.
+_models_cache: tuple[str, float, OpenRouterModelsResponse] | None = None
 _models_cache_lock = asyncio.Lock()
 
 
@@ -141,9 +144,9 @@ def _shared_http() -> httpx.AsyncClient:
 def build_client() -> AsyncOpenAI:
     """Return the shared AsyncOpenAI client, rebuilding when settings change.
 
-    Reuses one connection pool across all requests. The client is rebuilt only
-    when (api_key, base_url, timeout) changes; the superseded pool is closed by
-    ``aclose_clients`` or on the next rebuild.
+    Reuses one connection pool across all requests. A settings change rebuilds
+    only the thin SDK wrapper; the shared pool persists until app shutdown
+    (``aclose_clients``).
     """
     if not settings.openai_api_key:
         raise RuntimeError("Missing OPENAI_API_KEY in server environment")
@@ -188,33 +191,49 @@ async def fetch_openrouter_models() -> OpenRouterModelsResponse:
     models_url = f"{base_url}/models"
 
     global _models_cache
+
+    def _stale() -> OpenRouterModelsResponse | None:
+        """The cached catalog, only when it came from the current base_url."""
+        if _models_cache is not None and _models_cache[0] == base_url:
+            return _models_cache[2]
+        return None
+
     now = time.monotonic()
-    if _models_cache is not None and now - _models_cache[0] < _MODELS_CACHE_TTL_SECONDS:
-        return _models_cache[1]
+    cached = _stale()
+    if cached is not None and now - _models_cache[1] < _MODELS_CACHE_TTL_SECONDS:
+        return cached
 
     async with _models_cache_lock:
         # Re-check inside the lock: a concurrent caller may have refreshed.
         now = time.monotonic()
-        if _models_cache is not None and now - _models_cache[0] < _MODELS_CACHE_TTL_SECONDS:
-            return _models_cache[1]
+        cached = _stale()
+        if cached is not None and now - _models_cache[1] < _MODELS_CACHE_TTL_SECONDS:
+            return cached
 
         try:
             response = await _shared_http().get(models_url)
             response.raise_for_status()
-        except httpx.HTTPError:
-            if _models_cache is not None:
+            payload = response.json()
+            models = payload.get("data", []) if isinstance(payload, dict) else []
+            # ValueError covers JSON decoding and pydantic model validation:
+            # a malformed 200 triggers the same stale fallback as a 5xx.
+            result = OpenRouterModelsResponse(
+                data=[
+                    OpenRouterModel.model_validate(item)
+                    for item in models
+                    if isinstance(item, dict)
+                ]
+            )
+        except (httpx.HTTPError, ValueError):
+            if cached is not None:
                 logger.warning(
                     "OpenRouter models refresh failed; serving stale catalog.",
                     exc_info=True,
                 )
-                return _models_cache[1]
+                return cached
             raise
 
-        payload = response.json()
-        models = payload.get("data", []) if isinstance(payload, dict) else []
-        parsed = [OpenRouterModel.model_validate(item) for item in models if isinstance(item, dict)]
-        result = OpenRouterModelsResponse(data=parsed)
-        _models_cache = (time.monotonic(), result)
+        _models_cache = (base_url, time.monotonic(), result)
         return result
 
 
@@ -1020,8 +1039,10 @@ def _build_direct_chat_messages(
 
 
 async def optimize_prompt_text(client: AsyncOpenAI, prompt: str) -> str:
-    response = await _with_transient_retry(
-        lambda: client.chat.completions.create(
+    async def _call() -> str:
+        # Extraction runs inside the retry boundary so an empty-choices
+        # completion (CompletionFailure) retries like a transport failure.
+        response = await client.chat.completions.create(
             model=PROMPT_OPTIMIZER_MODEL,
             temperature=0.1,
             max_tokens=OPENROUTER_TOKEN_LIMIT,
@@ -1036,12 +1057,15 @@ async def optimize_prompt_text(client: AsyncOpenAI, prompt: str) -> str:
                     "exclude": True,
                 }
             },
-        ),
+        )
+        return _extract_first_choice_message_content(response, context="Prompt optimizer")
+
+    content = await _with_transient_retry(
+        _call,
         context="Prompt optimizer",
         model=PROMPT_OPTIMIZER_MODEL,
     )
 
-    content = _extract_first_choice_message_content(response, context="Prompt optimizer")
     optimized = _extract_optimized_prompt(content)
     return optimized or prompt.strip()
 
@@ -1056,8 +1080,10 @@ async def generate_persona_assignments(
 
     user_content = build_persona_generation_prompt(user_prompt, agents)
 
-    response = await _with_transient_retry(
-        lambda: client.chat.completions.create(
+    async def _call() -> str:
+        # Extraction runs inside the retry boundary so an empty-choices
+        # completion (CompletionFailure) retries like a transport failure.
+        response = await client.chat.completions.create(
             model=PERSONA_GENERATOR_MODEL,
             temperature=0.1,
             max_tokens=OPENROUTER_TOKEN_LIMIT,
@@ -1072,12 +1098,15 @@ async def generate_persona_assignments(
                 reasoning_exclude=True,
                 allow_tools=False,
             ),
-        ),
+        )
+        return _extract_first_choice_message_content(response, context="Persona generator")
+
+    content = await _with_transient_retry(
+        _call,
         context="Persona generator",
         model=PERSONA_GENERATOR_MODEL,
     )
 
-    content = _extract_first_choice_message_content(response, context="Persona generator")
     assignments = _extract_persona_assignments(content, agents)
     if assignments is None:
         raise RuntimeError("Persona generator returned invalid or incomplete persona assignments.")

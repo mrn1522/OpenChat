@@ -1,4 +1,5 @@
 import asyncio
+import gzip
 
 import httpx
 import pytest
@@ -74,7 +75,11 @@ class TestFetchModelsCache:
         monkeypatch.setattr(
             llm,
             "_models_cache",
-            (llm.time.monotonic() - llm._MODELS_CACHE_TTL_SECONDS - 1, stale),
+            (
+                "https://openrouter.test/v1",
+                llm.time.monotonic() - llm._MODELS_CACHE_TTL_SECONDS - 1,
+                stale,
+            ),
         )
 
         calls: list[httpx.Request] = []
@@ -83,6 +88,46 @@ class TestFetchModelsCache:
         result = asyncio.run(llm.fetch_openrouter_models())
         assert len(calls) == 1
         assert result is stale
+
+    def test_malformed_response_serves_stale_cache(self, monkeypatch):
+        """A 200 with unparseable JSON triggers the same stale fallback as a 5xx."""
+        base_url = "https://openrouter.test/v1"
+        monkeypatch.setattr(settings, "openai_base_url", base_url)
+        stale = _catalog(name="openai/stale")
+        monkeypatch.setattr(
+            llm,
+            "_models_cache",
+            (base_url, llm.time.monotonic() - llm._MODELS_CACHE_TTL_SECONDS - 1, stale),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=b"{not json")
+
+        monkeypatch.setattr(
+            llm, "_shared_http", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        )
+
+        assert asyncio.run(llm.fetch_openrouter_models()) is stale
+
+    def test_base_url_change_ignores_other_provider_catalog(self, monkeypatch):
+        """A cache entry from a different base_url is neither fresh nor stale-valid."""
+        monkeypatch.setattr(settings, "openai_base_url", "https://new-provider.test/v1")
+        monkeypatch.setattr(
+            llm,
+            "_models_cache",
+            (
+                "https://old-provider.test/v1",
+                llm.time.monotonic(),  # unexpired for the old provider
+                _catalog(name="openai/old"),
+            ),
+        )
+
+        calls: list[httpx.Request] = []
+        monkeypatch.setattr(llm, "_shared_http", lambda: self._client(calls, status=500))
+
+        with pytest.raises(httpx.HTTPStatusError):
+            asyncio.run(llm.fetch_openrouter_models())
+        assert len(calls) == 1
 
     def test_error_without_cache_propagates(self, monkeypatch):
         calls: list[httpx.Request] = []
@@ -295,3 +340,68 @@ class TestStreamWithHeartbeat:
 
         with pytest.raises(RuntimeError, match="stream broke"):
             asyncio.run(run())
+
+
+class TestGZipUnlessSSE:
+    def _drive(self, app, path: str = "/") -> list[dict]:
+        sent: list[dict] = []
+
+        async def send(message):
+            sent.append(dict(message))
+
+        middleware = main.GZipUnlessSSEMiddleware(app)
+        scope = {
+            "type": "http",
+            "headers": [(b"accept-encoding", b"gzip")],
+            "path": path,
+        }
+        asyncio.run(middleware(scope, None, send))
+        return sent
+
+    def test_event_stream_passes_through_uncompressed(self):
+        async def app(scope, receive, send):
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [(b"content-type", b"text/event-stream")],
+                }
+            )
+            await send(
+                {
+                    "type": "http.response.body",
+                    "body": b"event: a\n\n",
+                    "more_body": True,
+                }
+            )
+            await send({"type": "http.response.body", "body": b"", "more_body": False})
+
+        sent = self._drive(app)
+        bodies = [m["body"] for m in sent if m["type"] == "http.response.body"]
+        assert b"event: a\n\n" in bodies
+        start = next(m for m in sent if m["type"] == "http.response.start")
+        assert b"content-encoding" not in dict(start["headers"])
+
+    def test_json_response_is_compressed(self):
+        payload = b'{"data": "' + b"x" * 5000 + b'"}'
+
+        async def app(scope, receive, send):
+            await send(
+                {
+                    "type": "http.response.start",
+                    "status": 200,
+                    "headers": [
+                        (b"content-type", b"application/json"),
+                        (b"content-length", str(len(payload)).encode()),
+                    ],
+                }
+            )
+            await send(
+                {"type": "http.response.body", "body": payload, "more_body": False}
+            )
+
+        sent = self._drive(app)
+        start = next(m for m in sent if m["type"] == "http.response.start")
+        assert dict(start["headers"])[b"content-encoding"] == b"gzip"
+        body = b"".join(m["body"] for m in sent if m["type"] == "http.response.body")
+        assert gzip.decompress(body) == payload

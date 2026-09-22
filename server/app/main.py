@@ -14,8 +14,9 @@ import httpx
 from dotenv import dotenv_values
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import StreamingResponse
+from starlette.middleware.gzip import GZipResponder
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
 from app.chat_store import (
     WorkflowNameExistsError,
@@ -74,6 +75,12 @@ from app.prompting import (
 
 logger = logging.getLogger(__name__)
 
+# Serializes PUT /api/settings: the env-file read-modify-write used to be
+# atomic with respect to other requests because it ran synchronously on the
+# event loop; now that it runs in a worker thread the lock is required to
+# keep two concurrent updates from interleaving.
+_settings_write_lock = asyncio.Lock()
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> None:
@@ -93,9 +100,51 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Compress large JSON responses (model catalog, history lists). Starlette's
-# gzip responder compresses per-chunk, so SSE streams still flush per event.
-app.add_middleware(GZipMiddleware, minimum_size=1024)
+class _SSEAwareGZipResponder(GZipResponder):
+    """GZipResponder that passes ``text/event-stream`` responses through raw.
+
+    Starlette's streaming gzip path writes each body chunk into the
+    compressor but never flushes it, so a gzipped SSE response would emit
+    empty chunks and withhold every event — including heartbeats — until
+    zlib's internal block fills or the stream ends.
+    """
+
+    passthrough = False
+
+    async def send_with_gzip(self, message: Message) -> None:
+        if message["type"] == "http.response.start":
+            headers = dict(message["headers"])
+            content_type = headers.get(b"content-type", b"").decode("latin-1")
+            self.passthrough = (
+                content_type.split(";", 1)[0].strip() == "text/event-stream"
+            )
+        if self.passthrough:
+            await self.send(message)
+            return
+        await super().send_with_gzip(message)
+
+
+class GZipUnlessSSEMiddleware:
+    """Apply gzip compression to every response except SSE streams."""
+
+    def __init__(self, app: ASGIApp, minimum_size: int = 1024) -> None:
+        self.app = app
+        self.minimum_size = minimum_size
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] == "http":
+            accept_encoding = dict(scope["headers"]).get(b"accept-encoding", b"")
+            if b"gzip" in accept_encoding:
+                responder = _SSEAwareGZipResponder(self.app, self.minimum_size)
+                await responder(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+# Compress large JSON responses (model catalog, history lists); SSE routes
+# must not be compressed or their events would be buffered by the
+# compressor instead of flushing per event.
+app.add_middleware(GZipUnlessSSEMiddleware, minimum_size=1024)
 
 
 def sse(event: str, data: dict) -> str:
@@ -431,27 +480,28 @@ async def get_settings() -> SettingsResponse:
 
 @app.put("/api/settings", response_model=SettingsResponse)
 async def update_settings(request: SettingsUpdateRequest) -> SettingsResponse:
-    values: dict[str, str | None] = {}
-    if request.api_key is not None:
-        api_key = request.api_key.strip()
-        values["OPENAI_API_KEY"] = protect_secret(api_key) or None
-        if api_key:
-            os.environ["OPENAI_API_KEY"] = api_key
-        else:
-            os.environ.pop("OPENAI_API_KEY", None)
-    if request.base_url is not None:
-        values["OPENAI_BASE_URL"] = request.base_url.strip() or None
-
-    if values:
-        await asyncio.to_thread(_upsert_env_values, settings_env_file(), values)
-        for key, value in values.items():
-            if key == "OPENAI_API_KEY":
-                continue  # process env already holds the plaintext key
-            if value is None:
-                os.environ.pop(key, None)
+    async with _settings_write_lock:
+        values: dict[str, str | None] = {}
+        if request.api_key is not None:
+            api_key = request.api_key.strip()
+            values["OPENAI_API_KEY"] = protect_secret(api_key) or None
+            if api_key:
+                os.environ["OPENAI_API_KEY"] = api_key
             else:
-                os.environ[key] = value
-        await asyncio.to_thread(reload_settings)
+                os.environ.pop("OPENAI_API_KEY", None)
+        if request.base_url is not None:
+            values["OPENAI_BASE_URL"] = request.base_url.strip() or None
+
+        if values:
+            await asyncio.to_thread(_upsert_env_values, settings_env_file(), values)
+            for key, value in values.items():
+                if key == "OPENAI_API_KEY":
+                    continue  # process env already holds the plaintext key
+                if value is None:
+                    os.environ.pop(key, None)
+                else:
+                    os.environ[key] = value
+            await asyncio.to_thread(reload_settings)
 
     return _settings_response()
 
