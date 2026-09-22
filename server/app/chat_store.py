@@ -457,10 +457,14 @@ def save_chat_record(
 
 def list_chat_records(db_path: str, *, limit: int = 100) -> list[dict[str, Any]]:
     with _connect(db_path) as connection:
+        # fusion_output can be tens of KB per row; the list view only needs to
+        # know whether it is non-empty, so compute that in SQL instead of
+        # hauling every blob into memory.
         rows = connection.execute(
             """
             SELECT conversation_id, created_at, updated_at, status, title,
-                   request_json, fusion_output
+                   request_json,
+                   (LENGTH(TRIM(fusion_output)) > 0) AS has_fusion_output
             FROM conversations
             ORDER BY datetime(updated_at) DESC, updated_at DESC, rowid DESC
             LIMIT ?
@@ -484,7 +488,7 @@ def list_chat_records(db_path: str, *, limit: int = 100) -> list[dict[str, Any]]
                 "prompt_preview": preview,
                 "source_models": request_payload.get("source_models", []),
                 "fusion_model": request_payload.get("fusion_model", ""),
-                "has_fusion_output": bool(str(row["fusion_output"]).strip()),
+                "has_fusion_output": bool(row["has_fusion_output"]),
             }
         )
 
