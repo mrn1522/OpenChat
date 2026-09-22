@@ -137,7 +137,14 @@ _models_cache_lock = asyncio.Lock()
 def _shared_http() -> httpx.AsyncClient:
     global _shared_http_client
     if _shared_http_client is None:
-        _shared_http_client = httpx.AsyncClient(timeout=settings.openchat_timeout_seconds)
+        # Match the SDK's DefaultAsyncHttpxClient (follow_redirects + its
+        # connection limits) so injecting this client changes pooling only,
+        # not redirect or connection-limit behavior.
+        _shared_http_client = httpx.AsyncClient(
+            timeout=settings.openchat_timeout_seconds,
+            follow_redirects=True,
+            limits=httpx.Limits(max_connections=1000, max_keepalive_connections=100),
+        )
     return _shared_http_client
 
 
@@ -214,16 +221,22 @@ async def fetch_openrouter_models() -> OpenRouterModelsResponse:
             response = await _shared_http().get(models_url)
             response.raise_for_status()
             payload = response.json()
-            models = payload.get("data", []) if isinstance(payload, dict) else []
-            # ValueError covers JSON decoding and pydantic model validation:
-            # a malformed 200 triggers the same stale fallback as a 5xx.
+            # ValueError covers JSON decoding, shape mismatches, and pydantic
+            # model validation: a malformed or empty 200 triggers the same
+            # stale fallback as a 5xx instead of replacing the good cache
+            # with an empty catalog.
+            data = payload.get("data") if isinstance(payload, dict) else None
+            if not isinstance(data, list):
+                raise ValueError("Models catalog missing 'data' list")
             result = OpenRouterModelsResponse(
                 data=[
                     OpenRouterModel.model_validate(item)
-                    for item in models
+                    for item in data
                     if isinstance(item, dict)
                 ]
             )
+            if not result.data:
+                raise ValueError("Models catalog contains no usable models")
         except (httpx.HTTPError, ValueError):
             if cached is not None:
                 logger.warning(

@@ -109,6 +109,27 @@ class TestFetchModelsCache:
 
         assert asyncio.run(llm.fetch_openrouter_models()) is stale
 
+    @pytest.mark.parametrize("content", [b"{}", b'{"data": {}}', b'{"data": []}', b'{"data": [7, null]}'])
+    def test_empty_or_shapeless_catalog_serves_stale(self, monkeypatch, content):
+        """A 200 without usable models is malformed — not a new (empty) cache."""
+        base_url = "https://openrouter.test/v1"
+        monkeypatch.setattr(settings, "openai_base_url", base_url)
+        stale = _catalog(name="openai/stale")
+        monkeypatch.setattr(
+            llm,
+            "_models_cache",
+            (base_url, llm.time.monotonic() - llm._MODELS_CACHE_TTL_SECONDS - 1, stale),
+        )
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(200, content=content)
+
+        monkeypatch.setattr(
+            llm, "_shared_http", lambda: httpx.AsyncClient(transport=httpx.MockTransport(handler))
+        )
+
+        assert asyncio.run(llm.fetch_openrouter_models()) is stale
+
     def test_base_url_change_ignores_other_provider_catalog(self, monkeypatch):
         """A cache entry from a different base_url is neither fresh nor stale-valid."""
         monkeypatch.setattr(settings, "openai_base_url", "https://new-provider.test/v1")
