@@ -183,9 +183,20 @@ async fn install_update(
     .await
     .map_err(|e| format!("Installer download failed: {e}"))??;
 
+    // Same flags the Tauri updater plugin passes to its NSIS installer:
+    // `/S` runs fully silently (no setup UI), `/UPDATE` installs over the
+    // existing install so no uninstall/reinstall prompt appears (shortcuts,
+    // registry entries, and app data are preserved), and `/R` relaunches the
+    // app when the install finishes. `/ARGS` clears any stray argument the
+    // installer would otherwise forward to the relaunched app.
     std::process::Command::new(&installer)
+        .args(["/S", "/UPDATE", "/R", "/ARGS", ""])
         .spawn()
         .map_err(|e| format!("Failed to launch the installer: {e}"))?;
+
+    // Stop the sidecar now so the installer never races an openchat-server.exe
+    // file lock; the app itself exits below once the IPC response is sent.
+    kill_sidecar(&app.state::<SidecarState>());
 
     // Give the IPC response a moment to reach the webview before quitting; the
     // NSIS installer takes over from there and relaunches the app.
