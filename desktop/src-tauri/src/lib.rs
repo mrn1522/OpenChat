@@ -227,12 +227,13 @@ async fn install_update(
                         .await
                         .unwrap_or(false);
                     if dead {
-                        // The killed process is confirmed gone, so the gate's
-                        // job is done — clear it regardless of whether the
-                        // backend respawn works, or updates stay blocked until
-                        // the app restarts even though nothing is stopping.
+                        // Hold the gate through the respawn so a retry can't
+                        // launch an installer while the backend is coming back
+                        // up, then clear it regardless — the killed process is
+                        // confirmed gone either way.
+                        let restored = restore_sidecar(&app, port);
                         stopping.store(false, Ordering::SeqCst);
-                        if let Err(e) = restore_sidecar(&app, port) {
+                        if let Err(e) = restored {
                             eprintln!("Failed to restart openchat-server: {e}");
                         }
                     }
@@ -262,9 +263,9 @@ async fn install_update(
         .spawn()
     {
         // The sidecar is already stopped — bring the backend back so the app
-        // stays usable. Termination is confirmed either way, so the gate is
-        // cleared regardless of the respawn result.
-        stopping.store(false, Ordering::SeqCst);
+        // stays usable. The gate stays held through the respawn so a retry
+        // can't race the backend coming back up, then clears regardless —
+        // termination is confirmed either way.
         let error = match restore_sidecar(&app, port) {
             Ok(()) => format!("Failed to launch the installer: {e}"),
             Err(restore_error) => {
@@ -274,6 +275,7 @@ async fn install_update(
                 )
             }
         };
+        stopping.store(false, Ordering::SeqCst);
         return Err(error);
     }
 
