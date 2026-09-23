@@ -23,7 +23,9 @@ use tauri_plugin_shell::{
 type ExitListener = Arc<Mutex<Option<mpsc::Sender<()>>>>;
 
 struct SidecarState {
-    child: Mutex<Option<CommandChild>>,
+    // The flag flips true when the child's Terminated event is emitted — used
+    // to confirm death when kill() fails and the event may already be gone.
+    child: Mutex<Option<(CommandChild, Arc<AtomicBool>)>>,
     exit_listener: ExitListener,
     // Set while a killed sidecar's Terminated event is still pending — blocks
     // further update attempts so nothing proceeds on an unconfirmed exit.
@@ -204,7 +206,7 @@ async fn install_update(
     // never writes over a still-locked openchat-server.exe. `stopping` stays
     // set through the installer launch so a concurrent call can't slip past
     // stop_sidecar and spawn a second installer.
-    if let Some(terminated) = stop_sidecar(&app.state::<SidecarState>(), port)? {
+    if let Some(terminated) = stop_sidecar(&app.state::<SidecarState>())? {
         match tauri::async_runtime::spawn_blocking(move || {
             match terminated.recv_timeout(Duration::from_secs(5)) {
                 Ok(()) => Ok(()),
@@ -292,7 +294,7 @@ fn spawn_sidecar(
     app: &AppHandle,
     port: u16,
     exit_listener: ExitListener,
-) -> Result<CommandChild, String> {
+) -> Result<(CommandChild, Arc<AtomicBool>), String> {
     let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
     std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
     let port_arg = port.to_string();
@@ -314,6 +316,8 @@ fn spawn_sidecar(
         .spawn()
         .map_err(|e| e.to_string())?;
     let (mut events, child) = sidecar;
+    let terminated_flag = Arc::new(AtomicBool::new(false));
+    let drain_flag = terminated_flag.clone();
 
     tauri::async_runtime::spawn(async move {
         while let Some(event) = events.recv().await {
@@ -323,6 +327,7 @@ fn spawn_sidecar(
                 CommandEvent::Error(error) => eprintln!("openchat-server error: {error}"),
                 CommandEvent::Terminated(payload) => {
                     eprintln!("openchat-server exited: {payload:?}");
+                    drain_flag.store(true, Ordering::SeqCst);
                     if let Ok(mut listener) = exit_listener.lock() {
                         if let Some(tx) = listener.take() {
                             let _ = tx.send(());
@@ -334,28 +339,25 @@ fn spawn_sidecar(
         }
     });
 
-    Ok(child)
+    Ok((child, terminated_flag))
 }
 
 fn restore_sidecar(app: &AppHandle, port: u16) -> Result<(), String> {
     let listener = app.state::<SidecarState>().exit_listener.clone();
-    let child = spawn_sidecar(app, port, listener)?;
+    let spawned = spawn_sidecar(app, port, listener)?;
     let state = app.state::<SidecarState>();
     let mut slot = state
         .child
         .lock()
         .map_err(|_| "Sidecar state is unavailable.".to_string())?;
-    *slot = Some(child);
+    *slot = Some(spawned);
     Ok(())
 }
 
 // Kills the sidecar and returns a receiver that fires once the process has
-// actually terminated (its Terminated command event). Returns None when there
-// is nothing to wait for, and errors while a previous stop is still pending.
-fn stop_sidecar(
-    state: &SidecarState,
-    port: u16,
-) -> Result<Option<mpsc::Receiver<()>>, String> {
+// actually terminated (its Terminated command event). Returns None when the
+// exit is already confirmed, and errors while a previous stop is still pending.
+fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, String> {
     let mut slot = state
         .child
         .lock()
@@ -365,7 +367,7 @@ fn stop_sidecar(
             "The backend is still shutting down — try again in a moment.".to_string(),
         );
     }
-    let Some(child) = slot.take() else {
+    let Some((child, terminated)) = slot.take() else {
         return Ok(None);
     };
     let (tx, rx) = mpsc::channel::<()>();
@@ -376,10 +378,12 @@ fn stop_sidecar(
     if child.kill().is_err() {
         // A failed kill usually means the process already exited, but its
         // Terminated event may still be in flight — give it a brief window,
-        // then fall back to the port probe. Only when death is confirmed is
-        // there nothing to wait for; a live process that wouldn't take the
-        // kill still owns the exe, so treat it like a normal stop.
-        if rx.recv_timeout(Duration::from_millis(500)).is_ok() || !health_check(port) {
+        // then confirm via the per-child flag the drain task keeps. Only a
+        // process that never terminated is worth waiting on; a live one that
+        // wouldn't take the kill still owns the exe.
+        if rx.recv_timeout(Duration::from_millis(500)).is_ok()
+            || terminated.load(Ordering::SeqCst)
+        {
             if let Ok(mut listener) = state.exit_listener.lock() {
                 listener.take();
             }
@@ -392,7 +396,7 @@ fn stop_sidecar(
 
 fn kill_sidecar(state: &SidecarState) {
     if let Ok(mut child) = state.child.lock() {
-        if let Some(child) = child.take() {
+        if let Some((child, _)) = child.take() {
             let _ = child.kill();
         }
     }
@@ -411,9 +415,9 @@ pub fn run() {
                 stopping: Arc::new(AtomicBool::new(false)),
             });
 
-            let child = spawn_sidecar(&app.handle(), port, exit_listener)?;
+            let spawned = spawn_sidecar(&app.handle(), port, exit_listener)?;
             if let Ok(mut slot) = app.state::<SidecarState>().child.lock() {
-                *slot = Some(child);
+                *slot = Some(spawned);
             }
 
             let window = app.get_webview_window("main");
