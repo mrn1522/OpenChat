@@ -367,14 +367,20 @@ fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, Stri
             "The backend is still shutting down — try again in a moment.".to_string(),
         );
     }
+    // Claim the gate while the child lock is held so only one call ever
+    // proceeds to the installer launch; it clears when a cancelled update
+    // restores the backend (a launched update exits the app anyway).
+    state.stopping.store(true, Ordering::SeqCst);
     let Some((child, terminated)) = slot.take() else {
         return Ok(None);
     };
     let (tx, rx) = mpsc::channel::<()>();
-    *state
-        .exit_listener
-        .lock()
-        .map_err(|_| "Sidecar state is unavailable.".to_string())? = Some(tx);
+    if let Ok(mut listener) = state.exit_listener.lock() {
+        *listener = Some(tx);
+    } else {
+        state.stopping.store(false, Ordering::SeqCst);
+        return Err("Sidecar state is unavailable.".to_string());
+    }
     let kill_failed = child.kill().is_err();
     // The drain task flips `terminated` on every Terminated — including an
     // exit that already happened, where kill() can still succeed but no event
@@ -393,7 +399,6 @@ fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, Stri
         }
         return Ok(None);
     }
-    state.stopping.store(true, Ordering::SeqCst);
     Ok(Some(rx))
 }
 
