@@ -378,6 +378,9 @@ fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, Stri
     if let Ok(mut listener) = state.exit_listener.lock() {
         *listener = Some(tx);
     } else {
+        // The slot was already emptied — put the running sidecar back so the
+        // next attempt still finds (and kills) it instead of seeing no child.
+        *slot = Some((child, terminated));
         state.stopping.store(false, Ordering::SeqCst);
         return Err("Sidecar state is unavailable.".to_string());
     }
