@@ -2,7 +2,10 @@ use std::{
     io::{Read, Write},
     net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
     thread,
     time::Duration,
 };
@@ -14,7 +17,20 @@ use tauri_plugin_shell::{
     ShellExt,
 };
 
-struct SidecarState(Mutex<Option<CommandChild>>);
+// A one-shot sender registered before killing the sidecar; the event-drain
+// task fires it once the child's Terminated event arrives, i.e. the process
+// really exited and its exe is no longer locked.
+type ExitListener = Arc<Mutex<Option<mpsc::Sender<()>>>>;
+
+struct SidecarState {
+    // The flag flips true when the child's Terminated event is emitted — used
+    // to confirm death when kill() fails and the event may already be gone.
+    child: Mutex<Option<(CommandChild, Arc<AtomicBool>)>>,
+    exit_listener: ExitListener,
+    // Set while a killed sidecar's Terminated event is still pending — blocks
+    // further update attempts so nothing proceeds on an unconfirmed exit.
+    stopping: Arc<AtomicBool>,
+}
 
 #[tauri::command]
 async fn api_base(port: State<'_, u16>) -> Result<String, String> {
@@ -183,20 +199,87 @@ async fn install_update(
     .await
     .map_err(|e| format!("Installer download failed: {e}"))??;
 
+    let port = *app.state::<u16>();
+    let stopping = app.state::<SidecarState>().stopping.clone();
+
+    // Stop the sidecar and wait for its Terminated event so the installer
+    // never writes over a still-locked openchat-server.exe. `stopping` stays
+    // set through the installer launch so a concurrent call can't slip past
+    // stop_sidecar and spawn a second installer.
+    if let Some(terminated) = stop_sidecar(&app.state::<SidecarState>())? {
+        match tauri::async_runtime::spawn_blocking(move || {
+            match terminated.recv_timeout(Duration::from_secs(5)) {
+                Ok(()) => Ok(()),
+                Err(_) => Err(terminated),
+            }
+        })
+        .await
+        {
+            Ok(Ok(())) => {}
+            Ok(Err(rx)) => {
+                // Keep update attempts blocked until the old process is
+                // confirmed dead, then restore the backend so the app stays
+                // usable. No upper bound here — kill() already succeeded, so
+                // the process will exit eventually; a second timeout would
+                // leave updates blocked forever even after it does.
+                let app = app.clone();
+                let stopping = stopping.clone();
+                tauri::async_runtime::spawn(async move {
+                    let dead = tauri::async_runtime::spawn_blocking(move || rx.recv().is_ok())
+                        .await
+                        .unwrap_or(false);
+                    if dead {
+                        // Hold the gate through the respawn so a retry can't
+                        // launch an installer while the backend is coming back
+                        // up, then clear it regardless — the killed process is
+                        // confirmed gone either way.
+                        let restored = restore_sidecar(&app, port);
+                        stopping.store(false, Ordering::SeqCst);
+                        if let Err(e) = restored {
+                            eprintln!("Failed to restart openchat-server: {e}");
+                        }
+                    }
+                });
+                return Err(
+                    "The backend is still stopping — the update was cancelled. Try again in a moment."
+                        .to_string(),
+                );
+            }
+            Err(_) => {
+                return Err(
+                    "Could not confirm the backend stopped — restart OpenChat before retrying."
+                        .to_string(),
+                );
+            }
+        }
+    }
+
     // Same flags the Tauri updater plugin passes to its NSIS installer:
     // `/S` runs fully silently (no setup UI), `/UPDATE` installs over the
     // existing install so no uninstall/reinstall prompt appears (shortcuts,
     // registry entries, and app data are preserved), and `/R` relaunches the
     // app when the install finishes. `/ARGS` clears any stray argument the
     // installer would otherwise forward to the relaunched app.
-    std::process::Command::new(&installer)
+    if let Err(e) = std::process::Command::new(&installer)
         .args(["/S", "/UPDATE", "/R", "/ARGS", ""])
         .spawn()
-        .map_err(|e| format!("Failed to launch the installer: {e}"))?;
-
-    // Stop the sidecar now so the installer never races an openchat-server.exe
-    // file lock; the app itself exits below once the IPC response is sent.
-    kill_sidecar(&app.state::<SidecarState>());
+    {
+        // The sidecar is already stopped — bring the backend back so the app
+        // stays usable. The gate stays held through the respawn so a retry
+        // can't race the backend coming back up, then clears regardless —
+        // termination is confirmed either way.
+        let error = match restore_sidecar(&app, port) {
+            Ok(()) => format!("Failed to launch the installer: {e}"),
+            Err(restore_error) => {
+                eprintln!("Failed to restart openchat-server: {restore_error}");
+                format!(
+                    "Failed to launch the installer: {e}; failed to restore the backend: {restore_error}"
+                )
+            }
+        };
+        stopping.store(false, Ordering::SeqCst);
+        return Err(error);
+    }
 
     // Give the IPC response a moment to reach the webview before quitting; the
     // NSIS installer takes over from there and relaunches the app.
@@ -207,9 +290,113 @@ async fn install_update(
     Ok(())
 }
 
+fn spawn_sidecar(
+    app: &AppHandle,
+    port: u16,
+    exit_listener: ExitListener,
+) -> Result<(CommandChild, Arc<AtomicBool>), String> {
+    let data_dir = app.path().app_data_dir().map_err(|e| e.to_string())?;
+    std::fs::create_dir_all(&data_dir).map_err(|e| e.to_string())?;
+    let port_arg = port.to_string();
+    let data_dir_arg = data_dir.to_string_lossy().into_owned();
+    let parent_pid_arg = std::process::id().to_string();
+
+    let sidecar = app
+        .shell()
+        .sidecar("openchat-server")
+        .map_err(|e| e.to_string())?
+        .args([
+            "--port",
+            &port_arg,
+            "--data-dir",
+            &data_dir_arg,
+            "--parent-pid",
+            &parent_pid_arg,
+        ])
+        .spawn()
+        .map_err(|e| e.to_string())?;
+    let (mut events, child) = sidecar;
+    let terminated_flag = Arc::new(AtomicBool::new(false));
+    let drain_flag = terminated_flag.clone();
+
+    tauri::async_runtime::spawn(async move {
+        while let Some(event) = events.recv().await {
+            match event {
+                CommandEvent::Stdout(bytes) => eprint!("{}", String::from_utf8_lossy(&bytes)),
+                CommandEvent::Stderr(bytes) => eprint!("{}", String::from_utf8_lossy(&bytes)),
+                CommandEvent::Error(error) => eprintln!("openchat-server error: {error}"),
+                CommandEvent::Terminated(payload) => {
+                    eprintln!("openchat-server exited: {payload:?}");
+                    drain_flag.store(true, Ordering::SeqCst);
+                    if let Ok(mut listener) = exit_listener.lock() {
+                        if let Some(tx) = listener.take() {
+                            let _ = tx.send(());
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    });
+
+    Ok((child, terminated_flag))
+}
+
+fn restore_sidecar(app: &AppHandle, port: u16) -> Result<(), String> {
+    let listener = app.state::<SidecarState>().exit_listener.clone();
+    let spawned = spawn_sidecar(app, port, listener)?;
+    let state = app.state::<SidecarState>();
+    let mut slot = state
+        .child
+        .lock()
+        .map_err(|_| "Sidecar state is unavailable.".to_string())?;
+    *slot = Some(spawned);
+    Ok(())
+}
+
+// Kills the sidecar and returns a receiver that fires once the process has
+// actually terminated (its Terminated command event). Returns None when the
+// exit is already confirmed, and errors while a previous stop is still pending.
+fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, String> {
+    let mut slot = state
+        .child
+        .lock()
+        .map_err(|_| "Sidecar state is unavailable.".to_string())?;
+    if state.stopping.load(Ordering::SeqCst) {
+        return Err(
+            "The backend is still shutting down — try again in a moment.".to_string(),
+        );
+    }
+    let Some((child, terminated)) = slot.take() else {
+        return Ok(None);
+    };
+    let (tx, rx) = mpsc::channel::<()>();
+    *state
+        .exit_listener
+        .lock()
+        .map_err(|_| "Sidecar state is unavailable.".to_string())? = Some(tx);
+    if child.kill().is_err() {
+        // A failed kill usually means the process already exited, but its
+        // Terminated event may still be in flight — give it a brief window,
+        // then confirm via the per-child flag the drain task keeps. Only a
+        // process that never terminated is worth waiting on; a live one that
+        // wouldn't take the kill still owns the exe.
+        if rx.recv_timeout(Duration::from_millis(500)).is_ok()
+            || terminated.load(Ordering::SeqCst)
+        {
+            if let Ok(mut listener) = state.exit_listener.lock() {
+                listener.take();
+            }
+            return Ok(None);
+        }
+    }
+    state.stopping.store(true, Ordering::SeqCst);
+    Ok(Some(rx))
+}
+
 fn kill_sidecar(state: &SidecarState) {
-    if let Ok(mut child) = state.0.lock() {
-        if let Some(child) = child.take() {
+    if let Ok(mut child) = state.child.lock() {
+        if let Some((child, _)) = child.take() {
             let _ = child.kill();
         }
     }
@@ -218,44 +405,20 @@ fn kill_sidecar(state: &SidecarState) {
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_shell::init())
-        .manage(SidecarState(Mutex::new(None)))
         .invoke_handler(tauri::generate_handler![api_base, install_update])
         .setup(|app| {
-            let data_dir: PathBuf = app.path().app_data_dir()?;
-            std::fs::create_dir_all(&data_dir)?;
             let port = free_port()?;
-            let port_arg = port.to_string();
-            let data_dir_arg = data_dir.to_string_lossy().into_owned();
-            let parent_pid_arg = std::process::id().to_string();
-
-            let sidecar = app
-                .shell()
-                .sidecar("openchat-server")?
-                .args([
-                    "--port",
-                    &port_arg,
-                    "--data-dir",
-                    &data_dir_arg,
-                    "--parent-pid",
-                    &parent_pid_arg,
-                ])
-                .spawn()?;
-            let (mut events, child) = sidecar;
-            if let Ok(mut state) = app.state::<SidecarState>().0.lock() {
-                *state = Some(child);
-            }
-
-            tauri::async_runtime::spawn(async move {
-                while let Some(event) = events.recv().await {
-                    match event {
-                        CommandEvent::Stdout(bytes) => eprint!("{}", String::from_utf8_lossy(&bytes)),
-                        CommandEvent::Stderr(bytes) => eprint!("{}", String::from_utf8_lossy(&bytes)),
-                        CommandEvent::Error(error) => eprintln!("openchat-server error: {error}"),
-                        CommandEvent::Terminated(payload) => eprintln!("openchat-server exited: {payload:?}"),
-                        _ => {}
-                    }
-                }
+            let exit_listener: ExitListener = Arc::new(Mutex::new(None));
+            app.manage(SidecarState {
+                child: Mutex::new(None),
+                exit_listener: exit_listener.clone(),
+                stopping: Arc::new(AtomicBool::new(false)),
             });
+
+            let spawned = spawn_sidecar(&app.handle(), port, exit_listener)?;
+            if let Ok(mut slot) = app.state::<SidecarState>().child.lock() {
+                *slot = Some(spawned);
+            }
 
             let window = app.get_webview_window("main");
             thread::spawn(move || {
