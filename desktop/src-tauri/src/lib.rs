@@ -201,8 +201,10 @@ async fn install_update(
     let stopping = app.state::<SidecarState>().stopping.clone();
 
     // Stop the sidecar and wait for its Terminated event so the installer
-    // never writes over a still-locked openchat-server.exe.
-    if let Some(terminated) = stop_sidecar(&app.state::<SidecarState>())? {
+    // never writes over a still-locked openchat-server.exe. `stopping` stays
+    // set through the installer launch so a concurrent call can't slip past
+    // stop_sidecar and spawn a second installer.
+    if let Some(terminated) = stop_sidecar(&app.state::<SidecarState>(), port)? {
         match tauri::async_runtime::spawn_blocking(move || {
             match terminated.recv_timeout(Duration::from_secs(5)) {
                 Ok(()) => Ok(()),
@@ -211,7 +213,7 @@ async fn install_update(
         })
         .await
         {
-            Ok(Ok(())) => stopping.store(false, Ordering::SeqCst),
+            Ok(Ok(())) => {}
             Ok(Err(rx)) => {
                 // Keep update attempts blocked until the old process is
                 // confirmed dead, then restore the backend so the app stays
@@ -225,8 +227,12 @@ async fn install_update(
                         .await
                         .unwrap_or(false);
                     if dead {
-                        restore_sidecar(&app, port);
-                        stopping.store(false, Ordering::SeqCst);
+                        match restore_sidecar(&app, port) {
+                            Ok(()) => stopping.store(false, Ordering::SeqCst),
+                            Err(e) => {
+                                eprintln!("Failed to restart openchat-server: {e}")
+                            }
+                        }
                     }
                 });
                 return Err(
@@ -255,8 +261,19 @@ async fn install_update(
     {
         // The sidecar is already stopped — bring the backend back so the app
         // stays usable.
-        restore_sidecar(&app, port);
-        return Err(format!("Failed to launch the installer: {e}"));
+        let error = match restore_sidecar(&app, port) {
+            Ok(()) => {
+                stopping.store(false, Ordering::SeqCst);
+                format!("Failed to launch the installer: {e}")
+            }
+            Err(restore_error) => {
+                eprintln!("Failed to restart openchat-server: {restore_error}");
+                format!(
+                    "Failed to launch the installer: {e}; failed to restore the backend: {restore_error}"
+                )
+            }
+        };
+        return Err(error);
     }
 
     // Give the IPC response a moment to reach the webview before quitting; the
@@ -317,22 +334,25 @@ fn spawn_sidecar(
     Ok(child)
 }
 
-fn restore_sidecar(app: &AppHandle, port: u16) {
+fn restore_sidecar(app: &AppHandle, port: u16) -> Result<(), String> {
     let listener = app.state::<SidecarState>().exit_listener.clone();
-    match spawn_sidecar(app, port, listener) {
-        Ok(child) => {
-            if let Ok(mut slot) = app.state::<SidecarState>().child.lock() {
-                *slot = Some(child);
-            }
-        }
-        Err(e) => eprintln!("Failed to restart openchat-server: {e}"),
-    }
+    let child = spawn_sidecar(app, port, listener)?;
+    let state = app.state::<SidecarState>();
+    let mut slot = state
+        .child
+        .lock()
+        .map_err(|_| "Sidecar state is unavailable.".to_string())?;
+    *slot = Some(child);
+    Ok(())
 }
 
 // Kills the sidecar and returns a receiver that fires once the process has
 // actually terminated (its Terminated command event). Returns None when there
 // is nothing to wait for, and errors while a previous stop is still pending.
-fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, String> {
+fn stop_sidecar(
+    state: &SidecarState,
+    port: u16,
+) -> Result<Option<mpsc::Receiver<()>>, String> {
     let mut slot = state
         .child
         .lock()
@@ -350,13 +370,18 @@ fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, Stri
         .exit_listener
         .lock()
         .map_err(|_| "Sidecar state is unavailable.".to_string())? = Some(tx);
-    // A failed kill means the process already exited — nothing to wait for.
-    // Drop the listener so a late Terminated from it can't fire a stale channel.
     if child.kill().is_err() {
-        if let Ok(mut listener) = state.exit_listener.lock() {
-            listener.take();
+        // A failed kill usually means the process already exited, but its
+        // Terminated event may still be in flight — give it a brief window,
+        // then fall back to the port probe. Only when death is confirmed is
+        // there nothing to wait for; a live process that wouldn't take the
+        // kill still owns the exe, so treat it like a normal stop.
+        if rx.recv_timeout(Duration::from_millis(500)).is_ok() || !health_check(port) {
+            if let Ok(mut listener) = state.exit_listener.lock() {
+                listener.take();
+            }
+            return Ok(None);
         }
-        return Ok(None);
     }
     state.stopping.store(true, Ordering::SeqCst);
     Ok(Some(rx))
