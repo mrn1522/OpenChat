@@ -215,16 +215,15 @@ async fn install_update(
             Ok(Err(rx)) => {
                 // Keep update attempts blocked until the old process is
                 // confirmed dead, then restore the backend so the app stays
-                // usable. Restarting before the original releases the port or
-                // its exe would strand the update on a stale lock.
+                // usable. No upper bound here — kill() already succeeded, so
+                // the process will exit eventually; a second timeout would
+                // leave updates blocked forever even after it does.
                 let app = app.clone();
                 let stopping = stopping.clone();
                 tauri::async_runtime::spawn(async move {
-                    let dead = tauri::async_runtime::spawn_blocking(move || {
-                        rx.recv_timeout(Duration::from_secs(30)).is_ok()
-                    })
-                    .await
-                    .unwrap_or(false);
+                    let dead = tauri::async_runtime::spawn_blocking(move || rx.recv().is_ok())
+                        .await
+                        .unwrap_or(false);
                     if dead {
                         restore_sidecar(&app, port);
                         stopping.store(false, Ordering::SeqCst);
@@ -352,7 +351,11 @@ fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, Stri
         .lock()
         .map_err(|_| "Sidecar state is unavailable.".to_string())? = Some(tx);
     // A failed kill means the process already exited — nothing to wait for.
+    // Drop the listener so a late Terminated from it can't fire a stale channel.
     if child.kill().is_err() {
+        if let Ok(mut listener) = state.exit_listener.lock() {
+            listener.take();
+        }
         return Ok(None);
     }
     state.stopping.store(true, Ordering::SeqCst);
