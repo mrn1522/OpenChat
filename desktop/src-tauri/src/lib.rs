@@ -375,20 +375,23 @@ fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, Stri
         .exit_listener
         .lock()
         .map_err(|_| "Sidecar state is unavailable.".to_string())? = Some(tx);
-    if child.kill().is_err() {
-        // A failed kill usually means the process already exited, but its
-        // Terminated event may still be in flight — give it a brief window,
-        // then confirm via the per-child flag the drain task keeps. Only a
-        // process that never terminated is worth waiting on; a live one that
-        // wouldn't take the kill still owns the exe.
-        if rx.recv_timeout(Duration::from_millis(500)).is_ok()
-            || terminated.load(Ordering::SeqCst)
-        {
-            if let Ok(mut listener) = state.exit_listener.lock() {
-                listener.take();
-            }
-            return Ok(None);
+    let kill_failed = child.kill().is_err();
+    // The drain task flips `terminated` on every Terminated — including an
+    // exit that already happened, where kill() can still succeed but no event
+    // is left to fire the receiver. When the flag is set there is nothing to
+    // wait for; a live process that wouldn't take the kill still owns the exe,
+    // so only a failed kill without confirmed death waits like a normal stop.
+    // A dead process whose event is still in flight gets a brief window to
+    // deliver it first.
+    let confirmed = terminated.load(Ordering::SeqCst)
+        || (kill_failed
+            && (rx.recv_timeout(Duration::from_millis(500)).is_ok()
+                || terminated.load(Ordering::SeqCst)));
+    if confirmed {
+        if let Ok(mut listener) = state.exit_listener.lock() {
+            listener.take();
         }
+        return Ok(None);
     }
     state.stopping.store(true, Ordering::SeqCst);
     Ok(Some(rx))
