@@ -1,3 +1,5 @@
+import base64
+import binascii
 from typing import Any, Literal
 
 from pydantic import BaseModel, Field, model_validator
@@ -7,6 +9,8 @@ MAX_IMAGE_ATTACHMENT_BYTES = 5 * 1024 * 1024
 MAX_TEXT_ATTACHMENT_CHARS = 100_000
 # ceil(5MiB / 3) * 4 base64 chars, with padding headroom.
 MAX_IMAGE_BASE64_CHARS = 7_000_000
+# Formats every major vision provider accepts via OpenRouter data URLs.
+SUPPORTED_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 
 # OpenRouter service tiers. "fast" is an upstream alias for "priority" and is
 # normalized to "priority" at the boundary, so only these three are valid here.
@@ -48,6 +52,16 @@ class AttachmentInput(BaseModel):
     @model_validator(mode="after")
     def _validate_payload_size(self) -> "AttachmentInput":
         if self.is_image:
+            if self.content_type not in SUPPORTED_IMAGE_TYPES:
+                raise ValueError(f"unsupported image type: {self.content_type}")
+            try:
+                decoded = base64.b64decode(self.content, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError("image attachment content is not valid base64") from exc
+            if len(decoded) > MAX_IMAGE_ATTACHMENT_BYTES:
+                raise ValueError(
+                    f"image attachment exceeds {MAX_IMAGE_ATTACHMENT_BYTES} bytes"
+                )
             if self.size > MAX_IMAGE_ATTACHMENT_BYTES:
                 raise ValueError(
                     f"image attachment exceeds {MAX_IMAGE_ATTACHMENT_BYTES} bytes"
@@ -95,9 +109,22 @@ class RunRequest(BaseModel):
     service_tiers: dict[str, ServiceTier] = Field(default_factory=dict)
 
 
+class DirectChatImageMeta(BaseModel):
+    """Provenance for an image attached to a direct-chat turn.
+
+    The pixels travel in ``DirectChatRequest.attachments`` as base64; this
+    metadata rides along in ``messages`` so transcripts and history can
+    identify image turns without storing payloads.
+    """
+
+    name: str = Field(min_length=1, max_length=256)
+    content_type: str = Field(default="image/png", max_length=128)
+
+
 class DirectChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=100000)
+    images: list[DirectChatImageMeta] = Field(default_factory=list, max_length=5)
 
 
 class DirectChatRequest(BaseModel):

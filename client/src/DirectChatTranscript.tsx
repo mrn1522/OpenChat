@@ -26,6 +26,24 @@ const DirectChatMessageBubble = memo(function DirectChatMessageBubble({
   return (
     <article className={`direct-chat-bubble ${message.role}`}>
       <p className="direct-chat-role">{message.role === "user" ? "You" : "Assistant"}</p>
+      {message.images && message.images.length > 0 && (
+        <div className="direct-chat-image-row">
+          {message.images.map((image, index) =>
+            image.data_url ? (
+              <img
+                key={`${image.name}-${index}`}
+                className="direct-chat-image-thumb"
+                src={image.data_url}
+                alt={image.name}
+              />
+            ) : (
+              <span key={`${image.name}-${index}`} className="direct-chat-image-chip">
+                {image.name}
+              </span>
+            )
+          )}
+        </div>
+      )}
       <div className="markdown-body">
         <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
       </div>

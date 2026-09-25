@@ -67,9 +67,18 @@ export type AttachmentInput = {
 
 export type DirectChatRole = "user" | "assistant";
 
+export type DirectChatImageRef = {
+  name: string;
+  content_type: string;
+  // In-session thumbnail source only — stripped before transport and never
+  // persisted in history.
+  data_url?: string;
+};
+
 export type DirectChatMessage = {
   role: DirectChatRole;
   content: string;
+  images?: DirectChatImageRef[];
 };
 
 export type StreamEvent =

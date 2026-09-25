@@ -378,6 +378,35 @@ class TestBuildDirectChatMessages:
         assert prompt == "hello"
 
 
+class TestHistoryAttachmentPayload:
+    def test_image_payload_replaced_with_base64_placeholder(self):
+        import base64
+
+        image = AttachmentInput(
+            name="shot.png",
+            size=10,
+            content_type="image/png",
+            content="QUJD",
+        )
+        payload = main._history_attachment_payload(image)
+        assert payload["name"] == "shot.png"
+        assert payload["content"] != "QUJD"
+        decoded = base64.b64decode(payload["content"], validate=True)
+        assert decoded.decode() == "[image data omitted: 10 bytes]"
+        # The persisted record must still pass strict image validation on read.
+        AttachmentInput.model_validate(payload)
+
+    def test_text_payload_passes_through(self):
+        text = AttachmentInput(
+            name="notes.txt",
+            size=5,
+            content_type="text/plain",
+            content="hello",
+        )
+        payload = main._history_attachment_payload(text)
+        assert payload["content"] == "hello"
+
+
 class TestDebateJobConcurrency:
     def test_jobs_bounded_by_parallel_limit(self, monkeypatch):
         monkeypatch.setattr(settings, "openchat_max_parallel_sources", 2)

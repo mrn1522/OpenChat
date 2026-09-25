@@ -310,6 +310,8 @@ const MAX_ATTACHMENT_CONTENT_CHARS = 100_000;
 // 5MB — the tightest image cap across common vision providers (Anthropic).
 const MAX_IMAGE_ATTACHMENT_SIZE_BYTES = 5_242_880;
 const IMAGE_CONTENT_TYPE_PREFIX = "image/";
+// Formats every major vision provider accepts via OpenRouter data URLs.
+const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 const SUPPORTED_ATTACHMENT_TYPES = new Set([
   "txt",
   "md",
@@ -497,6 +499,10 @@ const readAttachmentFile = async (file: File): Promise<ComposerAttachment | null
 
 const readImageAttachmentFile = (file: File): Promise<ComposerAttachment | null> =>
   new Promise((resolve) => {
+    if (!SUPPORTED_IMAGE_TYPES.has(file.type)) {
+      resolve(null);
+      return;
+    }
     const reader = new FileReader();
     reader.onerror = () => resolve(null);
     reader.onload = () => {
@@ -741,6 +747,9 @@ function App() {
   const directSettingsRef = useRef<HTMLDivElement | null>(null);
   const directStreamControllerRef = useRef<AbortController | null>(null);
   const directRequestIdRef = useRef(0);
+  // Bumped whenever the direct session resets/hydrates so file reads started
+  // against the old session cannot commit attachments into the new one.
+  const directAttachmentGenerationRef = useRef(0);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -1514,6 +1523,7 @@ function App() {
     setDirectMessages([]);
     setDirectConversationId(null);
     setDirectAttachments([]);
+    directAttachmentGenerationRef.current += 1;
     setIsDirectSettingsOpen(false);
   };
 
@@ -1630,6 +1640,7 @@ function App() {
     });
     setDirectPrompt("");
     setDirectAttachments([]);
+    directAttachmentGenerationRef.current += 1;
     setIsDirectSettingsOpen(false);
     setDirectError(null);
     setDirectRunId(chat.run_id);
@@ -1997,9 +2008,11 @@ function App() {
       return;
     }
 
+    const generation = directAttachmentGenerationRef.current;
     const parsed = await Promise.all(
       nextFiles.map((file) => (isImageFile(file) ? readImageAttachmentFile(file) : readAttachmentFile(file)))
     );
+    if (generation !== directAttachmentGenerationRef.current) return;
     const rejectedCount = parsed.filter((item) => !item).length;
     const accepted = parsed.filter((item): item is ComposerAttachment => item !== null);
 
@@ -2035,6 +2048,25 @@ function App() {
       .filter((file): file is File => file !== null);
     if (imageFiles.length === 0) return;
     event.preventDefault();
+
+    // A clipboard payload can carry both files and text — keep the text by
+    // inserting it at the caret ourselves since the default paste is suppressed.
+    const pastedText = event.clipboardData?.getData("text/plain") ?? "";
+    if (pastedText) {
+      const textarea = event.currentTarget;
+      const nextValue =
+        textarea.value.slice(0, textarea.selectionStart) +
+        pastedText +
+        textarea.value.slice(textarea.selectionEnd);
+      const caret = textarea.selectionStart + pastedText.length;
+      setDirectPrompt(nextValue);
+      requestAnimationFrame(() => textarea.setSelectionRange(caret, caret));
+    }
+
+    if (imageFiles.every((file) => !SUPPORTED_IMAGE_TYPES.has(file.type))) {
+      setDirectError("Unsupported image type — use PNG, JPEG, GIF, or WebP.");
+      return;
+    }
     void addDirectFiles(imageFiles);
   };
 
@@ -2075,7 +2107,23 @@ function App() {
 
     const conversationId = directConversationId ?? crypto.randomUUID();
     setDirectConversationId(conversationId);
-    const nextMessages: DirectChatMessage[] = [...directMessages, { role: "user", content: promptText }];
+    const imageAttachments = directAttachments.filter(isImageAttachment);
+    const nextMessages: DirectChatMessage[] = [
+      ...directMessages,
+      {
+        role: "user",
+        content: promptText,
+        ...(imageAttachments.length > 0
+          ? {
+              images: imageAttachments.map((attachment) => ({
+                name: attachment.name,
+                content_type: attachment.content_type,
+                data_url: attachmentImageDataUrl(attachment),
+              })),
+            }
+          : {}),
+      },
+    ];
     setDirectMessages(nextMessages);
     setDirectPrompt("");
 
@@ -2086,7 +2134,18 @@ function App() {
       await streamDirectChat(
         {
           model: directModel,
-          messages: nextMessages,
+          messages: nextMessages.map((message) =>
+            message.images?.length
+              ? {
+                  role: message.role,
+                  content: message.content,
+                  // data_url is display-only — the wire format carries
+                  // name + type metadata; the image itself travels via
+                  // the attachments payload.
+                  images: message.images.map(({ name, content_type }) => ({ name, content_type })),
+                }
+              : message
+          ),
           conversation_id: conversationId,
           temperature: directTemperature,
           max_output_tokens: OPENROUTER_TOKEN_LIMIT,

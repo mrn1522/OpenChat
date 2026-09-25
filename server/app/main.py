@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import json
 import logging
 import os
@@ -872,10 +873,12 @@ async def run_stream(request: RunRequest):
 def _history_attachment_payload(attachment: AttachmentInput) -> dict[str, Any]:
     """Attachment shape persisted in history: image payloads are replaced
     with a placeholder since multi-MB base64 is never needed to rehydrate
-    a chat record."""
+    a chat record. The placeholder is itself valid base64 so the stored
+    record still passes ``AttachmentInput`` validation on read."""
     payload = attachment.model_dump()
     if attachment.is_image:
-        payload["content"] = f"[image data omitted: {attachment.size} bytes]"
+        marker = f"[image data omitted: {attachment.size} bytes]"
+        payload["content"] = base64.b64encode(marker.encode()).decode()
     return payload
 
 
@@ -937,8 +940,16 @@ async def direct_chat_stream(request: DirectChatRequest):
             (message.content for message in reversed(request.messages) if message.role == "user"),
             "",
         )
-        transcript: list[dict[str, str]] = [
-            {"role": message.role, "content": message.content}
+        transcript: list[dict[str, Any]] = [
+            {
+                "role": message.role,
+                "content": message.content,
+                **(
+                    {"images": [image.model_dump() for image in message.images]}
+                    if message.images
+                    else {}
+                ),
+            }
             for message in request.messages
         ]
         if assistant_output.strip():

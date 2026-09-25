@@ -91,11 +91,29 @@ class TestAttachmentInput:
     def test_image_attachment_valid(self):
         attachment = AttachmentInput(
             name="shot.png",
-            size=MAX_IMAGE_ATTACHMENT_BYTES,
+            size=10,
             content_type="image/png",
-            content="a" * MAX_IMAGE_BASE64_CHARS,
+            content="QUJD",  # b"ABC"
         )
         assert attachment.is_image
+
+    def test_image_attachment_rejects_unsupported_type(self):
+        with pytest.raises(ValidationError):
+            AttachmentInput(
+                name="icon.svg",
+                size=10,
+                content_type="image/svg+xml",
+                content="QUJD",
+            )
+
+    def test_image_attachment_rejects_invalid_base64(self):
+        with pytest.raises(ValidationError):
+            AttachmentInput(
+                name="shot.png",
+                size=10,
+                content_type="image/png",
+                content="not base64!!!",
+            )
 
     def test_image_attachment_rejects_oversize_file(self):
         with pytest.raises(ValidationError):
@@ -103,7 +121,7 @@ class TestAttachmentInput:
                 name="big.png",
                 size=MAX_IMAGE_ATTACHMENT_BYTES + 1,
                 content_type="image/png",
-                content="a",
+                content="QUJD",
             )
 
     def test_image_attachment_rejects_oversize_base64(self):
@@ -112,7 +130,7 @@ class TestAttachmentInput:
                 name="big.png",
                 size=MAX_IMAGE_ATTACHMENT_BYTES,
                 content_type="image/png",
-                content="a" * (MAX_IMAGE_BASE64_CHARS + 1),
+                content="a" * MAX_IMAGE_BASE64_CHARS,
             )
 
     def test_text_attachment_rejects_oversize_file(self):

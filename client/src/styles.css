@@ -1607,6 +1607,32 @@ body {
   text-transform: uppercase;
 }
 
+.direct-chat-image-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin: 0 0 8px;
+}
+
+.direct-chat-image-thumb {
+  width: 72px;
+  height: 72px;
+  border-radius: 8px;
+  object-fit: cover;
+  border: 1px solid var(--th-edge-15);
+}
+
+.direct-chat-image-chip {
+  border: 1px solid var(--th-edge-9);
+  border-radius: 999px;
+  background: var(--th-ink-44);
+  color: var(--th-bright-6);
+  padding: 3px 9px;
+  font-size: 0.74rem;
+  display: inline-flex;
+  align-items: center;
+}
+
 .direct-chat-loading {
   display: inline-flex;
   align-items: center;
