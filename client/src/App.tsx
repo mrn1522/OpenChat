@@ -654,9 +654,13 @@ function App() {
   const [serviceTierByModel, setServiceTierByModel] = useState<Record<string, ServiceTier>>({});
   const serviceTierFetchInFlightRef = useRef<Set<string>>(new Set());
   // modelId -> last failed discovery time; failed models retry once the
-  // cooldown elapses and another lookup pass runs, instead of recording
-  // "no tiers" and permanently hiding the dropdown.
+  // cooldown elapses via the retry timer below.
   const serviceTierFailedAtRef = useRef<Record<string, number>>({});
+  const serviceTierRetryTimerRef = useRef<Record<string, number>>({});
+  // Bumped when the provider base URL changes so stale in-flight lookups
+  // from the previous provider can never commit into the fresh caches.
+  const serviceTierGenerationRef = useRef(0);
+  const [tierRetryTick, bumpTierRetryTick] = useState(0);
 
   const [activePicker, setActivePicker] = useState<PickerKind | null>(null);
   const [pickerQuery, setPickerQuery] = useState("");
@@ -781,12 +785,16 @@ function App() {
       };
       const updated = await updateSettings(payload);
       if (updated.base_url !== appSettings?.base_url) {
-        // Tier availability is per-provider: drop cached lookups, failure
-        // marks, and selections so the new provider is probed fresh.
+        // Tier availability is per-provider: bump the generation so pending
+        // lookups from the old provider can't commit, drop cached lookups,
+        // failure marks, pending retries, and selections.
+        serviceTierGenerationRef.current += 1;
         setServiceTiersByModel({});
         setServiceTierByModel({});
         serviceTierFetchInFlightRef.current.clear();
         serviceTierFailedAtRef.current = {};
+        Object.values(serviceTierRetryTimerRef.current).forEach(clearTimeout);
+        serviceTierRetryTimerRef.current = {};
       }
       setAppSettings(updated);
       setIsAppSettingsOpen(false);
@@ -1118,6 +1126,7 @@ function App() {
   // Each lookup commits its own outcome — earlier passes must not be
   // invalidated when a sibling lookup resolves and reruns this effect.
   useEffect(() => {
+    const generation = serviceTierGenerationRef.current;
     for (const modelId of modelsNeedingTierLookup) {
       if (modelId in serviceTiersByModel || serviceTierFetchInFlightRef.current.has(modelId)) {
         continue;
@@ -1129,19 +1138,29 @@ function App() {
       serviceTierFetchInFlightRef.current.add(modelId);
       fetchServiceTiers(modelId)
         .then((tiers) => {
+          if (serviceTierGenerationRef.current !== generation) return;
           delete serviceTierFailedAtRef.current[modelId];
           setServiceTiersByModel((prev) => ({ ...prev, [modelId]: tiers }));
         })
         .catch(() => {
-          // Failures are recorded with a timestamp so discovery retries
-          // later; nothing is cached as "no tiers".
+          if (serviceTierGenerationRef.current !== generation) return;
+          // Record the failure and schedule a retry once the cooldown ends;
+          // nothing is cached as "no tiers", so a recovered provider is
+          // re-probed even when the selection is otherwise unchanged.
           serviceTierFailedAtRef.current[modelId] = Date.now();
+          if (serviceTierRetryTimerRef.current[modelId] === undefined) {
+            serviceTierRetryTimerRef.current[modelId] = window.setTimeout(() => {
+              delete serviceTierRetryTimerRef.current[modelId];
+              bumpTierRetryTick((tick) => tick + 1);
+            }, SERVICE_TIER_RETRY_MS);
+          }
         })
         .finally(() => {
+          if (serviceTierGenerationRef.current !== generation) return;
           serviceTierFetchInFlightRef.current.delete(modelId);
         });
     }
-  }, [modelsNeedingTierLookup, serviceTiersByModel]);
+  }, [modelsNeedingTierLookup, serviceTiersByModel, tierRetryTick]);
 
   const activeServiceTierSelection = useMemo(() => {
     const relevant = new Set<string>(sourceModels);
