@@ -952,7 +952,9 @@ body {
   margin-top: 8px;
   display: inline-flex;
   align-items: center;
-  gap: 6px;
+  flex-wrap: wrap;
+  row-gap: 2px;
+  column-gap: 6px;
   max-width: 100%;
 }
 
