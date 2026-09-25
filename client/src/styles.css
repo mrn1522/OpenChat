@@ -1566,7 +1566,7 @@ body {
 .direct-composer-panel .composer-settings-popover {
   top: auto;
   bottom: calc(100% + 10px);
-  max-height: min(320px, calc(100dvh - 320px));
+  max-height: clamp(160px, calc(100dvh - 320px), 320px);
   overflow-y: auto;
 }
 
