@@ -2648,7 +2648,7 @@ function App() {
           className="api-settings-overlay"
           role="presentation"
           onMouseDown={(event) => {
-            if (event.target === event.currentTarget && appSettings?.api_key_configured) {
+            if (event.button === 0 && event.target === event.currentTarget && appSettings?.api_key_configured) {
               setIsAppSettingsOpen(false);
             }
           }}
