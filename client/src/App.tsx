@@ -292,6 +292,7 @@ const SERVICE_TIER_LABELS: Record<ServiceTier, string> = {
   flex: "Flex · lower cost",
   priority: "Priority · faster",
 };
+const SERVICE_TIER_RETRY_MS = 60_000;
 const OPENROUTER_TOKEN_LIMIT = 10_000;
 const MAX_ATTACHMENTS = 5;
 const MAX_ATTACHMENT_SIZE_BYTES = 262_144;
@@ -652,6 +653,10 @@ function App() {
   const [serviceTiersByModel, setServiceTiersByModel] = useState<Record<string, ServiceTier[]>>({});
   const [serviceTierByModel, setServiceTierByModel] = useState<Record<string, ServiceTier>>({});
   const serviceTierFetchInFlightRef = useRef<Set<string>>(new Set());
+  // modelId -> last failed discovery time; failed models retry once the
+  // cooldown elapses and another lookup pass runs, instead of recording
+  // "no tiers" and permanently hiding the dropdown.
+  const serviceTierFailedAtRef = useRef<Record<string, number>>({});
 
   const [activePicker, setActivePicker] = useState<PickerKind | null>(null);
   const [pickerQuery, setPickerQuery] = useState("");
@@ -775,6 +780,14 @@ function App() {
         base_url: baseUrlInput.trim() || null,
       };
       const updated = await updateSettings(payload);
+      if (updated.base_url !== appSettings?.base_url) {
+        // Tier availability is per-provider: drop cached lookups, failure
+        // marks, and selections so the new provider is probed fresh.
+        setServiceTiersByModel({});
+        setServiceTierByModel({});
+        serviceTierFetchInFlightRef.current.clear();
+        serviceTierFailedAtRef.current = {};
+      }
       setAppSettings(updated);
       setIsAppSettingsOpen(false);
       setApiKeyInput("");
@@ -1102,32 +1115,32 @@ function App() {
 
   // Lazily discover non-default service tiers for every model in view;
   // results (including "none") are cached so each model is fetched once.
+  // Each lookup commits its own outcome — earlier passes must not be
+  // invalidated when a sibling lookup resolves and reruns this effect.
   useEffect(() => {
-    let isActive = true;
     for (const modelId of modelsNeedingTierLookup) {
       if (modelId in serviceTiersByModel || serviceTierFetchInFlightRef.current.has(modelId)) {
+        continue;
+      }
+      const failedAt = serviceTierFailedAtRef.current[modelId];
+      if (failedAt !== undefined && Date.now() - failedAt < SERVICE_TIER_RETRY_MS) {
         continue;
       }
       serviceTierFetchInFlightRef.current.add(modelId);
       fetchServiceTiers(modelId)
         .then((tiers) => {
-          if (isActive) {
-            setServiceTiersByModel((prev) => ({ ...prev, [modelId]: tiers }));
-          }
+          delete serviceTierFailedAtRef.current[modelId];
+          setServiceTiersByModel((prev) => ({ ...prev, [modelId]: tiers }));
         })
         .catch(() => {
-          // Discovery failures hide the dropdown rather than blocking the app.
-          if (isActive) {
-            setServiceTiersByModel((prev) => ({ ...prev, [modelId]: [] }));
-          }
+          // Failures are recorded with a timestamp so discovery retries
+          // later; nothing is cached as "no tiers".
+          serviceTierFailedAtRef.current[modelId] = Date.now();
         })
         .finally(() => {
           serviceTierFetchInFlightRef.current.delete(modelId);
         });
     }
-    return () => {
-      isActive = false;
-    };
   }, [modelsNeedingTierLookup, serviceTiersByModel]);
 
   const activeServiceTierSelection = useMemo(() => {
@@ -1500,12 +1513,19 @@ function App() {
     const hydratedDirectModel = chat.request.fusion_model || chat.request.source_models[0] || "";
     setDirectModel(hydratedDirectModel);
     const hydratedDirectTier = chat.request.service_tiers?.[hydratedDirectModel];
-    setServiceTierByModel((prev) => ({
-      ...prev,
-      ...(hydratedDirectModel && hydratedDirectTier
-        ? { [hydratedDirectModel]: hydratedDirectTier }
-        : {}),
-    }));
+    setServiceTierByModel((prev) => {
+      const next = { ...prev };
+      if (hydratedDirectModel) {
+        // A missing saved tier means default routing — clear any stale
+        // selection for this model rather than inheriting it.
+        if (hydratedDirectTier) {
+          next[hydratedDirectModel] = hydratedDirectTier;
+        } else {
+          delete next[hydratedDirectModel];
+        }
+      }
+      return next;
+    });
     setDirectPrompt("");
     setDirectAttachments([]);
     setIsDirectSettingsOpen(false);

@@ -322,7 +322,16 @@ async def fetch_model_service_tiers(model_id: str) -> list[str]:
                 timeout=settings.openchat_timeout_seconds,
             )
             response.raise_for_status()
-            tiers = _extract_service_tiers(response.json())
+            payload = response.json()
+            # A 200 without an endpoint list is malformed, not "no tiers" —
+            # treat it like a transport failure so a stale entry survives.
+            if not (
+                isinstance(payload, dict)
+                and isinstance(payload.get("data"), dict)
+                and isinstance(payload["data"].get("endpoints"), list)
+            ):
+                raise ValueError("Malformed model endpoints response")
+            tiers = _extract_service_tiers(payload)
         except (httpx.HTTPError, ValueError):
             if cached is not None:
                 logger.warning(

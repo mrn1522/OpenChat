@@ -521,6 +521,41 @@ class TestFetchModelServiceTiers:
         assert asyncio.run(llm.fetch_model_service_tiers("openai/a")) == ["flex"]
         assert len(calls) == 1
 
+    def test_malformed_response_serves_stale_cache(self, monkeypatch):
+        """A 200 without a usable endpoint list is malformed, not 'no tiers'."""
+        base_url = "https://openrouter.test/v1"
+        monkeypatch.setattr(settings, "openai_base_url", base_url)
+        monkeypatch.setattr(
+            llm,
+            "_service_tiers_cache",
+            {
+                (base_url, "openai/a"): (
+                    llm.time.monotonic() - llm._SERVICE_TIERS_CACHE_TTL_SECONDS - 1,
+                    ["flex"],
+                )
+            },
+        )
+
+        calls: list[httpx.Request] = []
+        monkeypatch.setattr(
+            llm, "_shared_http", lambda: self._client(calls, payload={"data": {}})
+        )
+
+        assert asyncio.run(llm.fetch_model_service_tiers("openai/a")) == ["flex"]
+        assert len(calls) == 1
+
+    def test_empty_endpoints_list_caches_as_no_tiers(self, monkeypatch):
+        """An explicit empty roster is a valid 'no tiers' result, not malformed."""
+        calls: list[httpx.Request] = []
+        monkeypatch.setattr(
+            llm,
+            "_shared_http",
+            lambda: self._client(calls, payload={"data": {"endpoints": []}}),
+        )
+
+        assert asyncio.run(llm.fetch_model_service_tiers("openai/a")) == []
+        assert len(calls) == 1
+
     def test_error_without_cache_propagates(self, monkeypatch):
         calls: list[httpx.Request] = []
         monkeypatch.setattr(llm, "_shared_http", lambda: self._client(calls, status=500))
