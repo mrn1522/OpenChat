@@ -757,6 +757,12 @@ function App() {
   // closures (sendDirectMessage awaits in-flight reads, then snapshots this).
   const directAttachmentsRef = useRef<ComposerAttachment[]>([]);
   const directAttachmentReadsRef = useRef<Promise<void>[]>([]);
+  // Every object URL minted for composer/transcript thumbnails, revoked when
+  // nothing references it (see releaseDirectThumbs) or the session resets.
+  const directThumbUrlsRef = useRef<Set<string>>(new Set());
+  // Set synchronously while a send is in flight so a second click can't start
+  // a concurrent send while the first still awaits attachment reads.
+  const directSendInFlightRef = useRef(false);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -1531,6 +1537,7 @@ function App() {
     setDirectConversationId(null);
     setDirectAttachments([]);
     directAttachmentsRef.current = [];
+    releaseDirectThumbs([...directThumbUrlsRef.current]);
     directAttachmentGenerationRef.current += 1;
     setIsDirectSettingsOpen(false);
   };
@@ -1649,6 +1656,7 @@ function App() {
     setDirectPrompt("");
     setDirectAttachments([]);
     directAttachmentsRef.current = [];
+    releaseDirectThumbs([...directThumbUrlsRef.current]);
     directAttachmentGenerationRef.current += 1;
     setIsDirectSettingsOpen(false);
     setDirectError(null);
@@ -2021,7 +2029,13 @@ function App() {
     const parsed = await Promise.all(
       nextFiles.map((file) => (isImageFile(file) ? readImageAttachmentFile(file) : readAttachmentFile(file)))
     );
-    if (generation !== directAttachmentGenerationRef.current) return;
+    if (generation !== directAttachmentGenerationRef.current) {
+      // Session moved on while reading — release thumbnails we won't show.
+      releaseDirectThumbs(
+        parsed.flatMap((item) => (item?.thumb_url ? [item.thumb_url] : []))
+      );
+      return;
+    }
     const rejectedCount = parsed.filter((item) => !item).length;
     const accepted = parsed.filter((item): item is ComposerAttachment => item !== null);
 
@@ -2030,14 +2044,22 @@ function App() {
       return;
     }
 
-    setDirectAttachments((prev) => {
-      const merged = [...prev, ...accepted].filter(
-        (item, index, array) => array.findIndex((entry) => entry.id === item.id) === index
-      );
-      const next = merged.slice(0, MAX_ATTACHMENTS);
-      directAttachmentsRef.current = next;
-      return next;
-    });
+    // Commit to the ref synchronously — a send awaiting this read must see
+    // the new attachments — then mirror to React state for rendering.
+    const merged = [...directAttachmentsRef.current, ...accepted].filter(
+      (item, index, array) => array.findIndex((entry) => entry.id === item.id) === index
+    );
+    const next = merged.slice(0, MAX_ATTACHMENTS);
+    directAttachmentsRef.current = next;
+    for (const item of next) {
+      if (item.thumb_url) directThumbUrlsRef.current.add(item.thumb_url);
+    }
+    setDirectAttachments(next);
+    releaseDirectThumbs(
+      accepted
+        .filter((item) => !next.some((entry) => entry.id === item.id))
+        .flatMap((item) => (item.thumb_url ? [item.thumb_url] : []))
+    );
 
     if (rejectedCount > 0) {
       setDirectError(`${rejectedCount} file(s) were skipped because they are unsupported or empty.`);
@@ -2045,6 +2067,24 @@ function App() {
       setDirectError(null);
     }
   };
+
+  const releaseDirectThumbs = (urls: string[]) => {
+    for (const url of urls) {
+      URL.revokeObjectURL(url);
+      directThumbUrlsRef.current.delete(url);
+    }
+  };
+
+  // Release any remaining object URLs when the app unmounts.
+  useEffect(
+    () => () => {
+      for (const url of directThumbUrlsRef.current) {
+        URL.revokeObjectURL(url);
+      }
+      directThumbUrlsRef.current.clear();
+    },
+    []
+  );
 
   // Tracks each addDirectFiles call so sendDirectMessage can wait for the
   // image read to finish instead of sending a turn without its attachment.
@@ -2094,11 +2134,18 @@ function App() {
   };
 
   const removeDirectAttachment = (attachmentId: string) => {
-    setDirectAttachments((prev) => {
-      const next = prev.filter((item) => item.id !== attachmentId);
-      directAttachmentsRef.current = next;
-      return next;
-    });
+    const removed = directAttachmentsRef.current.find((item) => item.id === attachmentId);
+    const next = directAttachmentsRef.current.filter((item) => item.id !== attachmentId);
+    directAttachmentsRef.current = next;
+    setDirectAttachments(next);
+    if (
+      removed?.thumb_url &&
+      !directMessages.some((message) =>
+        message.images?.some((image) => image.data_url === removed.thumb_url)
+      )
+    ) {
+      releaseDirectThumbs([removed.thumb_url]);
+    }
   };
 
   const toggleFromPicker = (id: string) => {
@@ -2121,86 +2168,96 @@ function App() {
   };
 
   const sendDirectMessage = async () => {
-    const trimmedPrompt = directPrompt.trim();
-    // A pasted image can still be reading when Send fires — wait for it so
-    // the outgoing turn includes it instead of it landing in the next turn.
-    if (directAttachmentReadsRef.current.length > 0) {
-      await Promise.allSettled([...directAttachmentReadsRef.current]);
-    }
-    const attachments = directAttachmentsRef.current;
-    const promptText =
-      trimmedPrompt || (attachments.some(isImageAttachment) ? "What's in this image?" : "");
-    if (!promptText || !directModel || isDirectRunning) return;
-
-    const requestId = directRequestIdRef.current + 1;
-    directRequestIdRef.current = requestId;
-    setDirectError(null);
-    setIsDirectRunning(true);
-    setDirectRunId(null);
-
-    const conversationId = directConversationId ?? crypto.randomUUID();
-    setDirectConversationId(conversationId);
-    const imageAttachments = attachments.filter(isImageAttachment);
-    const nextMessages: DirectChatMessage[] = [
-      ...directMessages,
-      {
-        role: "user",
-        content: promptText,
-        ...(imageAttachments.length > 0
-          ? {
-              images: imageAttachments.map((attachment) => ({
-                name: attachment.name,
-                content_type: attachment.content_type,
-                data_url: attachment.thumb_url,
-              })),
-            }
-          : {}),
-      },
-    ];
-    setDirectMessages(nextMessages);
-    setDirectPrompt("");
-
-    const controller = new AbortController();
-    directStreamControllerRef.current = controller;
-
+    if (directSendInFlightRef.current) return;
+    directSendInFlightRef.current = true;
     try {
-      await streamDirectChat(
+      const trimmedPrompt = directPrompt.trim();
+      const sendGeneration = directAttachmentGenerationRef.current;
+      // A pasted image can still be reading when Send fires — wait for it so
+      // the outgoing turn includes it instead of it landing in the next turn.
+      if (directAttachmentReadsRef.current.length > 0) {
+        await Promise.allSettled([...directAttachmentReadsRef.current]);
+      }
+      // The session may have been reset or rehydrated while reads settled;
+      // the prompt/model/directMessages captured above belong to it, so bail.
+      if (sendGeneration !== directAttachmentGenerationRef.current) return;
+      const attachments = directAttachmentsRef.current;
+      const promptText =
+        trimmedPrompt || (attachments.some(isImageAttachment) ? "What's in this image?" : "");
+      if (!promptText || !directModel || isDirectRunning) return;
+
+      const requestId = directRequestIdRef.current + 1;
+      directRequestIdRef.current = requestId;
+      setDirectError(null);
+      setIsDirectRunning(true);
+      setDirectRunId(null);
+
+      const conversationId = directConversationId ?? crypto.randomUUID();
+      setDirectConversationId(conversationId);
+      const imageAttachments = attachments.filter(isImageAttachment);
+      const nextMessages: DirectChatMessage[] = [
+        ...directMessages,
         {
-          model: directModel,
-          messages: nextMessages.map((message) =>
-            message.images?.length
-              ? {
-                  role: message.role,
-                  content: message.content,
-                  // data_url is display-only — the wire format carries
-                  // name + type metadata; the image itself travels via
-                  // the attachments payload.
-                  images: message.images.map(({ name, content_type }) => ({ name, content_type })),
-                }
-              : message
-          ),
-          conversation_id: conversationId,
-          temperature: directTemperature,
-          max_output_tokens: OPENROUTER_TOKEN_LIMIT,
-          web_search_enabled: directWebSearchEnabled,
-          reasoning: {
-            effort: directReasoningEffort,
-            exclude: false,
-          },
-          attachments: attachments.map(
-            ({ id: _id, thumb_url: _thumb, ...attachment }) => attachment
-          ),
-          service_tier: effectiveTier(directModel),
+          role: "user",
+          content: promptText,
+          ...(imageAttachments.length > 0
+            ? {
+                images: imageAttachments.map((attachment) => ({
+                  name: attachment.name,
+                  content_type: attachment.content_type,
+                  data_url: attachment.thumb_url,
+                })),
+              }
+            : {}),
         },
-        (event) => onDirectEvent(event, requestId),
-        controller.signal
-      );
-    } catch (err) {
-      if (requestId !== directRequestIdRef.current) return;
-      if (isAbortError(err)) return;
-      setDirectError(err instanceof Error ? err.message : "Direct chat failed.");
-      setIsDirectRunning(false);
-      directStreamControllerRef.current = null;
+      ];
+      setDirectMessages(nextMessages);
+      setDirectPrompt("");
+
+      const controller = new AbortController();
+      directStreamControllerRef.current = controller;
+
+      try {
+        await streamDirectChat(
+          {
+            model: directModel,
+            messages: nextMessages.map((message) =>
+              message.images?.length
+                ? {
+                    role: message.role,
+                    content: message.content,
+                    // data_url is display-only — the wire format carries
+                    // name + type metadata; the image itself travels via
+                    // the attachments payload.
+                    images: message.images.map(({ name, content_type }) => ({ name, content_type })),
+                  }
+                : message
+            ),
+            conversation_id: conversationId,
+            temperature: directTemperature,
+            max_output_tokens: OPENROUTER_TOKEN_LIMIT,
+            web_search_enabled: directWebSearchEnabled,
+            reasoning: {
+              effort: directReasoningEffort,
+              exclude: false,
+            },
+            attachments: attachments.map(
+              ({ id: _id, thumb_url: _thumb, ...attachment }) => attachment
+            ),
+            service_tier: effectiveTier(directModel),
+          },
+          (event) => onDirectEvent(event, requestId),
+          controller.signal
+        );
+      } catch (err) {
+        if (requestId !== directRequestIdRef.current) return;
+        if (isAbortError(err)) return;
+        setDirectError(err instanceof Error ? err.message : "Direct chat failed.");
+        setIsDirectRunning(false);
+        directStreamControllerRef.current = null;
+      }
+    } finally {
+      directSendInFlightRef.current = false;
     }
   };
 
