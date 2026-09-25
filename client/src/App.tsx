@@ -293,6 +293,11 @@ const SERVICE_TIER_LABELS: Record<ServiceTier, string> = {
   priority: "Priority",
 };
 const SERVICE_TIER_HINTS: Record<ServiceTier, string> = {
+  default: "",
+  flex: "lower cost",
+  priority: "faster",
+};
+const SERVICE_TIER_TOOLTIPS: Record<ServiceTier, string> = {
   default: "Default routing",
   flex: "Flex — lower cost, slower",
   priority: "Priority — faster, higher cost",
@@ -1214,7 +1219,7 @@ function App() {
         <select
           className="service-tier-select"
           aria-label={`Service tier for ${modelId}`}
-          title={SERVICE_TIER_HINTS[effectiveTier(modelId) ?? "default"]}
+          title={SERVICE_TIER_TOOLTIPS[effectiveTier(modelId) ?? "default"]}
           value={effectiveTier(modelId) ?? "default"}
           disabled={disabled}
           onChange={(event) =>
@@ -1226,11 +1231,16 @@ function App() {
         >
           <option value="default">{SERVICE_TIER_LABELS.default}</option>
           {tiers.map((tier) => (
-            <option key={tier} value={tier} title={SERVICE_TIER_HINTS[tier]}>
+            <option key={tier} value={tier} title={SERVICE_TIER_TOOLTIPS[tier]}>
               {SERVICE_TIER_LABELS[tier] ?? tier}
             </option>
           ))}
         </select>
+        {SERVICE_TIER_HINTS[effectiveTier(modelId) ?? "default"] && (
+          <span className="service-tier-hint">
+            {SERVICE_TIER_HINTS[effectiveTier(modelId) ?? "default"]}
+          </span>
+        )}
       </label>
     );
   };

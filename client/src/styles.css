@@ -979,6 +979,12 @@ body {
   opacity: 0.6;
 }
 
+.service-tier-hint {
+  color: var(--muted);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
 .fusion-star {
   inline-size: 34px;
   block-size: 34px;
