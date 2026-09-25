@@ -2647,7 +2647,7 @@ function App() {
         <div
           className="api-settings-overlay"
           role="presentation"
-          onClick={(event) => {
+          onMouseDown={(event) => {
             if (event.target === event.currentTarget && appSettings?.api_key_configured) {
               setIsAppSettingsOpen(false);
             }
