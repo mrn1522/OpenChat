@@ -142,6 +142,17 @@ _service_tiers_cache: dict[tuple[str, str], tuple[float, list[str]]] = {}
 # itself when its task completes, so failures retain nothing.
 _service_tiers_inflight: dict[tuple[str, str], asyncio.Task[list[str]]] = {}
 
+
+def _drop_inflight_tier_fetch(
+    cache_key: tuple[str, str], task: asyncio.Task[list[str]]
+) -> None:
+    _service_tiers_inflight.pop(cache_key, None)
+    # Retrieve failures so a fetch that outlived all of its cancelled
+    # awaiters does not log an unhandled task exception. exception() on a
+    # cancelled task raises CancelledError, so skip those.
+    if not task.cancelled():
+        task.exception()
+
 # Tier suffixes on provider endpoint tags (`openai/flex`,
 # `google-vertex/global/priority`). "fast" is OpenAI's rename of the priority
 # tier and is reported back as "priority", so it normalizes here.
@@ -355,7 +366,7 @@ async def fetch_model_service_tiers(model_id: str) -> list[str]:
         )
         _service_tiers_inflight[cache_key] = task
         task.add_done_callback(
-            lambda _task: _service_tiers_inflight.pop(cache_key, None)
+            lambda _task: _drop_inflight_tier_fetch(cache_key, _task)
         )
     return await asyncio.shield(task)
 
