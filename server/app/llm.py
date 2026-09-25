@@ -133,6 +133,31 @@ _MODELS_CACHE_TTL_SECONDS = 300.0
 _models_cache: tuple[str, float, OpenRouterModelsResponse] | None = None
 _models_cache_lock = asyncio.Lock()
 
+_SERVICE_TIERS_CACHE_TTL_SECONDS = 300.0
+# (base_url, model_id) -> (fetched_at, tiers). Endpoint rosters change rarely;
+# on a refresh failure the entry is served stale instead of erroring.
+_service_tiers_cache: dict[tuple[str, str], tuple[float, list[str]]] = {}
+# In-flight fetches keyed like the cache: concurrent requests for the same
+# model share one task (models fetch in parallel) and each entry removes
+# itself when its task completes, so failures retain nothing.
+_service_tiers_inflight: dict[tuple[str, str], asyncio.Task[list[str]]] = {}
+
+
+def _drop_inflight_tier_fetch(
+    cache_key: tuple[str, str], task: asyncio.Task[list[str]]
+) -> None:
+    _service_tiers_inflight.pop(cache_key, None)
+    # Retrieve failures so a fetch that outlived all of its cancelled
+    # awaiters does not log an unhandled task exception. exception() on a
+    # cancelled task raises CancelledError, so skip those.
+    if not task.cancelled():
+        task.exception()
+
+# Tier suffixes on provider endpoint tags (`openai/flex`,
+# `google-vertex/global/priority`). "fast" is OpenAI's rename of the priority
+# tier and is reported back as "priority", so it normalizes here.
+_ENDPOINT_TAG_TIER_BY_SUFFIX = {"flex": "flex", "fast": "priority", "priority": "priority"}
+
 
 def _shared_http() -> httpx.AsyncClient:
     global _shared_http_client
@@ -253,6 +278,99 @@ async def fetch_openrouter_models() -> OpenRouterModelsResponse:
         return result
 
 
+def _extract_service_tiers(payload: Any) -> list[str]:
+    """Collect non-default service tiers from a model's endpoint roster.
+
+    Tier-capable provider endpoints carry a tag suffix (``openai/flex``,
+    ``openai/fast``, ``google-vertex/global/priority``); regional and
+    quantization suffixes (``/us-east5``, ``/fp8``) are not tiers.
+    """
+    if not isinstance(payload, dict):
+        return []
+    data = payload.get("data")
+    endpoints = data.get("endpoints") if isinstance(data, dict) else None
+    if not isinstance(endpoints, list):
+        return []
+
+    tiers: set[str] = set()
+    for endpoint in endpoints:
+        if not isinstance(endpoint, dict):
+            continue
+        tag = endpoint.get("tag")
+        if not isinstance(tag, str) or "/" not in tag:
+            continue
+        tier = _ENDPOINT_TAG_TIER_BY_SUFFIX.get(tag.rsplit("/", 1)[1])
+        if tier is not None:
+            tiers.add(tier)
+
+    return [tier for tier in ("flex", "priority") if tier in tiers]
+
+
+async def _fetch_service_tiers(
+    cache_key: tuple[str, str], endpoints_url: str, model_id: str
+) -> list[str]:
+    """Fetch the endpoint roster, cache the tiers, serve stale on failure."""
+    cached = _service_tiers_cache.get(cache_key)
+    try:
+        response = await _shared_http().get(
+            endpoints_url,
+            timeout=settings.openchat_timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        # A 200 without an endpoint list is malformed, not "no tiers" —
+        # treat it like a transport failure so a stale entry survives.
+        if not (
+            isinstance(payload, dict)
+            and isinstance(payload.get("data"), dict)
+            and isinstance(payload["data"].get("endpoints"), list)
+        ):
+            raise ValueError("Malformed model endpoints response")
+        tiers = _extract_service_tiers(payload)
+    except (httpx.HTTPError, ValueError):
+        if cached is not None:
+            logger.warning(
+                "OpenRouter service-tier refresh failed for '%s'; serving stale tiers.",
+                model_id,
+                exc_info=True,
+            )
+            return list(cached[1])
+        raise
+
+    _service_tiers_cache[cache_key] = (time.monotonic(), tiers)
+    return list(tiers)
+
+
+async def fetch_model_service_tiers(model_id: str) -> list[str]:
+    """Fetch the non-default service tiers available for ``model_id``.
+
+    Reads the model's provider endpoint list (same host as the model
+    catalog). Cached per (base_url, model_id) for
+    ``_SERVICE_TIERS_CACHE_TTL_SECONDS``; a failed refresh serves the stale
+    entry when one exists. An empty list is a valid cached result — the model
+    simply has no tier endpoints.
+    """
+    base_url = settings.openai_base_url.rstrip("/")
+    endpoints_url = f"{base_url}/models/{model_id}/endpoints"
+    cache_key = (base_url, model_id)
+
+    now = time.monotonic()
+    cached = _service_tiers_cache.get(cache_key)
+    if cached is not None and now - cached[0] < _SERVICE_TIERS_CACHE_TTL_SECONDS:
+        return list(cached[1])
+
+    task = _service_tiers_inflight.get(cache_key)
+    if task is None:
+        task = asyncio.create_task(
+            _fetch_service_tiers(cache_key, endpoints_url, model_id)
+        )
+        _service_tiers_inflight[cache_key] = task
+        task.add_done_callback(
+            lambda _task: _drop_inflight_tier_fetch(cache_key, _task)
+        )
+    return await asyncio.shield(task)
+
+
 def _build_prompt_with_attachments(prompt: str, attachments: list[AttachmentInput]) -> str:
     if not attachments:
         return prompt
@@ -270,6 +388,7 @@ def _build_openrouter_extra_body(
     reasoning_effort: str,
     reasoning_exclude: bool,
     allow_tools: bool = True,
+    service_tier: str | None = None,
 ) -> dict[str, Any]:
     extra_body: dict[str, Any] = {
         "reasoning": {
@@ -277,6 +396,11 @@ def _build_openrouter_extra_body(
             "exclude": reasoning_exclude,
         },
     }
+
+    # "default" is the standard tier — omitting the parameter routes the same
+    # way, so only named tiers are sent upstream.
+    if service_tier and service_tier != "default":
+        extra_body["service_tier"] = service_tier
 
     # Only attach tool-control parameters when an actual tools array is
     # present. Sending `max_tool_calls`/`parallel_tool_calls` without a
@@ -802,6 +926,7 @@ async def run_single_model(
     attachments: list[AttachmentInput],
     system_prompt: str | None = None,
     agent_id: str = "",
+    service_tier: str | None = None,
 ) -> SourceResult:
     """Run a single source model with retry-on-empty and return a SourceResult.
 
@@ -814,6 +939,7 @@ async def run_single_model(
             web_search_enabled=web_search_enabled,
             reasoning_effort=reasoning_effort,
             reasoning_exclude=reasoning_exclude,
+            service_tier=service_tier,
         )
 
         messages: list[dict[str, Any]] = []
@@ -907,6 +1033,7 @@ async def run_source_models(
     temperature_by_agent: dict[str, float] | None = None,
     system_prompt: str | None = None,
     system_prompt_by_agent: dict[str, str] | None = None,
+    service_tier_by_model: dict[str, str] | None = None,
 ) -> AsyncGenerator[SourceResult, None]:
     semaphore = asyncio.Semaphore(max(1, settings.openchat_max_parallel_sources))
 
@@ -933,6 +1060,7 @@ async def run_source_models(
                 attachments=attachments,
                 system_prompt=resolved_system_prompt,
                 agent_id=agent.id,
+                service_tier=(service_tier_by_model or {}).get(agent.model),
             )
 
     tasks = [asyncio.create_task(runner(agent)) for agent in agents]
@@ -960,6 +1088,7 @@ async def run_markdown_model(
     *,
     context: str = "Synthesis",
     max_retries: int = MARKDOWN_MODEL_RETRY_COUNT,
+    service_tier: str | None = None,
 ) -> str:
     """Run a synthesis-style markdown completion with bounded silent retry.
 
@@ -973,6 +1102,7 @@ async def run_markdown_model(
         web_search_enabled=web_search_enabled,
         reasoning_effort=reasoning_effort,
         reasoning_exclude=reasoning_exclude,
+        service_tier=service_tier,
     )
 
     messages: list[dict[str, Any]] = []
@@ -1005,6 +1135,7 @@ async def run_direct_chat_model(
     reasoning_effort: str,
     reasoning_exclude: bool,
     attachments: list[AttachmentInput],
+    service_tier: str | None = None,
 ) -> str:
     normalized_messages: list[dict[str, Any]] = _build_direct_chat_messages(
         messages=messages,
@@ -1016,6 +1147,7 @@ async def run_direct_chat_model(
         web_search_enabled=web_search_enabled,
         reasoning_effort=reasoning_effort,
         reasoning_exclude=reasoning_exclude,
+        service_tier=service_tier,
     )
 
     return await _with_transient_retry(

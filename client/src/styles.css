@@ -948,6 +948,45 @@ body {
   font-size: 0.79rem;
 }
 
+.service-tier-control {
+  margin-top: 8px;
+  display: inline-flex;
+  align-items: center;
+  flex-wrap: wrap;
+  row-gap: 2px;
+  column-gap: 6px;
+  max-width: 100%;
+}
+
+.service-tier-label {
+  color: var(--muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.service-tier-select {
+  border: 1px solid var(--th-edge-12);
+  border-radius: 8px;
+  background: var(--th-ink-30);
+  color: inherit;
+  padding: 3px 6px;
+  font: inherit;
+  font-size: 0.75rem;
+  min-width: 0;
+  max-width: 100%;
+}
+
+.service-tier-select:disabled {
+  opacity: 0.6;
+}
+
+.service-tier-hint {
+  color: var(--muted);
+  font-size: 0.72rem;
+  white-space: nowrap;
+}
+
 .fusion-star {
   inline-size: 34px;
   block-size: 34px;

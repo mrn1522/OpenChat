@@ -2,6 +2,10 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, Field
 
+# OpenRouter service tiers. "fast" is an upstream alias for "priority" and is
+# normalized to "priority" at the boundary, so only these three are valid here.
+ServiceTier = Literal["default", "flex", "priority"]
+
 
 class ReasoningConfig(BaseModel):
     effort: Literal["max", "xhigh", "high", "medium", "low", "minimal", "none"] = "medium"
@@ -52,6 +56,9 @@ class RunRequest(BaseModel):
     persona_assignments_override: list[PersonaAssignment] = Field(default_factory=list, max_length=48)
     reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
     attachments: list[AttachmentInput] = Field(default_factory=list, max_length=5)
+    # Per-model service tier map keyed by model id (source agents, debate
+    # reviewers, and the fusion model all resolve through this map).
+    service_tiers: dict[str, ServiceTier] = Field(default_factory=dict)
 
 
 class DirectChatMessage(BaseModel):
@@ -68,6 +75,7 @@ class DirectChatRequest(BaseModel):
     web_search_enabled: bool = False
     reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
     attachments: list[AttachmentInput] = Field(default_factory=list, max_length=5)
+    service_tier: ServiceTier | None = None
 
 
 class PromptOptimizeRequest(BaseModel):
@@ -87,6 +95,7 @@ class FusionRegenerateRequest(BaseModel):
     reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
     source_results: list["SourceResult"] = Field(min_length=1)
     critique_output: str = ""
+    service_tier: ServiceTier | None = None
 
 
 class PersonaPreviewRequest(BaseModel):
@@ -149,6 +158,18 @@ class OpenRouterModelsResponse(BaseModel):
     data: list[OpenRouterModel]
 
 
+class ServiceTiersResponse(BaseModel):
+    """Non-default service tiers discovered for one model.
+
+    Populated from the model's provider endpoint list: tier-capable endpoints
+    carry a slug suffix (``openai/flex``, ``openai/fast``,
+    ``google-vertex/global/priority``). ``fast`` is an alias for ``priority``.
+    """
+
+    model: str
+    tiers: list[ServiceTier]
+
+
 class ChatHistorySummary(BaseModel):
     chat_id: str
     created_at: str
@@ -193,6 +214,7 @@ class WorkflowConfig(BaseModel):
     web_search_enabled: bool = False
     persona_enabled: bool = False
     attachments: list[WorkflowAttachmentMeta] = Field(default_factory=list, max_length=5)
+    service_tiers: dict[str, ServiceTier] = Field(default_factory=dict)
 
 
 class WorkflowCreateRequest(BaseModel):

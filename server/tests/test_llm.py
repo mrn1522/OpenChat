@@ -7,7 +7,12 @@ import pytest
 import app.llm as llm
 import app.main as main
 from app.config import settings
-from app.models import OpenRouterModelsResponse, SourceAgentSpec, SourceResult
+from app.models import (
+    DirectChatMessage,
+    OpenRouterModelsResponse,
+    SourceAgentSpec,
+    SourceResult,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -17,6 +22,8 @@ def reset_llm_state(monkeypatch):
     monkeypatch.setattr(llm, "_openai_client", None)
     monkeypatch.setattr(llm, "_openai_client_key", None)
     monkeypatch.setattr(llm, "_models_cache", None)
+    monkeypatch.setattr(llm, "_service_tiers_cache", {})
+    monkeypatch.setattr(llm, "_service_tiers_inflight", {})
     monkeypatch.setattr(llm, "MARKDOWN_MODEL_RETRY_BACKOFF_SECONDS", 0)
     yield
     if llm._shared_http_client is not None:
@@ -426,3 +433,232 @@ class TestGZipUnlessSSE:
         assert dict(start["headers"])[b"content-encoding"] == b"gzip"
         body = b"".join(m["body"] for m in sent if m["type"] == "http.response.body")
         assert gzip.decompress(body) == payload
+
+
+class TestExtractServiceTiers:
+    def test_collects_tier_suffixes(self):
+        payload = {
+            "data": {
+                "endpoints": [
+                    {"tag": "openai/flex"},
+                    {"tag": "openai/fast"},  # "fast" normalizes to "priority"
+                    {"tag": "google-vertex/global/priority"},
+                ]
+            }
+        }
+        assert llm._extract_service_tiers(payload) == ["flex", "priority"]
+
+    def test_ignores_non_tier_suffixes(self):
+        payload = {
+            "data": {
+                "endpoints": [
+                    {"tag": "openai/us-east5"},
+                    {"tag": "openai/fp8"},
+                    {"tag": "openai"},
+                    {"tag": 42},
+                    {"other": "x"},
+                    "not-a-dict",
+                ]
+            }
+        }
+        assert llm._extract_service_tiers(payload) == []
+
+    @pytest.mark.parametrize(
+        "payload",
+        [{}, {"data": {}}, {"data": {"endpoints": "x"}}, [], "x", None],
+    )
+    def test_malformed_payload_returns_empty(self, payload):
+        assert llm._extract_service_tiers(payload) == []
+
+
+class TestFetchModelServiceTiers:
+    def _client(
+        self, calls: list[httpx.Request], *, status: int = 200, payload: dict | None = None
+    ) -> httpx.AsyncClient:
+        if payload is None:
+            payload = {"data": {"endpoints": [{"tag": "openai/flex"}]}}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            if status != 200:
+                return httpx.Response(status)
+            return httpx.Response(200, json=payload)
+
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    def test_fetches_endpoints_url_and_caches(self, monkeypatch):
+        monkeypatch.setattr(settings, "openai_base_url", "https://openrouter.test/v1")
+        calls: list[httpx.Request] = []
+        monkeypatch.setattr(llm, "_shared_http", lambda: self._client(calls))
+
+        async def run():
+            first = await llm.fetch_model_service_tiers("openai/a")
+            second = await llm.fetch_model_service_tiers("openai/a")
+            return first, second
+
+        first, second = asyncio.run(run())
+        assert first == ["flex"]
+        assert second == ["flex"]
+        assert len(calls) == 1
+        assert str(calls[0].url) == "https://openrouter.test/v1/models/openai/a/endpoints"
+
+    def test_refresh_failure_serves_stale_cache(self, monkeypatch):
+        base_url = "https://openrouter.test/v1"
+        monkeypatch.setattr(settings, "openai_base_url", base_url)
+        monkeypatch.setattr(
+            llm,
+            "_service_tiers_cache",
+            {
+                (base_url, "openai/a"): (
+                    llm.time.monotonic() - llm._SERVICE_TIERS_CACHE_TTL_SECONDS - 1,
+                    ["flex"],
+                )
+            },
+        )
+
+        calls: list[httpx.Request] = []
+        monkeypatch.setattr(llm, "_shared_http", lambda: self._client(calls, status=500))
+
+        assert asyncio.run(llm.fetch_model_service_tiers("openai/a")) == ["flex"]
+        assert len(calls) == 1
+
+    def test_malformed_response_serves_stale_cache(self, monkeypatch):
+        """A 200 without a usable endpoint list is malformed, not 'no tiers'."""
+        base_url = "https://openrouter.test/v1"
+        monkeypatch.setattr(settings, "openai_base_url", base_url)
+        monkeypatch.setattr(
+            llm,
+            "_service_tiers_cache",
+            {
+                (base_url, "openai/a"): (
+                    llm.time.monotonic() - llm._SERVICE_TIERS_CACHE_TTL_SECONDS - 1,
+                    ["flex"],
+                )
+            },
+        )
+
+        calls: list[httpx.Request] = []
+        monkeypatch.setattr(
+            llm, "_shared_http", lambda: self._client(calls, payload={"data": {}})
+        )
+
+        assert asyncio.run(llm.fetch_model_service_tiers("openai/a")) == ["flex"]
+        assert len(calls) == 1
+
+    def test_empty_endpoints_list_caches_as_no_tiers(self, monkeypatch):
+        """An explicit empty roster is a valid 'no tiers' result, not malformed."""
+        calls: list[httpx.Request] = []
+        monkeypatch.setattr(
+            llm,
+            "_shared_http",
+            lambda: self._client(calls, payload={"data": {"endpoints": []}}),
+        )
+
+        assert asyncio.run(llm.fetch_model_service_tiers("openai/a")) == []
+        assert len(calls) == 1
+
+    def test_error_without_cache_propagates(self, monkeypatch):
+        calls: list[httpx.Request] = []
+        monkeypatch.setattr(llm, "_shared_http", lambda: self._client(calls, status=500))
+
+        with pytest.raises(httpx.HTTPStatusError):
+            asyncio.run(llm.fetch_model_service_tiers("openai/a"))
+
+
+class TestServiceTierPlumbing:
+    def test_extra_body_includes_named_tiers_only(self):
+        base = dict(
+            web_search_enabled=False, reasoning_effort="medium", reasoning_exclude=False
+        )
+        assert llm._build_openrouter_extra_body(**base, service_tier="flex")[
+            "service_tier"
+        ] == "flex"
+        assert llm._build_openrouter_extra_body(**base, service_tier="priority")[
+            "service_tier"
+        ] == "priority"
+        for tier in (None, "default"):
+            body = llm._build_openrouter_extra_body(**base, service_tier=tier)
+            assert "service_tier" not in body
+
+    def test_run_source_models_passes_per_model_tier(self, monkeypatch):
+        captured: dict[str, str | None] = {}
+
+        async def fake_run_single_model(
+            *, client, model, service_tier=None, **kwargs
+        ) -> SourceResult:
+            captured[model] = service_tier
+            return SourceResult(model=model, agent_id=model, content="x", status="ok")
+
+        monkeypatch.setattr(llm, "run_single_model", fake_run_single_model)
+
+        async def run() -> None:
+            agents = [
+                SourceAgentSpec(id="a1", model="openai/a"),
+                SourceAgentSpec(id="a2", model="openai/b"),
+            ]
+            stream = llm.run_source_models(
+                client=None,
+                agents=agents,
+                prompt="p",
+                temperature=0.2,
+                web_search_enabled=False,
+                reasoning_effort="medium",
+                reasoning_exclude=False,
+                attachments=[],
+                service_tier_by_model={"openai/a": "flex"},
+            )
+            async for _ in stream:
+                pass
+
+        asyncio.run(run())
+        assert captured == {"openai/a": "flex", "openai/b": None}
+
+    def test_run_markdown_model_forwards_tier_to_completion(self, monkeypatch):
+        captured = {}
+
+        async def fake_completion(**kwargs) -> str:
+            captured.update(kwargs)
+            return "ok"
+
+        monkeypatch.setattr(llm, "_run_chat_completion_with_tool_loop", fake_completion)
+
+        asyncio.run(
+            llm.run_markdown_model(
+                client=None,
+                model="openai/a",
+                prompt="p",
+                system_prompt="s",
+                temperature=0.2,
+                web_search_enabled=False,
+                reasoning_effort="medium",
+                reasoning_exclude=False,
+                context="t",
+                service_tier="priority",
+            )
+        )
+        assert captured["extra_body"]["service_tier"] == "priority"
+
+    def test_run_direct_chat_model_forwards_tier_to_completion(self, monkeypatch):
+        captured = {}
+
+        async def fake_completion(**kwargs) -> str:
+            captured.update(kwargs)
+            return "ok"
+
+        monkeypatch.setattr(llm, "_run_chat_completion_with_tool_loop", fake_completion)
+
+        asyncio.run(
+            llm.run_direct_chat_model(
+                client=None,
+                model="openai/a",
+                messages=[DirectChatMessage(role="user", content="hi")],
+                system_prompt="s",
+                temperature=0.2,
+                web_search_enabled=False,
+                reasoning_effort="medium",
+                reasoning_exclude=False,
+                attachments=[],
+                service_tier="flex",
+            )
+        )
+        assert captured["extra_body"]["service_tier"] == "flex"
