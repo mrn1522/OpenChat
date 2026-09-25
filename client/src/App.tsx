@@ -766,6 +766,10 @@ function App() {
   const [directAttachments, setDirectAttachments] = useState<ComposerAttachment[]>([]);
   const [isDirectSettingsOpen, setIsDirectSettingsOpen] = useState(false);
   const [enlargedImage, setEnlargedImage] = useState<{ src: string; alt: string } | null>(null);
+  const enlargeImage = useCallback((src: string, alt: string) => {
+    setEnlargedImage({ src, alt });
+  }, []);
+  const closeImageLightbox = useCallback(() => setEnlargedImage(null), []);
 
   const pickerRef = useRef<HTMLDivElement | null>(null);
   const pickerSearchRef = useRef<HTMLInputElement | null>(null);
@@ -2730,11 +2734,7 @@ function App() {
       )}
 
       {enlargedImage && (
-        <ImageLightbox
-          src={enlargedImage.src}
-          alt={enlargedImage.alt}
-          onClose={() => setEnlargedImage(null)}
-        />
+        <ImageLightbox src={enlargedImage.src} alt={enlargedImage.alt} onClose={closeImageLightbox} />
       )}
 
       <aside className="sidebar-rail">
@@ -3508,7 +3508,7 @@ function App() {
               <DirectChatTranscript
                 messages={directMessages}
                 isRunning={isDirectRunning}
-                onImageClick={(src, alt) => setEnlargedImage({ src, alt })}
+                onImageClick={enlargeImage}
               />
             </div>
 
@@ -3543,7 +3543,7 @@ function App() {
                           aria-label={`Enlarge image ${attachment.name}`}
                           onClick={() =>
                             attachment.thumb_url &&
-                            setEnlargedImage({ src: attachment.thumb_url, alt: attachment.name })
+                            enlargeImage(attachment.thumb_url, attachment.name)
                           }
                         >
                           <img src={attachment.thumb_url} alt={`Attached image ${attachment.name}`} />
