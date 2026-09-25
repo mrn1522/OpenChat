@@ -6,7 +6,9 @@ description: Exercise first-run connection settings and isolated persistence thr
 # OpenChat settings testing
 
 ## Devin Secrets Needed
-None for configuration persistence tests: use a clearly fake API key. Real model generation requires an authorized OPENAI_API_KEY.
+- `OPENROUTER_TEST_API_KEY` (org scope) — real OpenRouter key for tests needing actual completions. Bind it in exec via `env={"OPENROUTER_TEST_API_KEY": "secret:org:OPENROUTER_TEST_API_KEY"}`, then pass to the backend as `OPENAI_API_KEY` (or paste it into the app's Connect OpenRouter settings).
+- Always use `openai/gpt-oss-20b` for real completions (cheap, fast, ~12 endpoints; it has NO flex/priority tier tags, so the tier dropdown correctly stays hidden for it). Tier-capable fixtures for tier tests: `google/gemini-2.5-flash` (flex+priority), `openai/gpt-5-mini` (flex only).
+- None needed for configuration persistence tests: use a clearly fake API key.
 
 ## Local runtime
 - Reuse server/.venv-desktop and client/node_modules if available; otherwise create a Python venv from server/requirements.txt and run npm ci in client/. The venv may exist but be empty — if `python -m app` fails with ModuleNotFoundError, run `.venv-desktop/bin/pip install -r requirements-desktop.txt`.
