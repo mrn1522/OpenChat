@@ -137,7 +137,9 @@ _SERVICE_TIERS_CACHE_TTL_SECONDS = 300.0
 # (base_url, model_id) -> (fetched_at, tiers). Endpoint rosters change rarely;
 # on a refresh failure the entry is served stale instead of erroring.
 _service_tiers_cache: dict[tuple[str, str], tuple[float, list[str]]] = {}
-_service_tiers_lock = asyncio.Lock()
+# One lock per cache key: concurrent lookups for different models fetch in
+# parallel while duplicate fetches for the same model still coalesce.
+_service_tiers_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
 # Tier suffixes on provider endpoint tags (`openai/flex`,
 # `google-vertex/global/priority`). "fast" is OpenAI's rename of the priority
@@ -310,7 +312,7 @@ async def fetch_model_service_tiers(model_id: str) -> list[str]:
     if cached is not None and now - cached[0] < _SERVICE_TIERS_CACHE_TTL_SECONDS:
         return list(cached[1])
 
-    async with _service_tiers_lock:
+    async with _service_tiers_locks.setdefault(cache_key, asyncio.Lock()):
         now = time.monotonic()
         cached = _service_tiers_cache.get(cache_key)
         if cached is not None and now - cached[0] < _SERVICE_TIERS_CACHE_TTL_SECONDS:

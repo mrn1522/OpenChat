@@ -1018,6 +1018,11 @@ async def get_service_tiers(model_id: str) -> ServiceTiersResponse:
         raise HTTPException(
             status_code=502, detail=f"OpenRouter endpoints request failed: {exc}"
         ) from exc
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=502,
+            detail=f"OpenRouter endpoints response was malformed: {exc}",
+        ) from exc
     return ServiceTiersResponse(model=model_id, tiers=tiers)
 
 

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent } from "react";
 import type { ComponentType } from "react";
 import type { CSSProperties } from "react";
@@ -1174,14 +1174,31 @@ function App() {
     }
   }, [modelsNeedingTierLookup, serviceTiersByModel, tierRetryTick]);
 
+  // A hydrated/saved tier only survives when discovery hasn't ruled it out:
+  // pending or failed lookups (undefined) keep the tier, a completed roster
+  // that excludes it drops it.
+  const effectiveTier = useCallback(
+    (modelId: string): ServiceTier | undefined => {
+      const tier = serviceTierByModel[modelId];
+      if (!tier || tier === "default") return undefined;
+      const discoveredTiers = serviceTiersByModel[modelId];
+      if (discoveredTiers !== undefined && !discoveredTiers.includes(tier)) {
+        return undefined;
+      }
+      return tier;
+    },
+    [serviceTierByModel, serviceTiersByModel]
+  );
+
   const activeServiceTierSelection = useMemo(() => {
     const relevant = new Set<string>(sourceModels);
     if (fusionModel) relevant.add(fusionModel);
-    const entries = Object.entries(serviceTierByModel).filter(
-      ([model, tier]) => relevant.has(model) && tier !== "default"
-    );
-    return Object.fromEntries(entries) as Record<string, ServiceTier>;
-  }, [serviceTierByModel, sourceModels, fusionModel]);
+    const entries = Object.keys(serviceTierByModel)
+      .filter((model) => relevant.has(model))
+      .map((model) => [model, effectiveTier(model)] as const)
+      .filter((entry): entry is readonly [string, ServiceTier] => entry[1] !== undefined);
+    return Object.fromEntries(entries);
+  }, [effectiveTier, serviceTierByModel, sourceModels, fusionModel]);
 
   const renderServiceTierSelect = (modelId: string, disabled: boolean) => {
     const tiers = serviceTiersByModel[modelId];
@@ -1192,7 +1209,7 @@ function App() {
         <select
           className="service-tier-select"
           aria-label={`Service tier for ${modelId}`}
-          value={serviceTierByModel[modelId] ?? "default"}
+          value={effectiveTier(modelId) ?? "default"}
           disabled={disabled}
           onChange={(event) =>
             setServiceTierByModel((prev) => ({
@@ -2004,7 +2021,7 @@ function App() {
             exclude: false,
           },
           attachments: directAttachments.map(({ id: _id, ...attachment }) => attachment),
-          service_tier: serviceTierByModel[directModel] ?? undefined,
+          service_tier: effectiveTier(directModel),
         },
         (event) => onDirectEvent(event, requestId),
         controller.signal
@@ -2187,7 +2204,7 @@ function App() {
         },
         source_results: sourceResults,
         critique_output: critiqueOutput,
-        service_tier: serviceTierByModel[fusionModel] ?? undefined,
+        service_tier: effectiveTier(fusionModel),
       });
 
       setFusionOutput(result.content);
