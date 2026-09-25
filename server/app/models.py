@@ -54,6 +54,14 @@ class AttachmentInput(BaseModel):
         if self.is_image:
             if self.content_type not in SUPPORTED_IMAGE_TYPES:
                 raise ValueError(f"unsupported image type: {self.content_type}")
+            if self.size > MAX_IMAGE_ATTACHMENT_BYTES:
+                raise ValueError(
+                    f"image attachment exceeds {MAX_IMAGE_ATTACHMENT_BYTES} bytes"
+                )
+            # Check the encoded length before decoding so oversized payloads
+            # are rejected without allocating for them.
+            if len(self.content) > MAX_IMAGE_BASE64_CHARS:
+                raise ValueError("image attachment exceeds maximum base64 length")
             try:
                 decoded = base64.b64decode(self.content, validate=True)
             except (binascii.Error, ValueError) as exc:
@@ -62,12 +70,6 @@ class AttachmentInput(BaseModel):
                 raise ValueError(
                     f"image attachment exceeds {MAX_IMAGE_ATTACHMENT_BYTES} bytes"
                 )
-            if self.size > MAX_IMAGE_ATTACHMENT_BYTES:
-                raise ValueError(
-                    f"image attachment exceeds {MAX_IMAGE_ATTACHMENT_BYTES} bytes"
-                )
-            if len(self.content) > MAX_IMAGE_BASE64_CHARS:
-                raise ValueError("image attachment exceeds maximum base64 length")
         else:
             if self.size > MAX_TEXT_ATTACHMENT_BYTES:
                 raise ValueError(

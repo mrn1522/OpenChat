@@ -236,6 +236,25 @@ class TestDirectTranscripts:
         _save_chat(db_path, "chat-1")
         assert get_chat_record(db_path, "chat-1")["messages"] == []
 
+    def test_image_metadata_roundtrips(self, db_path):
+        _save_direct_turn(
+            db_path,
+            "conv-1",
+            [
+                {
+                    "role": "user",
+                    "content": "describe this",
+                    "images": [{"name": "chart.png", "content_type": "image/png"}],
+                },
+                {"role": "assistant", "content": "a1", "model": "openai/d"},
+            ],
+        )
+        record = get_chat_record(db_path, "conv-1")
+        assert record["messages"][0]["images"] == [
+            {"name": "chart.png", "content_type": "image/png"}
+        ]
+        assert "images" not in record["messages"][1]
+
     def test_title_is_first_user_message(self, db_path):
         _save_direct_turn(
             db_path,
@@ -338,6 +357,76 @@ class TestLegacyMigration:
         record = get_chat_record(path, "legacy-1")
         assert record is not None
         assert record["fusion_output"] == "fused answer"
+
+    def test_v2_db_gains_images_json_column(self, tmp_path):
+        """v2 databases lack images_json; init must ALTER the table, not recreate it."""
+        path = str(tmp_path / "v2.db")
+        with sqlite3.connect(path) as connection:
+            connection.execute("PRAGMA user_version=2")
+            connection.executescript(
+                """
+                CREATE TABLE conversations (
+                    conversation_id TEXT PRIMARY KEY,
+                    kind TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    elapsed_ms INTEGER,
+                    run_id TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    request_json TEXT NOT NULL,
+                    critique_output TEXT NOT NULL,
+                    fusion_output TEXT NOT NULL
+                );
+                CREATE TABLE conversation_messages (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    conversation_id TEXT NOT NULL,
+                    seq INTEGER NOT NULL,
+                    role TEXT NOT NULL,
+                    model TEXT NOT NULL DEFAULT '',
+                    content TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(conversation_id, seq)
+                );
+                """
+            )
+            connection.execute(
+                "INSERT INTO conversations VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "conv-1",
+                    "direct",
+                    "2026-01-01T00:00:00+00:00",
+                    "2026-01-01T00:00:00+00:00",
+                    "direct_completed",
+                    10,
+                    "run-1",
+                    "title",
+                    json.dumps({"prompt": "hi"}),
+                    "",
+                    "a1",
+                ),
+            )
+            connection.execute(
+                "INSERT INTO conversation_messages "
+                "(conversation_id, seq, role, model, content, created_at) "
+                "VALUES ('conv-1', 0, 'user', '', 'hi', '2026-01-01T00:00:00+00:00')"
+            )
+            connection.commit()
+
+        init_chat_store(path)
+
+        with sqlite3.connect(path) as connection:
+            columns = {
+                row[1]
+                for row in connection.execute(
+                    "PRAGMA table_info(conversation_messages)"
+                ).fetchall()
+            }
+        assert "images_json" in columns
+
+        record = get_chat_record(path, "conv-1")
+        assert record is not None
+        assert record["messages"][0]["content"] == "hi"
 
 
 class TestRetention:

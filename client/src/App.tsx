@@ -117,7 +117,12 @@ type ExperienceModeTab = {
   workflowId: string | null;
 };
 
-type ComposerAttachment = AttachmentInput & { id: string };
+type ComposerAttachment = AttachmentInput & {
+  id: string;
+  // Object URL for thumbnails — built from the source File so no extra
+  // base64 copy is retained per turn. Client-only; stripped before transport.
+  thumb_url?: string;
+};
 
 type DisplayModel = {
   id: string;
@@ -476,9 +481,6 @@ const isImageFile = (file: File): boolean => file.type.startsWith(IMAGE_CONTENT_
 const isImageAttachment = (attachment: Pick<AttachmentInput, "content_type">): boolean =>
   attachment.content_type.startsWith(IMAGE_CONTENT_TYPE_PREFIX);
 
-const attachmentImageDataUrl = (attachment: Pick<AttachmentInput, "content_type" | "content">): string =>
-  `data:${attachment.content_type};base64,${attachment.content}`;
-
 const readAttachmentFile = async (file: File): Promise<ComposerAttachment | null> => {
   const extension = file.name.includes(".") ? file.name.split(".").pop()?.toLowerCase() ?? "" : "";
   const looksLikeText = file.type.startsWith("text/") || SUPPORTED_ATTACHMENT_TYPES.has(extension);
@@ -499,7 +501,7 @@ const readAttachmentFile = async (file: File): Promise<ComposerAttachment | null
 
 const readImageAttachmentFile = (file: File): Promise<ComposerAttachment | null> =>
   new Promise((resolve) => {
-    if (!SUPPORTED_IMAGE_TYPES.has(file.type)) {
+    if (!SUPPORTED_IMAGE_TYPES.has(file.type) || file.size === 0) {
       resolve(null);
       return;
     }
@@ -520,6 +522,7 @@ const readImageAttachmentFile = (file: File): Promise<ComposerAttachment | null>
         size: file.size,
         content_type: contentType,
         content: base64,
+        thumb_url: URL.createObjectURL(file),
       });
     };
     reader.readAsDataURL(file);
@@ -750,6 +753,10 @@ function App() {
   // Bumped whenever the direct session resets/hydrates so file reads started
   // against the old session cannot commit attachments into the new one.
   const directAttachmentGenerationRef = useRef(0);
+  // Mirror of directAttachments for reads that must not go through stale
+  // closures (sendDirectMessage awaits in-flight reads, then snapshots this).
+  const directAttachmentsRef = useRef<ComposerAttachment[]>([]);
+  const directAttachmentReadsRef = useRef<Promise<void>[]>([]);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -1523,6 +1530,7 @@ function App() {
     setDirectMessages([]);
     setDirectConversationId(null);
     setDirectAttachments([]);
+    directAttachmentsRef.current = [];
     directAttachmentGenerationRef.current += 1;
     setIsDirectSettingsOpen(false);
   };
@@ -1640,6 +1648,7 @@ function App() {
     });
     setDirectPrompt("");
     setDirectAttachments([]);
+    directAttachmentsRef.current = [];
     directAttachmentGenerationRef.current += 1;
     setIsDirectSettingsOpen(false);
     setDirectError(null);
@@ -2025,7 +2034,9 @@ function App() {
       const merged = [...prev, ...accepted].filter(
         (item, index, array) => array.findIndex((entry) => entry.id === item.id) === index
       );
-      return merged.slice(0, MAX_ATTACHMENTS);
+      const next = merged.slice(0, MAX_ATTACHMENTS);
+      directAttachmentsRef.current = next;
+      return next;
     });
 
     if (rejectedCount > 0) {
@@ -2035,10 +2046,22 @@ function App() {
     }
   };
 
+  // Tracks each addDirectFiles call so sendDirectMessage can wait for the
+  // image read to finish instead of sending a turn without its attachment.
+  const queueDirectFiles = (files: File[]) => {
+    const task = addDirectFiles(files).catch(() => undefined);
+    directAttachmentReadsRef.current.push(task);
+    void task.finally(() => {
+      directAttachmentReadsRef.current = directAttachmentReadsRef.current.filter(
+        (entry) => entry !== task
+      );
+    });
+  };
+
   const onDirectAttachmentChange = async (event: ChangeEvent<HTMLInputElement>) => {
     const selected = Array.from(event.target.files ?? []);
     event.target.value = "";
-    await addDirectFiles(selected);
+    queueDirectFiles(selected);
   };
 
   const onDirectComposerPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
@@ -2067,11 +2090,15 @@ function App() {
       setDirectError("Unsupported image type — use PNG, JPEG, GIF, or WebP.");
       return;
     }
-    void addDirectFiles(imageFiles);
+    queueDirectFiles(imageFiles);
   };
 
   const removeDirectAttachment = (attachmentId: string) => {
-    setDirectAttachments((prev) => prev.filter((item) => item.id !== attachmentId));
+    setDirectAttachments((prev) => {
+      const next = prev.filter((item) => item.id !== attachmentId);
+      directAttachmentsRef.current = next;
+      return next;
+    });
   };
 
   const toggleFromPicker = (id: string) => {
@@ -2095,8 +2122,14 @@ function App() {
 
   const sendDirectMessage = async () => {
     const trimmedPrompt = directPrompt.trim();
+    // A pasted image can still be reading when Send fires — wait for it so
+    // the outgoing turn includes it instead of it landing in the next turn.
+    if (directAttachmentReadsRef.current.length > 0) {
+      await Promise.allSettled([...directAttachmentReadsRef.current]);
+    }
+    const attachments = directAttachmentsRef.current;
     const promptText =
-      trimmedPrompt || (directAttachments.some(isImageAttachment) ? "What's in this image?" : "");
+      trimmedPrompt || (attachments.some(isImageAttachment) ? "What's in this image?" : "");
     if (!promptText || !directModel || isDirectRunning) return;
 
     const requestId = directRequestIdRef.current + 1;
@@ -2107,7 +2140,7 @@ function App() {
 
     const conversationId = directConversationId ?? crypto.randomUUID();
     setDirectConversationId(conversationId);
-    const imageAttachments = directAttachments.filter(isImageAttachment);
+    const imageAttachments = attachments.filter(isImageAttachment);
     const nextMessages: DirectChatMessage[] = [
       ...directMessages,
       {
@@ -2118,7 +2151,7 @@ function App() {
               images: imageAttachments.map((attachment) => ({
                 name: attachment.name,
                 content_type: attachment.content_type,
-                data_url: attachmentImageDataUrl(attachment),
+                data_url: attachment.thumb_url,
               })),
             }
           : {}),
@@ -2154,7 +2187,9 @@ function App() {
             effort: directReasoningEffort,
             exclude: false,
           },
-          attachments: directAttachments.map(({ id: _id, ...attachment }) => attachment),
+          attachments: attachments.map(
+            ({ id: _id, thumb_url: _thumb, ...attachment }) => attachment
+          ),
           service_tier: effectiveTier(directModel),
         },
         (event) => onDirectEvent(event, requestId),
@@ -3315,10 +3350,10 @@ function App() {
                 <div className="attachment-chip-row" role="list" aria-label="Attached files">
                   {directAttachments.map((attachment) => (
                     <div key={attachment.id} className="attachment-chip" role="listitem">
-                      {isImageAttachment(attachment) && (
+                      {isImageAttachment(attachment) && attachment.thumb_url && (
                         <img
                           className="attachment-thumb"
-                          src={attachmentImageDataUrl(attachment)}
+                          src={attachment.thumb_url}
                           alt={`Attached image ${attachment.name}`}
                         />
                       )}

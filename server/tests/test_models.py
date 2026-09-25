@@ -130,6 +130,16 @@ class TestAttachmentInput:
                 name="big.png",
                 size=MAX_IMAGE_ATTACHMENT_BYTES,
                 content_type="image/png",
+                content="a" * (MAX_IMAGE_BASE64_CHARS + 1),
+            )
+
+    def test_image_attachment_rejects_oversize_decoded_bytes(self):
+        # At the encoded limit the payload still decodes to >5MiB.
+        with pytest.raises(ValidationError):
+            AttachmentInput(
+                name="big.png",
+                size=10,
+                content_type="image/png",
                 content="a" * MAX_IMAGE_BASE64_CHARS,
             )
 
