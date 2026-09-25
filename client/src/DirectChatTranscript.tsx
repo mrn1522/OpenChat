@@ -133,15 +133,22 @@ function DirectChatTranscript({ messages, isRunning }: DirectChatTranscriptProps
     const cancelProgrammaticScroll = () => {
       programmaticScrollRef.current = false;
     };
+    const cancelProgrammaticScrollOnKeydown = (event: KeyboardEvent) => {
+      if (["ArrowDown", "ArrowUp", "PageDown", "PageUp", "Home", "End", " "].includes(event.key)) {
+        cancelProgrammaticScroll();
+      }
+    };
 
     updateStickToBottom();
     element.addEventListener("scroll", updateStickToBottom, { passive: true });
     element.addEventListener("wheel", cancelProgrammaticScroll, { passive: true });
     element.addEventListener("pointerdown", cancelProgrammaticScroll);
+    element.addEventListener("keydown", cancelProgrammaticScrollOnKeydown);
     return () => {
       element.removeEventListener("scroll", updateStickToBottom);
       element.removeEventListener("wheel", cancelProgrammaticScroll);
       element.removeEventListener("pointerdown", cancelProgrammaticScroll);
+      element.removeEventListener("keydown", cancelProgrammaticScrollOnKeydown);
     };
   }, [updateStickToBottom]);
 
