@@ -528,6 +528,23 @@ const readImageAttachmentFile = (file: File): Promise<ComposerAttachment | null>
     reader.readAsDataURL(file);
   });
 
+// Re-encodes a blob: object URL back to base64 so earlier turns can re-send
+// their pixels on follow-ups without retaining a second base64 copy in state.
+const blobUrlToBase64 = async (url: string): Promise<string | null> => {
+  try {
+    const blob = await fetch(url).then((response) => response.blob());
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let index = 0; index < bytes.length; index += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+    }
+    return btoa(binary);
+  } catch {
+    return null;
+  }
+};
+
 const SettingsUpdateSection = ({ appVersion }: { appVersion: string | null }) => {
   const [updateState, setUpdateState] = useState<UpdateState>({ kind: "idle" });
   const checkAbortRef = useRef<AbortController | null>(null);
@@ -760,9 +777,13 @@ function App() {
   // Every object URL minted for composer/transcript thumbnails, revoked when
   // nothing references it (see releaseDirectThumbs) or the session resets.
   const directThumbUrlsRef = useRef<Set<string>>(new Set());
-  // Set synchronously while a send is in flight so a second click can't start
-  // a concurrent send while the first still awaits attachment reads.
-  const directSendInFlightRef = useRef(false);
+  // Holds the session generation of the in-flight send (null = idle). Scoped
+  // to the generation so a reset unblocks Send in the new session and a stale
+  // send's finally cannot clear a newer send's guard.
+  const directSendGenerationRef = useRef<number | null>(null);
+  // Set on unmount so late image reads revoke their object URLs instead of
+  // committing state to a dead component.
+  const directUnmountedRef = useRef(false);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -2009,7 +2030,7 @@ function App() {
   const addDirectFiles = async (files: File[]) => {
     if (files.length === 0) return;
 
-    const slotsRemaining = MAX_ATTACHMENTS - directAttachments.length;
+    const slotsRemaining = MAX_ATTACHMENTS - directAttachmentsRef.current.length;
     if (slotsRemaining <= 0) {
       setDirectError(`Attachment limit reached (${MAX_ATTACHMENTS}). Remove one to add another.`);
       return;
@@ -2029,8 +2050,9 @@ function App() {
     const parsed = await Promise.all(
       nextFiles.map((file) => (isImageFile(file) ? readImageAttachmentFile(file) : readAttachmentFile(file)))
     );
-    if (generation !== directAttachmentGenerationRef.current) {
-      // Session moved on while reading — release thumbnails we won't show.
+    if (generation !== directAttachmentGenerationRef.current || directUnmountedRef.current) {
+      // Session moved on or the app unmounted while reading — release
+      // thumbnails we won't show instead of committing stale state.
       releaseDirectThumbs(
         parsed.flatMap((item) => (item?.thumb_url ? [item.thumb_url] : []))
       );
@@ -2046,10 +2068,14 @@ function App() {
 
     // Commit to the ref synchronously — a send awaiting this read must see
     // the new attachments — then mirror to React state for rendering.
-    const merged = [...directAttachmentsRef.current, ...accepted].filter(
+    // Capacity is recomputed here: another batch may have committed while
+    // this read was in flight, so overflow is dropped with an explicit count.
+    const capacityLeft = Math.max(0, MAX_ATTACHMENTS - directAttachmentsRef.current.length);
+    const merged = [...directAttachmentsRef.current, ...accepted.slice(0, capacityLeft)].filter(
       (item, index, array) => array.findIndex((entry) => entry.id === item.id) === index
     );
     const next = merged.slice(0, MAX_ATTACHMENTS);
+    const droppedCount = accepted.length - next.filter((item) => accepted.includes(item)).length;
     directAttachmentsRef.current = next;
     for (const item of next) {
       if (item.thumb_url) directThumbUrlsRef.current.add(item.thumb_url);
@@ -2061,7 +2087,9 @@ function App() {
         .flatMap((item) => (item.thumb_url ? [item.thumb_url] : []))
     );
 
-    if (rejectedCount > 0) {
+    if (droppedCount > 0) {
+      setDirectError(`${droppedCount} file(s) were skipped — attachment limit (${MAX_ATTACHMENTS}) reached.`);
+    } else if (rejectedCount > 0) {
       setDirectError(`${rejectedCount} file(s) were skipped because they are unsupported or empty.`);
     } else {
       setDirectError(null);
@@ -2078,6 +2106,7 @@ function App() {
   // Release any remaining object URLs when the app unmounts.
   useEffect(
     () => () => {
+      directUnmountedRef.current = true;
       for (const url of directThumbUrlsRef.current) {
         URL.revokeObjectURL(url);
       }
@@ -2168,11 +2197,11 @@ function App() {
   };
 
   const sendDirectMessage = async () => {
-    if (directSendInFlightRef.current) return;
-    directSendInFlightRef.current = true;
+    const sendGeneration = directAttachmentGenerationRef.current;
+    if (directSendGenerationRef.current === sendGeneration) return;
+    directSendGenerationRef.current = sendGeneration;
     try {
       const trimmedPrompt = directPrompt.trim();
-      const sendGeneration = directAttachmentGenerationRef.current;
       // A pasted image can still be reading when Send fires — wait for it so
       // the outgoing turn includes it instead of it landing in the next turn.
       if (directAttachmentReadsRef.current.length > 0) {
@@ -2221,17 +2250,23 @@ function App() {
         await streamDirectChat(
           {
             model: directModel,
-            messages: nextMessages.map((message) =>
-              message.images?.length
-                ? {
-                    role: message.role,
-                    content: message.content,
-                    // data_url is display-only — the wire format carries
-                    // name + type metadata; the image itself travels via
-                    // the attachments payload.
-                    images: message.images.map(({ name, content_type }) => ({ name, content_type })),
-                  }
-                : message
+            messages: await Promise.all(
+              nextMessages.map(async (message, index) => {
+                if (!message.images?.length) return message;
+                // The latest user turn's pixels travel via `attachments`; for
+                // earlier image turns we re-encode the blob thumbnail so the
+                // model still sees them on follow-ups. data_url is stripped
+                // regardless — it is display-only.
+                const isLatestMessage = index === nextMessages.length - 1;
+                const images = await Promise.all(
+                  message.images.map(async ({ name, content_type, data_url }) => {
+                    const content =
+                      !isLatestMessage && data_url ? await blobUrlToBase64(data_url) : null;
+                    return content ? { name, content_type, content } : { name, content_type };
+                  })
+                );
+                return { role: message.role, content: message.content, images };
+              })
             ),
             conversation_id: conversationId,
             temperature: directTemperature,
@@ -2257,7 +2292,9 @@ function App() {
         directStreamControllerRef.current = null;
       }
     } finally {
-      directSendInFlightRef.current = false;
+      if (directSendGenerationRef.current === sendGeneration) {
+        directSendGenerationRef.current = null;
+      }
     }
   };
 

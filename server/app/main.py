@@ -945,7 +945,14 @@ async def direct_chat_stream(request: DirectChatRequest):
                 "role": message.role,
                 "content": message.content,
                 **(
-                    {"images": [image.model_dump() for image in message.images]}
+                    {
+                        # Persist provenance only — the base64 payload stays
+                        # out of SQLite.
+                        "images": [
+                            image.model_dump(exclude={"content"})
+                            for image in message.images
+                        ]
+                    }
                     if message.images
                     else {}
                 ),

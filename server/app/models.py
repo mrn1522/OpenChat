@@ -114,13 +114,31 @@ class RunRequest(BaseModel):
 class DirectChatImageMeta(BaseModel):
     """Provenance for an image attached to a direct-chat turn.
 
-    The pixels travel in ``DirectChatRequest.attachments`` as base64; this
-    metadata rides along in ``messages`` so transcripts and history can
-    identify image turns without storing payloads.
+    The current turn's pixels travel in ``DirectChatRequest.attachments``;
+    prior turns re-embed their pixels here as base64 ``content`` so follow-up
+    requests still carry earlier images. History persists only name and
+    content_type — never the payload.
     """
 
     name: str = Field(min_length=1, max_length=256)
     content_type: str = Field(default="image/png", max_length=128)
+    content: str | None = Field(default=None, max_length=MAX_IMAGE_BASE64_CHARS)
+
+    @model_validator(mode="after")
+    def _validate_content(self) -> "DirectChatImageMeta":
+        if self.content is None:
+            return self
+        if self.content_type not in SUPPORTED_IMAGE_TYPES:
+            raise ValueError(f"unsupported image type: {self.content_type}")
+        try:
+            decoded = base64.b64decode(self.content, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("image content is not valid base64") from exc
+        if len(decoded) > MAX_IMAGE_ATTACHMENT_BYTES:
+            raise ValueError(
+                f"image content exceeds {MAX_IMAGE_ATTACHMENT_BYTES} bytes"
+            )
+        return self
 
 
 class DirectChatMessage(BaseModel):

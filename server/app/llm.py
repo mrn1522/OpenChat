@@ -1174,9 +1174,44 @@ def _build_direct_chat_messages(
     resolved_system_prompt = (system_prompt or "").strip() or build_source_system_prompt(None)
 
     normalized_messages: list[dict[str, Any]] = [{"role": "system", "content": resolved_system_prompt}]
+    last_user_message_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if messages[index].role == "user"
+        ),
+        -1,
+    )
     last_user_index = -1
-    for message in messages:
-        normalized_messages.append({"role": message.role, "content": message.content})
+    for index, message in enumerate(messages):
+        # Prior image turns re-embed their pixels in the message so follow-up
+        # requests keep earlier images in context. The latest turn's pixels
+        # arrive separately in `attachments` (handled below) — skipping them
+        # here avoids sending the same image twice.
+        embedded_image_parts = (
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{image.content_type};base64,{image.content}"
+                    },
+                }
+                for image in message.images
+                if image.content
+            ]
+            if index != last_user_message_index
+            else []
+        )
+        normalized_messages.append(
+            {
+                "role": message.role,
+                "content": (
+                    [{"type": "text", "text": message.content}, *embedded_image_parts]
+                    if embedded_image_parts
+                    else message.content
+                ),
+            }
+        )
         if message.role == "user":
             last_user_index = len(normalized_messages) - 1
 
