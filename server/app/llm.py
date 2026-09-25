@@ -137,9 +137,10 @@ _SERVICE_TIERS_CACHE_TTL_SECONDS = 300.0
 # (base_url, model_id) -> (fetched_at, tiers). Endpoint rosters change rarely;
 # on a refresh failure the entry is served stale instead of erroring.
 _service_tiers_cache: dict[tuple[str, str], tuple[float, list[str]]] = {}
-# One lock per cache key: concurrent lookups for different models fetch in
-# parallel while duplicate fetches for the same model still coalesce.
-_service_tiers_locks: dict[tuple[str, str], asyncio.Lock] = {}
+# In-flight fetches keyed like the cache: concurrent requests for the same
+# model share one task (models fetch in parallel) and each entry removes
+# itself when its task completes, so failures retain nothing.
+_service_tiers_inflight: dict[tuple[str, str], asyncio.Task[list[str]]] = {}
 
 # Tier suffixes on provider endpoint tags (`openai/flex`,
 # `google-vertex/global/priority`). "fast" is OpenAI's rename of the priority
@@ -294,6 +295,41 @@ def _extract_service_tiers(payload: Any) -> list[str]:
     return [tier for tier in ("flex", "priority") if tier in tiers]
 
 
+async def _fetch_service_tiers(
+    cache_key: tuple[str, str], endpoints_url: str, model_id: str
+) -> list[str]:
+    """Fetch the endpoint roster, cache the tiers, serve stale on failure."""
+    cached = _service_tiers_cache.get(cache_key)
+    try:
+        response = await _shared_http().get(
+            endpoints_url,
+            timeout=settings.openchat_timeout_seconds,
+        )
+        response.raise_for_status()
+        payload = response.json()
+        # A 200 without an endpoint list is malformed, not "no tiers" —
+        # treat it like a transport failure so a stale entry survives.
+        if not (
+            isinstance(payload, dict)
+            and isinstance(payload.get("data"), dict)
+            and isinstance(payload["data"].get("endpoints"), list)
+        ):
+            raise ValueError("Malformed model endpoints response")
+        tiers = _extract_service_tiers(payload)
+    except (httpx.HTTPError, ValueError):
+        if cached is not None:
+            logger.warning(
+                "OpenRouter service-tier refresh failed for '%s'; serving stale tiers.",
+                model_id,
+                exc_info=True,
+            )
+            return list(cached[1])
+        raise
+
+    _service_tiers_cache[cache_key] = (time.monotonic(), tiers)
+    return list(tiers)
+
+
 async def fetch_model_service_tiers(model_id: str) -> list[str]:
     """Fetch the non-default service tiers available for ``model_id``.
 
@@ -312,40 +348,16 @@ async def fetch_model_service_tiers(model_id: str) -> list[str]:
     if cached is not None and now - cached[0] < _SERVICE_TIERS_CACHE_TTL_SECONDS:
         return list(cached[1])
 
-    async with _service_tiers_locks.setdefault(cache_key, asyncio.Lock()):
-        now = time.monotonic()
-        cached = _service_tiers_cache.get(cache_key)
-        if cached is not None and now - cached[0] < _SERVICE_TIERS_CACHE_TTL_SECONDS:
-            return list(cached[1])
-
-        try:
-            response = await _shared_http().get(
-                endpoints_url,
-                timeout=settings.openchat_timeout_seconds,
-            )
-            response.raise_for_status()
-            payload = response.json()
-            # A 200 without an endpoint list is malformed, not "no tiers" —
-            # treat it like a transport failure so a stale entry survives.
-            if not (
-                isinstance(payload, dict)
-                and isinstance(payload.get("data"), dict)
-                and isinstance(payload["data"].get("endpoints"), list)
-            ):
-                raise ValueError("Malformed model endpoints response")
-            tiers = _extract_service_tiers(payload)
-        except (httpx.HTTPError, ValueError):
-            if cached is not None:
-                logger.warning(
-                    "OpenRouter service-tier refresh failed for '%s'; serving stale tiers.",
-                    model_id,
-                    exc_info=True,
-                )
-                return list(cached[1])
-            raise
-
-        _service_tiers_cache[cache_key] = (time.monotonic(), tiers)
-        return list(tiers)
+    task = _service_tiers_inflight.get(cache_key)
+    if task is None:
+        task = asyncio.create_task(
+            _fetch_service_tiers(cache_key, endpoints_url, model_id)
+        )
+        _service_tiers_inflight[cache_key] = task
+        task.add_done_callback(
+            lambda _task: _service_tiers_inflight.pop(cache_key, None)
+        )
+    return await asyncio.shield(task)
 
 
 def _build_prompt_with_attachments(prompt: str, attachments: list[AttachmentInput]) -> str:

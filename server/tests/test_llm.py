@@ -23,7 +23,7 @@ def reset_llm_state(monkeypatch):
     monkeypatch.setattr(llm, "_openai_client_key", None)
     monkeypatch.setattr(llm, "_models_cache", None)
     monkeypatch.setattr(llm, "_service_tiers_cache", {})
-    monkeypatch.setattr(llm, "_service_tiers_locks", {})
+    monkeypatch.setattr(llm, "_service_tiers_inflight", {})
     monkeypatch.setattr(llm, "MARKDOWN_MODEL_RETRY_BACKOFF_SECONDS", 0)
     yield
     if llm._shared_http_client is not None:
