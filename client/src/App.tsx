@@ -661,6 +661,9 @@ function App() {
   // from the previous provider can never commit into the fresh caches.
   const serviceTierGenerationRef = useRef(0);
   const [tierRetryTick, bumpTierRetryTick] = useState(0);
+  // Gates async tier-lookup handlers so nothing commits state or schedules
+  // a retry after the component unmounts.
+  const mountedRef = useRef(true);
 
   const [activePicker, setActivePicker] = useState<PickerKind | null>(null);
   const [pickerQuery, setPickerQuery] = useState("");
@@ -693,6 +696,15 @@ function App() {
   const directSettingsRef = useRef<HTMLDivElement | null>(null);
   const directStreamControllerRef = useRef<AbortController | null>(null);
   const directRequestIdRef = useRef(0);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      Object.values(serviceTierRetryTimerRef.current).forEach(clearTimeout);
+      serviceTierRetryTimerRef.current = {};
+    };
+  }, []);
 
   useEffect(() => {
     let isActive = true;
@@ -1138,12 +1150,12 @@ function App() {
       serviceTierFetchInFlightRef.current.add(modelId);
       fetchServiceTiers(modelId)
         .then((tiers) => {
-          if (serviceTierGenerationRef.current !== generation) return;
+          if (!mountedRef.current || serviceTierGenerationRef.current !== generation) return;
           delete serviceTierFailedAtRef.current[modelId];
           setServiceTiersByModel((prev) => ({ ...prev, [modelId]: tiers }));
         })
         .catch(() => {
-          if (serviceTierGenerationRef.current !== generation) return;
+          if (!mountedRef.current || serviceTierGenerationRef.current !== generation) return;
           // Record the failure and schedule a retry once the cooldown ends;
           // nothing is cached as "no tiers", so a recovered provider is
           // re-probed even when the selection is otherwise unchanged.
