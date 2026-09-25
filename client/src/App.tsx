@@ -1,5 +1,5 @@
-import { useEffect, useMemo, useRef, useState } from "react";
-import type { ChangeEvent } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import type { ChangeEvent, ClipboardEvent } from "react";
 import type { ComponentType } from "react";
 import type { CSSProperties } from "react";
 import ReactMarkdown from "react-markdown";
@@ -51,6 +51,7 @@ import {
   fetchChatHistory,
   fetchChatHistoryDetail,
   fetchModels,
+  fetchServiceTiers,
   fetchWorkflows,
   getAppVersion,
   getSettings,
@@ -80,6 +81,7 @@ import type {
   RunRequest,
   SavedWorkflow,
   SavedWorkflowConfig,
+  ServiceTier,
   SourceAgentSpec,
   SourceModelResult,
   StreamEvent,
@@ -115,7 +117,12 @@ type ExperienceModeTab = {
   workflowId: string | null;
 };
 
-type ComposerAttachment = AttachmentInput & { id: string };
+type ComposerAttachment = AttachmentInput & {
+  id: string;
+  // Object URL for thumbnails — built from the source File so no extra
+  // base64 copy is retained per turn. Client-only; stripped before transport.
+  thumb_url?: string;
+};
 
 type DisplayModel = {
   id: string;
@@ -285,10 +292,34 @@ const ORCHESTRATION_FLOW: Array<{ id: OrchestrationStep; label: string; detail: 
 
 const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ["max", "xhigh", "high", "medium", "low", "minimal", "none"];
 const DEBATE_MODE_OPTIONS: DebateMode[] = ["off", "partial", "full"];
+const SERVICE_TIER_LABELS: Record<ServiceTier, string> = {
+  default: "Default",
+  flex: "Flex",
+  priority: "Priority",
+};
+const SERVICE_TIER_HINTS: Record<ServiceTier, string> = {
+  default: "",
+  flex: "lower cost",
+  priority: "faster",
+};
+const SERVICE_TIER_TOOLTIPS: Record<ServiceTier, string> = {
+  default: "Default routing",
+  flex: "Flex — lower cost, slower",
+  priority: "Priority — faster, higher cost",
+};
+const SERVICE_TIER_RETRY_MS = 60_000;
+// Matches the server-side roster cache TTL — long-lived sessions re-probe
+// tier availability instead of pinning the first result forever.
+const SERVICE_TIER_REFRESH_MS = 300_000;
 const OPENROUTER_TOKEN_LIMIT = 10_000;
 const MAX_ATTACHMENTS = 5;
 const MAX_ATTACHMENT_SIZE_BYTES = 262_144;
 const MAX_ATTACHMENT_CONTENT_CHARS = 100_000;
+// 5MB — the tightest image cap across common vision providers (Anthropic).
+const MAX_IMAGE_ATTACHMENT_SIZE_BYTES = 5_242_880;
+const IMAGE_CONTENT_TYPE_PREFIX = "image/";
+// Formats every major vision provider accepts via OpenRouter data URLs.
+const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 const SUPPORTED_ATTACHMENT_TYPES = new Set([
   "txt",
   "md",
@@ -448,6 +479,11 @@ const getChatType = (status: string): "fusion" | "direct" =>
 const toChatTypeLabel = (status: string): string =>
   getChatType(status) === "direct" ? "Direct" : "Fusion";
 
+const isImageFile = (file: File): boolean => file.type.startsWith(IMAGE_CONTENT_TYPE_PREFIX);
+
+const isImageAttachment = (attachment: Pick<AttachmentInput, "content_type">): boolean =>
+  attachment.content_type.startsWith(IMAGE_CONTENT_TYPE_PREFIX);
+
 const readAttachmentFile = async (file: File): Promise<ComposerAttachment | null> => {
   const extension = file.name.includes(".") ? file.name.split(".").pop()?.toLowerCase() ?? "" : "";
   const looksLikeText = file.type.startsWith("text/") || SUPPORTED_ATTACHMENT_TYPES.has(extension);
@@ -464,6 +500,52 @@ const readAttachmentFile = async (file: File): Promise<ComposerAttachment | null
     content_type: file.type || "text/plain",
     content,
   };
+};
+
+const readImageAttachmentFile = (file: File): Promise<ComposerAttachment | null> =>
+  new Promise((resolve) => {
+    if (!SUPPORTED_IMAGE_TYPES.has(file.type) || file.size === 0) {
+      resolve(null);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => resolve(null);
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      const match = /^data:(image\/[\w.+-]+);base64,(.+)$/.exec(result);
+      if (!match) {
+        resolve(null);
+        return;
+      }
+      const [, contentType, base64] = match;
+      const extension = contentType.split("/")[1]?.split("+")[0] ?? "png";
+      resolve({
+        id: `image-${crypto.randomUUID()}`,
+        name: file.name || `pasted-image.${extension}`,
+        size: file.size,
+        content_type: contentType,
+        content: base64,
+        thumb_url: URL.createObjectURL(file),
+      });
+    };
+    reader.readAsDataURL(file);
+  });
+
+// Re-encodes a blob: object URL back to base64 so earlier turns can re-send
+// their pixels on follow-ups without retaining a second base64 copy in state.
+const blobUrlToBase64 = async (url: string): Promise<string | null> => {
+  try {
+    const blob = await fetch(url).then((response) => response.blob());
+    const bytes = new Uint8Array(await blob.arrayBuffer());
+    let binary = "";
+    const chunkSize = 0x8000;
+    for (let index = 0; index < bytes.length; index += chunkSize) {
+      binary += String.fromCharCode(...bytes.subarray(index, index + chunkSize));
+    }
+    return btoa(binary);
+  } catch {
+    return null;
+  }
 };
 
 const SettingsUpdateSection = ({ appVersion }: { appVersion: string | null }) => {
@@ -639,6 +721,27 @@ function App() {
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [isCatalogLoading, setIsCatalogLoading] = useState(false);
 
+  // Per-model service tiers: `serviceTiersByModel` caches which non-default
+  // tiers each model exposes (absent = not yet fetched, [] = none);
+  // `serviceTierByModel` holds the user's selection per model.
+  const [serviceTiersByModel, setServiceTiersByModel] = useState<Record<string, ServiceTier[]>>({});
+  const [serviceTierByModel, setServiceTierByModel] = useState<Record<string, ServiceTier>>({});
+  const serviceTierFetchInFlightRef = useRef<Set<string>>(new Set());
+  // modelId -> last failed discovery time; failed models retry once the
+  // cooldown elapses via the retry timer below.
+  const serviceTierFailedAtRef = useRef<Record<string, number>>({});
+  // modelId -> last successful discovery time; rosters refresh once the
+  // TTL elapses via the same retry-timer mechanism as failures.
+  const serviceTierFetchedAtRef = useRef<Record<string, number>>({});
+  const serviceTierRetryTimerRef = useRef<Record<string, number>>({});
+  // Bumped when the provider base URL changes so stale in-flight lookups
+  // from the previous provider can never commit into the fresh caches.
+  const serviceTierGenerationRef = useRef(0);
+  const [tierRetryTick, bumpTierRetryTick] = useState(0);
+  // Gates async tier-lookup handlers so nothing commits state or schedules
+  // a retry after the component unmounts.
+  const mountedRef = useRef(true);
+
   const [activePicker, setActivePicker] = useState<PickerKind | null>(null);
   const [pickerQuery, setPickerQuery] = useState("");
   const [hoveredModelId, setHoveredModelId] = useState<string | null>(null);
@@ -670,6 +773,37 @@ function App() {
   const directSettingsRef = useRef<HTMLDivElement | null>(null);
   const directStreamControllerRef = useRef<AbortController | null>(null);
   const directRequestIdRef = useRef(0);
+  // Bumped whenever the direct session resets/hydrates so file reads started
+  // against the old session cannot commit attachments into the new one.
+  const directAttachmentGenerationRef = useRef(0);
+  // Mirror of directAttachments for reads that must not go through stale
+  // closures (sendDirectMessage awaits in-flight reads, then snapshots this).
+  const directAttachmentsRef = useRef<ComposerAttachment[]>([]);
+  const directAttachmentReadsRef = useRef<
+    { generation: number; task: Promise<void> }[]
+  >([]);
+  // Every object URL minted for composer/transcript thumbnails, revoked when
+  // nothing references it (see releaseDirectThumbs) or the session resets.
+  const directThumbUrlsRef = useRef<Set<string>>(new Set());
+  // Holds the session generation of the in-flight send (null = idle). Scoped
+  // to the generation so a reset unblocks Send in the new session and a stale
+  // send's finally cannot clear a newer send's guard.
+  const directSendGenerationRef = useRef<number | null>(null);
+  // Set on unmount so late image reads revoke their object URLs instead of
+  // committing state to a dead component.
+  const directUnmountedRef = useRef(false);
+  // Mirror of activePage for the async send path — navigation away from
+  // Direct Chat during the pre-request read wait cancels the pending send.
+  const activePageRef = useRef(activePage);
+
+  useEffect(() => {
+    mountedRef.current = true;
+    return () => {
+      mountedRef.current = false;
+      Object.values(serviceTierRetryTimerRef.current).forEach(clearTimeout);
+      serviceTierRetryTimerRef.current = {};
+    };
+  }, []);
 
   useEffect(() => {
     let isActive = true;
@@ -761,6 +895,19 @@ function App() {
         base_url: baseUrlInput.trim() || null,
       };
       const updated = await updateSettings(payload);
+      if (updated.base_url !== appSettings?.base_url) {
+        // Tier availability is per-provider: bump the generation so pending
+        // lookups from the old provider can't commit, drop cached lookups,
+        // failure marks, pending retries, and selections.
+        serviceTierGenerationRef.current += 1;
+        setServiceTiersByModel({});
+        setServiceTierByModel({});
+        serviceTierFetchInFlightRef.current.clear();
+        serviceTierFailedAtRef.current = {};
+        serviceTierFetchedAtRef.current = {};
+        Object.values(serviceTierRetryTimerRef.current).forEach(clearTimeout);
+        serviceTierRetryTimerRef.current = {};
+      }
       setAppSettings(updated);
       setIsAppSettingsOpen(false);
       setApiKeyInput("");
@@ -1078,6 +1225,129 @@ function App() {
     ? filteredModels.find((model) => model.id === focusedModelId) ?? null
     : null;
 
+  const modelsNeedingTierLookup = useMemo(() => {
+    const ids = new Set<string>(sourceModels);
+    if (fusionModel) ids.add(fusionModel);
+    if (directModel) ids.add(directModel);
+    if (focusedModelId) ids.add(focusedModelId);
+    return [...ids];
+  }, [sourceModels, fusionModel, directModel, focusedModelId]);
+
+  // Lazily discover non-default service tiers for every model in view.
+  // Results (including "none") are cached per model and re-probed once the
+  // roster TTL elapses so long-lived sessions pick up tier changes.
+  // Each lookup commits its own outcome — earlier passes must not be
+  // invalidated when a sibling lookup resolves and reruns this effect.
+  useEffect(() => {
+    const generation = serviceTierGenerationRef.current;
+    for (const modelId of modelsNeedingTierLookup) {
+      if (serviceTierFetchInFlightRef.current.has(modelId)) {
+        continue;
+      }
+      const fetchedAt = serviceTierFetchedAtRef.current[modelId];
+      if (fetchedAt !== undefined && Date.now() - fetchedAt < SERVICE_TIER_REFRESH_MS) {
+        // Fresh roster — arm a one-shot re-check at expiry when none is pending.
+        if (serviceTierRetryTimerRef.current[modelId] === undefined) {
+          serviceTierRetryTimerRef.current[modelId] = window.setTimeout(() => {
+            delete serviceTierRetryTimerRef.current[modelId];
+            bumpTierRetryTick((tick) => tick + 1);
+          }, SERVICE_TIER_REFRESH_MS - (Date.now() - fetchedAt));
+        }
+        continue;
+      }
+      const failedAt = serviceTierFailedAtRef.current[modelId];
+      if (failedAt !== undefined && Date.now() - failedAt < SERVICE_TIER_RETRY_MS) {
+        continue;
+      }
+      serviceTierFetchInFlightRef.current.add(modelId);
+      fetchServiceTiers(modelId)
+        .then((tiers) => {
+          if (!mountedRef.current || serviceTierGenerationRef.current !== generation) return;
+          delete serviceTierFailedAtRef.current[modelId];
+          serviceTierFetchedAtRef.current[modelId] = Date.now();
+          setServiceTiersByModel((prev) => ({ ...prev, [modelId]: tiers }));
+        })
+        .catch(() => {
+          if (!mountedRef.current || serviceTierGenerationRef.current !== generation) return;
+          // Record the failure and schedule a retry once the cooldown ends;
+          // nothing is cached as "no tiers", so a recovered provider is
+          // re-probed even when the selection is otherwise unchanged.
+          serviceTierFailedAtRef.current[modelId] = Date.now();
+          if (serviceTierRetryTimerRef.current[modelId] === undefined) {
+            serviceTierRetryTimerRef.current[modelId] = window.setTimeout(() => {
+              delete serviceTierRetryTimerRef.current[modelId];
+              bumpTierRetryTick((tick) => tick + 1);
+            }, SERVICE_TIER_RETRY_MS);
+          }
+        })
+        .finally(() => {
+          if (serviceTierGenerationRef.current !== generation) return;
+          serviceTierFetchInFlightRef.current.delete(modelId);
+        });
+    }
+  }, [modelsNeedingTierLookup, serviceTiersByModel, tierRetryTick]);
+
+  // A hydrated/saved tier only survives when discovery hasn't ruled it out:
+  // pending or failed lookups (undefined) keep the tier, a completed roster
+  // that excludes it drops it.
+  const effectiveTier = useCallback(
+    (modelId: string): ServiceTier | undefined => {
+      const tier = serviceTierByModel[modelId];
+      if (!tier || tier === "default") return undefined;
+      const discoveredTiers = serviceTiersByModel[modelId];
+      if (discoveredTiers !== undefined && !discoveredTiers.includes(tier)) {
+        return undefined;
+      }
+      return tier;
+    },
+    [serviceTierByModel, serviceTiersByModel]
+  );
+
+  const activeServiceTierSelection = useMemo(() => {
+    const relevant = new Set<string>(sourceModels);
+    if (fusionModel) relevant.add(fusionModel);
+    const entries = Object.keys(serviceTierByModel)
+      .filter((model) => relevant.has(model))
+      .map((model) => [model, effectiveTier(model)] as const)
+      .filter((entry): entry is readonly [string, ServiceTier] => entry[1] !== undefined);
+    return Object.fromEntries(entries);
+  }, [effectiveTier, serviceTierByModel, sourceModels, fusionModel]);
+
+  const renderServiceTierSelect = (modelId: string, disabled: boolean) => {
+    const tiers = serviceTiersByModel[modelId];
+    if (!tiers || tiers.length === 0) return null;
+    return (
+      <label className="service-tier-control">
+        <span className="service-tier-label">Tier</span>
+        <select
+          className="service-tier-select"
+          aria-label={`Service tier for ${modelId}`}
+          title={SERVICE_TIER_TOOLTIPS[effectiveTier(modelId) ?? "default"]}
+          value={effectiveTier(modelId) ?? "default"}
+          disabled={disabled}
+          onChange={(event) =>
+            setServiceTierByModel((prev) => ({
+              ...prev,
+              [modelId]: event.target.value as ServiceTier,
+            }))
+          }
+        >
+          <option value="default">{SERVICE_TIER_LABELS.default}</option>
+          {tiers.map((tier) => (
+            <option key={tier} value={tier} title={SERVICE_TIER_TOOLTIPS[tier]}>
+              {SERVICE_TIER_LABELS[tier] ?? tier}
+            </option>
+          ))}
+        </select>
+        {SERVICE_TIER_HINTS[effectiveTier(modelId) ?? "default"] && (
+          <span className="service-tier-hint">
+            {SERVICE_TIER_HINTS[effectiveTier(modelId) ?? "default"]}
+          </span>
+        )}
+      </label>
+    );
+  };
+
   const isOptimizationReviewPending = pendingOriginalPrompt !== null && (
     pendingOptimizedPrompt !== null || pendingPersonaAssignments.length > 0
   );
@@ -1103,8 +1373,11 @@ function App() {
   );
 
   const canSendDirect = useMemo(
-    () => directPrompt.trim().length > 0 && directModel.length > 0 && !isDirectRunning,
-    [directModel.length, directPrompt, isDirectRunning]
+    () =>
+      (directPrompt.trim().length > 0 || directAttachments.some(isImageAttachment)) &&
+      directModel.length > 0 &&
+      !isDirectRunning,
+    [directAttachments, directModel.length, directPrompt, isDirectRunning]
   );
 
   const hasSourceResults = sourceResults.length > 0;
@@ -1184,6 +1457,7 @@ function App() {
   }, [isDirectSettingsOpen]);
 
   useEffect(() => {
+    activePageRef.current = activePage;
     if (activePage === "direct") return;
     if (!isDirectRunning) return;
     directStreamControllerRef.current?.abort();
@@ -1309,6 +1583,9 @@ function App() {
     setDirectMessages([]);
     setDirectConversationId(null);
     setDirectAttachments([]);
+    directAttachmentsRef.current = [];
+    releaseDirectThumbs([...directThumbUrlsRef.current]);
+    directAttachmentGenerationRef.current += 1;
     setIsDirectSettingsOpen(false);
   };
 
@@ -1325,6 +1602,7 @@ function App() {
     setAgentCounts({});
     setActiveRuntimeAgents([]);
     setFusionModel("");
+    setServiceTierByModel({});
     setTemperature(1.0);
     setReasoningEffort("medium");
     setDebateMode("partial");
@@ -1370,6 +1648,7 @@ function App() {
           }));
     setActiveRuntimeAgents(hydratedAgents);
     setFusionModel(chat.request.fusion_model);
+    setServiceTierByModel(chat.request.service_tiers ?? {});
     setDebateMode(chat.request.debate_mode ?? "partial");
     setTemperature(chat.request.temperature ?? 1.0);
     setWebSearchEnabled(chat.request.web_search_enabled ?? false);
@@ -1405,9 +1684,27 @@ function App() {
 
   const hydrateDirectFromHistory = (chat: ChatHistoryDetail) => {
     setActivePage("direct");
-    setDirectModel(chat.request.fusion_model || chat.request.source_models[0] || "");
+    const hydratedDirectModel = chat.request.fusion_model || chat.request.source_models[0] || "";
+    setDirectModel(hydratedDirectModel);
+    const hydratedDirectTier = chat.request.service_tiers?.[hydratedDirectModel];
+    setServiceTierByModel((prev) => {
+      const next = { ...prev };
+      if (hydratedDirectModel) {
+        // A missing saved tier means default routing — clear any stale
+        // selection for this model rather than inheriting it.
+        if (hydratedDirectTier) {
+          next[hydratedDirectModel] = hydratedDirectTier;
+        } else {
+          delete next[hydratedDirectModel];
+        }
+      }
+      return next;
+    });
     setDirectPrompt("");
     setDirectAttachments([]);
+    directAttachmentsRef.current = [];
+    releaseDirectThumbs([...directThumbUrlsRef.current]);
+    directAttachmentGenerationRef.current += 1;
     setIsDirectSettingsOpen(false);
     setDirectError(null);
     setDirectRunId(chat.run_id);
@@ -1489,6 +1786,7 @@ function App() {
         exclude: false,
       },
       attachments: attachments.map(({ id: _id, ...attachment }) => attachment),
+      service_tiers: activeServiceTierSelection,
     };
 
     try {
@@ -1605,6 +1903,7 @@ function App() {
     setDebateMode(config.debate_mode);
     setWebSearchEnabled(config.web_search_enabled);
     setPersonaEnabled(config.persona_enabled ?? false);
+    setServiceTierByModel(config.service_tiers ?? {});
     setAttachments([]);
   };
 
@@ -1664,6 +1963,7 @@ function App() {
           debate_mode: debateMode,
           web_search_enabled: webSearchEnabled,
           persona_enabled: personaEnabled,
+          service_tiers: activeServiceTierSelection,
           attachments: attachments.map((attachment) => ({
             name: attachment.name,
             size: attachment.size,
@@ -1753,49 +2053,162 @@ function App() {
     directFileInputRef.current?.click();
   };
 
-  const onDirectAttachmentChange = async (event: ChangeEvent<HTMLInputElement>) => {
-    const selected = Array.from(event.target.files ?? []);
-    event.target.value = "";
-    if (selected.length === 0) return;
+  const addDirectFiles = async (files: File[]) => {
+    if (files.length === 0) return;
 
-    const slotsRemaining = MAX_ATTACHMENTS - directAttachments.length;
+    const slotsRemaining = MAX_ATTACHMENTS - directAttachmentsRef.current.length;
     if (slotsRemaining <= 0) {
       setDirectError(`Attachment limit reached (${MAX_ATTACHMENTS}). Remove one to add another.`);
       return;
     }
 
-    const nextFiles = selected.slice(0, slotsRemaining);
-    const oversize = nextFiles.find((file) => file.size > MAX_ATTACHMENT_SIZE_BYTES);
+    const nextFiles = files.slice(0, slotsRemaining);
+    const oversize = nextFiles.find(
+      (file) => file.size > (isImageFile(file) ? MAX_IMAGE_ATTACHMENT_SIZE_BYTES : MAX_ATTACHMENT_SIZE_BYTES)
+    );
     if (oversize) {
-      setDirectError(`Attachment ${oversize.name} exceeds 256KB and cannot be added.`);
+      const limitLabel = isImageFile(oversize) ? "5MB" : "256KB";
+      setDirectError(`Attachment ${oversize.name} exceeds ${limitLabel} and cannot be added.`);
       return;
     }
 
-    const parsed = await Promise.all(nextFiles.map((file) => readAttachmentFile(file)));
+    const generation = directAttachmentGenerationRef.current;
+    const parsed = await Promise.all(
+      nextFiles.map((file) => (isImageFile(file) ? readImageAttachmentFile(file) : readAttachmentFile(file)))
+    );
+    if (generation !== directAttachmentGenerationRef.current || directUnmountedRef.current) {
+      // Session moved on or the app unmounted while reading — release
+      // thumbnails we won't show instead of committing stale state.
+      releaseDirectThumbs(
+        parsed.flatMap((item) => (item?.thumb_url ? [item.thumb_url] : []))
+      );
+      return;
+    }
     const rejectedCount = parsed.filter((item) => !item).length;
     const accepted = parsed.filter((item): item is ComposerAttachment => item !== null);
 
     if (accepted.length === 0) {
-      setDirectError("No supported text attachments found. Use text-based files like .txt, .md, .json, .csv, or code files.");
+      setDirectError("No supported attachments found. Use text files like .txt, .md, .json, .csv, or images.");
       return;
     }
 
-    setDirectAttachments((prev) => {
-      const merged = [...prev, ...accepted].filter(
-        (item, index, array) => array.findIndex((entry) => entry.id === item.id) === index
-      );
-      return merged.slice(0, MAX_ATTACHMENTS);
-    });
+    // Commit to the ref synchronously — a send awaiting this read must see
+    // the new attachments — then mirror to React state for rendering.
+    // Capacity is recomputed here: another batch may have committed while
+    // this read was in flight, so overflow is dropped with an explicit count.
+    const capacityLeft = Math.max(0, MAX_ATTACHMENTS - directAttachmentsRef.current.length);
+    const merged = [...directAttachmentsRef.current, ...accepted.slice(0, capacityLeft)].filter(
+      (item, index, array) => array.findIndex((entry) => entry.id === item.id) === index
+    );
+    const next = merged.slice(0, MAX_ATTACHMENTS);
+    const droppedCount = accepted.length - next.filter((item) => accepted.includes(item)).length;
+    directAttachmentsRef.current = next;
+    for (const item of next) {
+      if (item.thumb_url) directThumbUrlsRef.current.add(item.thumb_url);
+    }
+    setDirectAttachments(next);
+    releaseDirectThumbs(
+      accepted
+        .filter((item) => !next.some((entry) => entry.id === item.id))
+        .flatMap((item) => (item.thumb_url ? [item.thumb_url] : []))
+    );
 
-    if (rejectedCount > 0) {
+    if (droppedCount > 0) {
+      setDirectError(`${droppedCount} file(s) were skipped — attachment limit (${MAX_ATTACHMENTS}) reached.`);
+    } else if (rejectedCount > 0) {
       setDirectError(`${rejectedCount} file(s) were skipped because they are unsupported or empty.`);
     } else {
       setDirectError(null);
     }
   };
 
+  const releaseDirectThumbs = (urls: string[]) => {
+    for (const url of urls) {
+      URL.revokeObjectURL(url);
+      directThumbUrlsRef.current.delete(url);
+    }
+  };
+
+  // Release any remaining object URLs when the app unmounts.
+  useEffect(
+    () => {
+      // StrictMode remounts run cleanup then setup again — reset the flag so
+      // dev-mode image reads aren't discarded as post-unmount work.
+      directUnmountedRef.current = false;
+      return () => {
+        directUnmountedRef.current = true;
+        for (const url of directThumbUrlsRef.current) {
+          URL.revokeObjectURL(url);
+        }
+        directThumbUrlsRef.current.clear();
+      };
+    },
+    []
+  );
+
+  // Tracks each addDirectFiles call so sendDirectMessage can wait for the
+  // image read to finish instead of sending a turn without its attachment.
+  const queueDirectFiles = (files: File[]) => {
+    const entry = {
+      generation: directAttachmentGenerationRef.current,
+      task: addDirectFiles(files).catch(() => undefined),
+    };
+    directAttachmentReadsRef.current.push(entry);
+    void entry.task.finally(() => {
+      directAttachmentReadsRef.current = directAttachmentReadsRef.current.filter(
+        (item) => item !== entry
+      );
+    });
+  };
+
+  const onDirectAttachmentChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const selected = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    queueDirectFiles(selected);
+  };
+
+  const onDirectComposerPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const imageFiles = Array.from(event.clipboardData?.items ?? [])
+      .filter((item) => item.kind === "file" && item.type.startsWith(IMAGE_CONTENT_TYPE_PREFIX))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+    if (imageFiles.length === 0) return;
+    event.preventDefault();
+
+    // A clipboard payload can carry both files and text — keep the text by
+    // inserting it at the caret ourselves since the default paste is suppressed.
+    const pastedText = event.clipboardData?.getData("text/plain") ?? "";
+    if (pastedText) {
+      const textarea = event.currentTarget;
+      const nextValue =
+        textarea.value.slice(0, textarea.selectionStart) +
+        pastedText +
+        textarea.value.slice(textarea.selectionEnd);
+      const caret = textarea.selectionStart + pastedText.length;
+      setDirectPrompt(nextValue);
+      requestAnimationFrame(() => textarea.setSelectionRange(caret, caret));
+    }
+
+    if (imageFiles.every((file) => !SUPPORTED_IMAGE_TYPES.has(file.type))) {
+      setDirectError("Unsupported image type — use PNG, JPEG, GIF, or WebP.");
+      return;
+    }
+    queueDirectFiles(imageFiles);
+  };
+
   const removeDirectAttachment = (attachmentId: string) => {
-    setDirectAttachments((prev) => prev.filter((item) => item.id !== attachmentId));
+    const removed = directAttachmentsRef.current.find((item) => item.id === attachmentId);
+    const next = directAttachmentsRef.current.filter((item) => item.id !== attachmentId);
+    directAttachmentsRef.current = next;
+    setDirectAttachments(next);
+    if (
+      removed?.thumb_url &&
+      !directMessages.some((message) =>
+        message.images?.some((image) => image.data_url === removed.thumb_url)
+      )
+    ) {
+      releaseDirectThumbs([removed.thumb_url]);
+    }
   };
 
   const toggleFromPicker = (id: string) => {
@@ -1818,48 +2231,124 @@ function App() {
   };
 
   const sendDirectMessage = async () => {
-    const trimmedPrompt = directPrompt.trim();
-    if (!trimmedPrompt || !directModel || isDirectRunning) return;
-
-    const requestId = directRequestIdRef.current + 1;
-    directRequestIdRef.current = requestId;
-    setDirectError(null);
-    setIsDirectRunning(true);
-    setDirectRunId(null);
-
-    const conversationId = directConversationId ?? crypto.randomUUID();
-    setDirectConversationId(conversationId);
-    const nextMessages: DirectChatMessage[] = [...directMessages, { role: "user", content: trimmedPrompt }];
-    setDirectMessages(nextMessages);
-    setDirectPrompt("");
-
-    const controller = new AbortController();
-    directStreamControllerRef.current = controller;
-
+    const sendGeneration = directAttachmentGenerationRef.current;
+    if (directSendGenerationRef.current === sendGeneration) return;
+    directSendGenerationRef.current = sendGeneration;
     try {
-      await streamDirectChat(
+      // Consume the draft at click time: edits made while image reads settle
+      // become the next message instead of being silently dropped.
+      const trimmedPrompt = directPrompt.trim();
+      setDirectPrompt("");
+      // A pasted image can still be reading when Send fires — wait for this
+      // session's reads so the outgoing turn includes them, draining until no
+      // same-generation read remains (images pasted during the wait count too).
+      // Reads queued by a previous session (pre-reset) are ignored.
+      for (;;) {
+        const pendingReads = directAttachmentReadsRef.current.filter(
+          (entry) => entry.generation === sendGeneration
+        );
+        if (pendingReads.length === 0) break;
+        await Promise.allSettled(pendingReads.map((entry) => entry.task));
+      }
+      // The session may have been reset or rehydrated while reads settled, or
+      // the user navigated away — the captured prompt/model/messages belong
+      // to the direct page at click time, so bail in either case.
+      if (sendGeneration !== directAttachmentGenerationRef.current) return;
+      if (activePageRef.current !== "direct") return;
+      const attachments = directAttachmentsRef.current;
+      const promptText =
+        trimmedPrompt || (attachments.some(isImageAttachment) ? "What's in this image?" : "");
+      if (!promptText || !directModel || isDirectRunning) return;
+
+      const requestId = directRequestIdRef.current + 1;
+      directRequestIdRef.current = requestId;
+      setDirectError(null);
+      setIsDirectRunning(true);
+      setDirectRunId(null);
+
+      const conversationId = directConversationId ?? crypto.randomUUID();
+      setDirectConversationId(conversationId);
+      const imageAttachments = attachments.filter(isImageAttachment);
+      const nextMessages: DirectChatMessage[] = [
+        ...directMessages,
         {
-          model: directModel,
-          messages: nextMessages,
-          conversation_id: conversationId,
-          temperature: directTemperature,
-          max_output_tokens: OPENROUTER_TOKEN_LIMIT,
-          web_search_enabled: directWebSearchEnabled,
-          reasoning: {
-            effort: directReasoningEffort,
-            exclude: false,
-          },
-          attachments: directAttachments.map(({ id: _id, ...attachment }) => attachment),
+          role: "user",
+          content: promptText,
+          ...(imageAttachments.length > 0
+            ? {
+                images: imageAttachments.map((attachment) => ({
+                  name: attachment.name,
+                  content_type: attachment.content_type,
+                  data_url: attachment.thumb_url,
+                })),
+              }
+            : {}),
         },
-        (event) => onDirectEvent(event, requestId),
-        controller.signal
-      );
-    } catch (err) {
-      if (requestId !== directRequestIdRef.current) return;
-      if (isAbortError(err)) return;
-      setDirectError(err instanceof Error ? err.message : "Direct chat failed.");
-      setIsDirectRunning(false);
-      directStreamControllerRef.current = null;
+      ];
+      setDirectMessages(nextMessages);
+      // Sent images now live on the transcript turn — drop them from the
+      // composer so follow-ups don't re-attach them. Keep their blob URLs:
+      // the transcript thumbnail and follow-up re-encoding both use them.
+      if (imageAttachments.length > 0) {
+        const remainingAttachments = directAttachmentsRef.current.filter(
+          (attachment) => !isImageAttachment(attachment)
+        );
+        directAttachmentsRef.current = remainingAttachments;
+        setDirectAttachments(remainingAttachments);
+      }
+
+      const controller = new AbortController();
+      directStreamControllerRef.current = controller;
+
+      try {
+        await streamDirectChat(
+          {
+            model: directModel,
+            messages: await Promise.all(
+              nextMessages.map(async (message, index) => {
+                if (!message.images?.length) return message;
+                // The latest user turn's pixels travel via `attachments`; for
+                // earlier image turns we re-encode the blob thumbnail so the
+                // model still sees them on follow-ups. data_url is stripped
+                // regardless — it is display-only.
+                const isLatestMessage = index === nextMessages.length - 1;
+                const images = await Promise.all(
+                  message.images.map(async ({ name, content_type, data_url }) => {
+                    const content =
+                      !isLatestMessage && data_url ? await blobUrlToBase64(data_url) : null;
+                    return content ? { name, content_type, content } : { name, content_type };
+                  })
+                );
+                return { role: message.role, content: message.content, images };
+              })
+            ),
+            conversation_id: conversationId,
+            temperature: directTemperature,
+            max_output_tokens: OPENROUTER_TOKEN_LIMIT,
+            web_search_enabled: directWebSearchEnabled,
+            reasoning: {
+              effort: directReasoningEffort,
+              exclude: false,
+            },
+            attachments: attachments.map(
+              ({ id: _id, thumb_url: _thumb, ...attachment }) => attachment
+            ),
+            service_tier: effectiveTier(directModel),
+          },
+          (event) => onDirectEvent(event, requestId),
+          controller.signal
+        );
+      } catch (err) {
+        if (requestId !== directRequestIdRef.current) return;
+        if (isAbortError(err)) return;
+        setDirectError(err instanceof Error ? err.message : "Direct chat failed.");
+        setIsDirectRunning(false);
+        directStreamControllerRef.current = null;
+      }
+    } finally {
+      if (directSendGenerationRef.current === sendGeneration) {
+        directSendGenerationRef.current = null;
+      }
     }
   };
 
@@ -2032,6 +2521,7 @@ function App() {
         },
         source_results: sourceResults,
         critique_output: critiqueOutput,
+        service_tier: effectiveTier(fusionModel),
       });
 
       setFusionOutput(result.content);
@@ -2047,6 +2537,8 @@ function App() {
 
   const renderPicker = () => {
     if (!activePicker) return null;
+
+    const focusedTiers = focusedModel ? serviceTiersByModel[focusedModel.id] ?? [] : [];
 
     return (
       <div className="model-picker-popover" role="dialog" aria-label="Model picker" ref={pickerRef}>
@@ -2113,6 +2605,10 @@ function App() {
                   <div>
                     <dt>Output</dt>
                     <dd>{focusedModel.completionPrice ?? "—"}</dd>
+                  </div>
+                  <div>
+                    <dt>Tiers</dt>
+                    <dd>{focusedTiers.length > 0 ? focusedTiers.join(", ") : "—"}</dd>
                   </div>
                 </dl>
               </>
@@ -2373,6 +2869,7 @@ function App() {
                 <span className="muted">Select direct chat model</span>
               )}
             </button>
+            {directModel && renderServiceTierSelect(directModel, isDirectRunning)}
             <div className="picker-anchor">{activePicker === "direct" && renderPicker()}</div>
           </section>
         </div>
@@ -2504,27 +3001,30 @@ function App() {
                     )}
                     <p className={`agent-status status-${agentStatus}`}>Status: {formatAgentStatus(agentStatus)}</p>
                     {isFirstInstance ? (
-                      <div className="agent-count-control" role="group" aria-label={`Instance count for ${modelDisplay.name}`}>
-                        <button
-                          type="button"
-                          className="agent-count-btn"
-                          onClick={() => decrementAgentCount(agent.model)}
-                          disabled={count <= 1 || isRunning}
-                          aria-label="Decrease instance count"
-                        >
-                          −
-                        </button>
-                        <span className="agent-count-value" aria-live="polite">{count}</span>
-                        <button
-                          type="button"
-                          className="agent-count-btn"
-                          onClick={() => incrementAgentCount(agent.model)}
-                          disabled={count >= MAX_AGENT_COUNT || isRunning}
-                          aria-label="Increase instance count"
-                        >
-                          +
-                        </button>
-                      </div>
+                      <>
+                        <div className="agent-count-control" role="group" aria-label={`Instance count for ${modelDisplay.name}`}>
+                          <button
+                            type="button"
+                            className="agent-count-btn"
+                            onClick={() => decrementAgentCount(agent.model)}
+                            disabled={count <= 1 || isRunning}
+                            aria-label="Decrease instance count"
+                          >
+                            −
+                          </button>
+                          <span className="agent-count-value" aria-live="polite">{count}</span>
+                          <button
+                            type="button"
+                            className="agent-count-btn"
+                            onClick={() => incrementAgentCount(agent.model)}
+                            disabled={count >= MAX_AGENT_COUNT || isRunning}
+                            aria-label="Increase instance count"
+                          >
+                            +
+                          </button>
+                        </div>
+                        {renderServiceTierSelect(agent.model, isRunning)}
+                      </>
                     ) : (
                       <p className="agent-instance-label">Instance #{agent.id.split("#")[1] ?? ""}</p>
                     )}
@@ -2563,6 +3063,7 @@ function App() {
                 <span className="muted">Select fusion model</span>
               )}
             </button>
+            {fusionModel && renderServiceTierSelect(fusionModel, isRunning)}
             <div className="picker-anchor">{activePicker === "fusion" && renderPicker()}</div>
           </div>
         </section>
@@ -2979,6 +3480,7 @@ function App() {
               <textarea
                 value={directPrompt}
                 onChange={(event) => setDirectPrompt(event.target.value)}
+                onPaste={onDirectComposerPaste}
                 placeholder="Message your selected model..."
                 rows={4}
               />
@@ -2989,13 +3491,20 @@ function App() {
                 className="composer-file-input"
                 onChange={onDirectAttachmentChange}
                 multiple
-                accept=".txt,.md,.json,.csv,.py,.js,.ts,.tsx,.jsx,.html,.css,.yaml,.yml,.xml,.log,text/*"
+                accept=".txt,.md,.json,.csv,.py,.js,.ts,.tsx,.jsx,.html,.css,.yaml,.yml,.xml,.log,text/*,image/*"
               />
 
               {directAttachments.length > 0 && (
                 <div className="attachment-chip-row" role="list" aria-label="Attached files">
                   {directAttachments.map((attachment) => (
                     <div key={attachment.id} className="attachment-chip" role="listitem">
+                      {isImageAttachment(attachment) && attachment.thumb_url && (
+                        <img
+                          className="attachment-thumb"
+                          src={attachment.thumb_url}
+                          alt={`Attached image ${attachment.name}`}
+                        />
+                      )}
                       <span>{attachment.name}</span>
                       <button type="button" onClick={() => removeDirectAttachment(attachment.id)} aria-label={`Remove ${attachment.name}`}>
                         ×
@@ -3011,7 +3520,7 @@ function App() {
                     className="composer-icon-btn"
                     type="button"
                     aria-label="Add attachment"
-                    title="Attach up to 5 text files (max 256KB each)"
+                    title="Attach text files or images, or paste an image with Ctrl+V"
                     onClick={triggerDirectAttachmentPicker}
                   >
                     <img src={paperclipIcon} alt="" aria-hidden="true" className="ui-icon" />

@@ -7,7 +7,13 @@ import pytest
 import app.llm as llm
 import app.main as main
 from app.config import settings
-from app.models import OpenRouterModelsResponse, SourceAgentSpec, SourceResult
+from app.models import (
+    AttachmentInput,
+    DirectChatMessage,
+    OpenRouterModelsResponse,
+    SourceAgentSpec,
+    SourceResult,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -17,6 +23,8 @@ def reset_llm_state(monkeypatch):
     monkeypatch.setattr(llm, "_openai_client", None)
     monkeypatch.setattr(llm, "_openai_client_key", None)
     monkeypatch.setattr(llm, "_models_cache", None)
+    monkeypatch.setattr(llm, "_service_tiers_cache", {})
+    monkeypatch.setattr(llm, "_service_tiers_inflight", {})
     monkeypatch.setattr(llm, "MARKDOWN_MODEL_RETRY_BACKOFF_SECONDS", 0)
     yield
     if llm._shared_http_client is not None:
@@ -287,6 +295,234 @@ class TestRunSourceModels:
         assert cancelled.is_set()
 
 
+class TestBuildDirectChatMessages:
+    _messages = [
+        DirectChatMessage(role="user", content="first"),
+        DirectChatMessage(role="assistant", content="reply"),
+        DirectChatMessage(role="user", content="describe this"),
+    ]
+
+    def _image(self) -> AttachmentInput:
+        return AttachmentInput(
+            name="shot.png",
+            size=10,
+            content_type="image/png",
+            content="QUJD",
+        )
+
+    def test_no_attachments_keeps_string_content(self):
+        built = llm._build_direct_chat_messages(
+            messages=self._messages,
+            attachments=[],
+            system_prompt="sys",
+        )
+        assert built[0] == {"role": "system", "content": "sys"}
+        assert built[-1] == {"role": "user", "content": "describe this"}
+
+    def test_text_attachments_merge_into_last_user_message(self):
+        built = llm._build_direct_chat_messages(
+            messages=self._messages,
+            attachments=[
+                AttachmentInput(
+                    name="notes.txt",
+                    size=5,
+                    content_type="text/plain",
+                    content="hello",
+                )
+            ],
+            system_prompt="sys",
+        )
+        assert built[1]["content"] == "first"  # earlier turns untouched
+        last = built[-1]["content"]
+        assert isinstance(last, str)
+        assert "describe this" in last
+        assert "notes.txt" in last
+        assert "hello" in last
+
+    def test_image_attachments_build_multipart_content(self):
+        built = llm._build_direct_chat_messages(
+            messages=self._messages,
+            attachments=[self._image()],
+            system_prompt="sys",
+        )
+        last = built[-1]["content"]
+        assert isinstance(last, list)
+        assert last[0] == {"type": "text", "text": "describe this"}
+        assert last[1] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,QUJD"},
+        }
+
+    def test_mixed_attachments_merge_text_and_images(self):
+        built = llm._build_direct_chat_messages(
+            messages=self._messages,
+            attachments=[
+                AttachmentInput(
+                    name="notes.txt",
+                    size=5,
+                    content_type="text/plain",
+                    content="ctx",
+                ),
+                self._image(),
+            ],
+            system_prompt="sys",
+        )
+        last = built[-1]["content"]
+        assert isinstance(last, list)
+        assert last[0]["type"] == "text"
+        assert "ctx" in last[0]["text"]
+        assert last[1]["type"] == "image_url"
+
+    def test_prompt_with_attachments_skips_images(self):
+        prompt = llm._build_prompt_with_attachments("hello", [self._image()])
+        assert prompt == "hello"
+
+    def test_prior_turn_embedded_images_build_multipart(self):
+        messages = [
+            DirectChatMessage.model_validate(
+                {
+                    "role": "user",
+                    "content": "first image",
+                    "images": [
+                        {
+                            "name": "one.png",
+                            "content_type": "image/png",
+                            "content": "QUJD",
+                        }
+                    ],
+                }
+            ),
+            DirectChatMessage(role="assistant", content="seen"),
+            DirectChatMessage(role="user", content="compare to this"),
+        ]
+        built = llm._build_direct_chat_messages(
+            messages=messages,
+            attachments=[self._image()],
+            system_prompt="sys",
+        )
+        first = built[1]["content"]
+        assert isinstance(first, list)
+        assert first[0] == {"type": "text", "text": "first image"}
+        assert first[1] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,QUJD"},
+        }
+        last = built[-1]["content"]
+        assert isinstance(last, list)
+        assert last[0]["type"] == "text"
+        assert last[1]["type"] == "image_url"
+
+    def test_last_turn_embedded_images_kept_without_attachments(self):
+        messages = [
+            DirectChatMessage.model_validate(
+                {
+                    "role": "user",
+                    "content": "describe",
+                    "images": [
+                        {
+                            "name": "a.png",
+                            "content_type": "image/png",
+                            "content": "QUJD",
+                        }
+                    ],
+                }
+            ),
+        ]
+        built = llm._build_direct_chat_messages(
+            messages=messages, attachments=[], system_prompt="sys"
+        )
+        last = built[-1]["content"]
+        assert isinstance(last, list)
+        assert last[0] == {"type": "text", "text": "describe"}
+        assert last[1] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,QUJD"},
+        }
+
+    def test_last_turn_embedded_images_survive_text_attachments(self):
+        messages = [
+            DirectChatMessage.model_validate(
+                {
+                    "role": "user",
+                    "content": "describe",
+                    "images": [
+                        {
+                            "name": "a.png",
+                            "content_type": "image/png",
+                            "content": "QUJD",
+                        }
+                    ],
+                }
+            ),
+        ]
+        built = llm._build_direct_chat_messages(
+            messages=messages,
+            attachments=[
+                AttachmentInput(
+                    name="notes.txt",
+                    size=3,
+                    content_type="text/plain",
+                    content="ctx",
+                )
+            ],
+            system_prompt="sys",
+        )
+        last = built[-1]["content"]
+        assert isinstance(last, list)
+        assert last[0]["type"] == "text"
+        assert "notes.txt" in last[0]["text"]
+        assert "ctx" in last[0]["text"]
+        assert last[1] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,QUJD"},
+        }
+
+    def test_prior_turn_metadata_only_stays_string_content(self):
+        messages = [
+            DirectChatMessage.model_validate(
+                {
+                    "role": "user",
+                    "content": "first image",
+                    "images": [{"name": "one.png", "content_type": "image/png"}],
+                }
+            ),
+            DirectChatMessage(role="user", content="follow up"),
+        ]
+        built = llm._build_direct_chat_messages(
+            messages=messages, attachments=[], system_prompt="sys"
+        )
+        assert built[1] == {"role": "user", "content": "first image"}
+
+
+class TestHistoryAttachmentPayload:
+    def test_image_payload_replaced_with_base64_placeholder(self):
+        import base64
+
+        image = AttachmentInput(
+            name="shot.png",
+            size=10,
+            content_type="image/png",
+            content="QUJD",
+        )
+        payload = main._history_attachment_payload(image)
+        assert payload["name"] == "shot.png"
+        assert payload["content"] != "QUJD"
+        decoded = base64.b64decode(payload["content"], validate=True)
+        assert decoded.decode() == "[image data omitted: 10 bytes]"
+        # The persisted record must still pass strict image validation on read.
+        AttachmentInput.model_validate(payload)
+
+    def test_text_payload_passes_through(self):
+        text = AttachmentInput(
+            name="notes.txt",
+            size=5,
+            content_type="text/plain",
+            content="hello",
+        )
+        payload = main._history_attachment_payload(text)
+        assert payload["content"] == "hello"
+
+
 class TestDebateJobConcurrency:
     def test_jobs_bounded_by_parallel_limit(self, monkeypatch):
         monkeypatch.setattr(settings, "openchat_max_parallel_sources", 2)
@@ -426,3 +662,232 @@ class TestGZipUnlessSSE:
         assert dict(start["headers"])[b"content-encoding"] == b"gzip"
         body = b"".join(m["body"] for m in sent if m["type"] == "http.response.body")
         assert gzip.decompress(body) == payload
+
+
+class TestExtractServiceTiers:
+    def test_collects_tier_suffixes(self):
+        payload = {
+            "data": {
+                "endpoints": [
+                    {"tag": "openai/flex"},
+                    {"tag": "openai/fast"},  # "fast" normalizes to "priority"
+                    {"tag": "google-vertex/global/priority"},
+                ]
+            }
+        }
+        assert llm._extract_service_tiers(payload) == ["flex", "priority"]
+
+    def test_ignores_non_tier_suffixes(self):
+        payload = {
+            "data": {
+                "endpoints": [
+                    {"tag": "openai/us-east5"},
+                    {"tag": "openai/fp8"},
+                    {"tag": "openai"},
+                    {"tag": 42},
+                    {"other": "x"},
+                    "not-a-dict",
+                ]
+            }
+        }
+        assert llm._extract_service_tiers(payload) == []
+
+    @pytest.mark.parametrize(
+        "payload",
+        [{}, {"data": {}}, {"data": {"endpoints": "x"}}, [], "x", None],
+    )
+    def test_malformed_payload_returns_empty(self, payload):
+        assert llm._extract_service_tiers(payload) == []
+
+
+class TestFetchModelServiceTiers:
+    def _client(
+        self, calls: list[httpx.Request], *, status: int = 200, payload: dict | None = None
+    ) -> httpx.AsyncClient:
+        if payload is None:
+            payload = {"data": {"endpoints": [{"tag": "openai/flex"}]}}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            if status != 200:
+                return httpx.Response(status)
+            return httpx.Response(200, json=payload)
+
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    def test_fetches_endpoints_url_and_caches(self, monkeypatch):
+        monkeypatch.setattr(settings, "openai_base_url", "https://openrouter.test/v1")
+        calls: list[httpx.Request] = []
+        monkeypatch.setattr(llm, "_shared_http", lambda: self._client(calls))
+
+        async def run():
+            first = await llm.fetch_model_service_tiers("openai/a")
+            second = await llm.fetch_model_service_tiers("openai/a")
+            return first, second
+
+        first, second = asyncio.run(run())
+        assert first == ["flex"]
+        assert second == ["flex"]
+        assert len(calls) == 1
+        assert str(calls[0].url) == "https://openrouter.test/v1/models/openai/a/endpoints"
+
+    def test_refresh_failure_serves_stale_cache(self, monkeypatch):
+        base_url = "https://openrouter.test/v1"
+        monkeypatch.setattr(settings, "openai_base_url", base_url)
+        monkeypatch.setattr(
+            llm,
+            "_service_tiers_cache",
+            {
+                (base_url, "openai/a"): (
+                    llm.time.monotonic() - llm._SERVICE_TIERS_CACHE_TTL_SECONDS - 1,
+                    ["flex"],
+                )
+            },
+        )
+
+        calls: list[httpx.Request] = []
+        monkeypatch.setattr(llm, "_shared_http", lambda: self._client(calls, status=500))
+
+        assert asyncio.run(llm.fetch_model_service_tiers("openai/a")) == ["flex"]
+        assert len(calls) == 1
+
+    def test_malformed_response_serves_stale_cache(self, monkeypatch):
+        """A 200 without a usable endpoint list is malformed, not 'no tiers'."""
+        base_url = "https://openrouter.test/v1"
+        monkeypatch.setattr(settings, "openai_base_url", base_url)
+        monkeypatch.setattr(
+            llm,
+            "_service_tiers_cache",
+            {
+                (base_url, "openai/a"): (
+                    llm.time.monotonic() - llm._SERVICE_TIERS_CACHE_TTL_SECONDS - 1,
+                    ["flex"],
+                )
+            },
+        )
+
+        calls: list[httpx.Request] = []
+        monkeypatch.setattr(
+            llm, "_shared_http", lambda: self._client(calls, payload={"data": {}})
+        )
+
+        assert asyncio.run(llm.fetch_model_service_tiers("openai/a")) == ["flex"]
+        assert len(calls) == 1
+
+    def test_empty_endpoints_list_caches_as_no_tiers(self, monkeypatch):
+        """An explicit empty roster is a valid 'no tiers' result, not malformed."""
+        calls: list[httpx.Request] = []
+        monkeypatch.setattr(
+            llm,
+            "_shared_http",
+            lambda: self._client(calls, payload={"data": {"endpoints": []}}),
+        )
+
+        assert asyncio.run(llm.fetch_model_service_tiers("openai/a")) == []
+        assert len(calls) == 1
+
+    def test_error_without_cache_propagates(self, monkeypatch):
+        calls: list[httpx.Request] = []
+        monkeypatch.setattr(llm, "_shared_http", lambda: self._client(calls, status=500))
+
+        with pytest.raises(httpx.HTTPStatusError):
+            asyncio.run(llm.fetch_model_service_tiers("openai/a"))
+
+
+class TestServiceTierPlumbing:
+    def test_extra_body_includes_named_tiers_only(self):
+        base = dict(
+            web_search_enabled=False, reasoning_effort="medium", reasoning_exclude=False
+        )
+        assert llm._build_openrouter_extra_body(**base, service_tier="flex")[
+            "service_tier"
+        ] == "flex"
+        assert llm._build_openrouter_extra_body(**base, service_tier="priority")[
+            "service_tier"
+        ] == "priority"
+        for tier in (None, "default"):
+            body = llm._build_openrouter_extra_body(**base, service_tier=tier)
+            assert "service_tier" not in body
+
+    def test_run_source_models_passes_per_model_tier(self, monkeypatch):
+        captured: dict[str, str | None] = {}
+
+        async def fake_run_single_model(
+            *, client, model, service_tier=None, **kwargs
+        ) -> SourceResult:
+            captured[model] = service_tier
+            return SourceResult(model=model, agent_id=model, content="x", status="ok")
+
+        monkeypatch.setattr(llm, "run_single_model", fake_run_single_model)
+
+        async def run() -> None:
+            agents = [
+                SourceAgentSpec(id="a1", model="openai/a"),
+                SourceAgentSpec(id="a2", model="openai/b"),
+            ]
+            stream = llm.run_source_models(
+                client=None,
+                agents=agents,
+                prompt="p",
+                temperature=0.2,
+                web_search_enabled=False,
+                reasoning_effort="medium",
+                reasoning_exclude=False,
+                attachments=[],
+                service_tier_by_model={"openai/a": "flex"},
+            )
+            async for _ in stream:
+                pass
+
+        asyncio.run(run())
+        assert captured == {"openai/a": "flex", "openai/b": None}
+
+    def test_run_markdown_model_forwards_tier_to_completion(self, monkeypatch):
+        captured = {}
+
+        async def fake_completion(**kwargs) -> str:
+            captured.update(kwargs)
+            return "ok"
+
+        monkeypatch.setattr(llm, "_run_chat_completion_with_tool_loop", fake_completion)
+
+        asyncio.run(
+            llm.run_markdown_model(
+                client=None,
+                model="openai/a",
+                prompt="p",
+                system_prompt="s",
+                temperature=0.2,
+                web_search_enabled=False,
+                reasoning_effort="medium",
+                reasoning_exclude=False,
+                context="t",
+                service_tier="priority",
+            )
+        )
+        assert captured["extra_body"]["service_tier"] == "priority"
+
+    def test_run_direct_chat_model_forwards_tier_to_completion(self, monkeypatch):
+        captured = {}
+
+        async def fake_completion(**kwargs) -> str:
+            captured.update(kwargs)
+            return "ok"
+
+        monkeypatch.setattr(llm, "_run_chat_completion_with_tool_loop", fake_completion)
+
+        asyncio.run(
+            llm.run_direct_chat_model(
+                client=None,
+                model="openai/a",
+                messages=[DirectChatMessage(role="user", content="hi")],
+                system_prompt="s",
+                temperature=0.2,
+                web_search_enabled=False,
+                reasoning_effort="medium",
+                reasoning_exclude=False,
+                attachments=[],
+                service_tier="flex",
+            )
+        )
+        assert captured["extra_body"]["service_tier"] == "flex"

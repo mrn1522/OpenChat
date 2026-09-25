@@ -1,6 +1,28 @@
+import base64
+import binascii
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
+
+MAX_TEXT_ATTACHMENT_BYTES = 262_144
+MAX_IMAGE_ATTACHMENT_BYTES = 5 * 1024 * 1024
+# Bound on the total decoded image payload one direct-chat request can carry
+# (current attachments plus prior-turn re-embedded pixels).
+MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_TEXT_ATTACHMENT_CHARS = 100_000
+# ceil(5MiB / 3) * 4 base64 chars, with padding headroom.
+MAX_IMAGE_BASE64_CHARS = 7_000_000
+# Formats every major vision provider accepts via OpenRouter data URLs.
+SUPPORTED_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+
+
+def base64_decoded_len(content: str) -> int:
+    """Decoded byte length of a base64 string, excluding trailing `=` padding."""
+    return 3 * (len(content) // 4) - (len(content) - len(content.rstrip("=")))
+
+# OpenRouter service tiers. "fast" is an upstream alias for "priority" and is
+# normalized to "priority" at the boundary, so only these three are valid here.
+ServiceTier = Literal["default", "flex", "priority"]
 
 
 class ReasoningConfig(BaseModel):
@@ -20,10 +42,50 @@ class SettingsUpdateRequest(BaseModel):
 
 
 class AttachmentInput(BaseModel):
+    """A composer attachment: either an inlined text file or an image.
+
+    Image attachments carry raw base64 in ``content`` (no ``data:`` prefix)
+    and are rendered as ``image_url`` parts in direct chat requests.
+    """
+
     name: str = Field(min_length=1, max_length=256)
-    size: int = Field(ge=1, le=262144)
+    size: int = Field(ge=1)
     content_type: str = Field(default="application/octet-stream", max_length=128)
-    content: str = Field(min_length=1, max_length=100000)
+    content: str = Field(min_length=1)
+
+    @property
+    def is_image(self) -> bool:
+        return self.content_type.startswith("image/")
+
+    @model_validator(mode="after")
+    def _validate_payload_size(self) -> "AttachmentInput":
+        if self.is_image:
+            if self.content_type not in SUPPORTED_IMAGE_TYPES:
+                raise ValueError(f"unsupported image type: {self.content_type}")
+            if self.size > MAX_IMAGE_ATTACHMENT_BYTES:
+                raise ValueError(
+                    f"image attachment exceeds {MAX_IMAGE_ATTACHMENT_BYTES} bytes"
+                )
+            # Check the encoded length before decoding so oversized payloads
+            # are rejected without allocating for them.
+            if len(self.content) > MAX_IMAGE_BASE64_CHARS:
+                raise ValueError("image attachment exceeds maximum base64 length")
+            try:
+                decoded = base64.b64decode(self.content, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError("image attachment content is not valid base64") from exc
+            if len(decoded) > MAX_IMAGE_ATTACHMENT_BYTES:
+                raise ValueError(
+                    f"image attachment exceeds {MAX_IMAGE_ATTACHMENT_BYTES} bytes"
+                )
+        else:
+            if self.size > MAX_TEXT_ATTACHMENT_BYTES:
+                raise ValueError(
+                    f"attachment exceeds {MAX_TEXT_ATTACHMENT_BYTES} bytes"
+                )
+            if len(self.content) > MAX_TEXT_ATTACHMENT_CHARS:
+                raise ValueError("attachment exceeds maximum content length")
+        return self
 
 
 class SourceAgentSpec(BaseModel):
@@ -52,11 +114,53 @@ class RunRequest(BaseModel):
     persona_assignments_override: list[PersonaAssignment] = Field(default_factory=list, max_length=48)
     reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
     attachments: list[AttachmentInput] = Field(default_factory=list, max_length=5)
+    # Per-model service tier map keyed by model id (source agents, debate
+    # reviewers, and the fusion model all resolve through this map).
+    service_tiers: dict[str, ServiceTier] = Field(default_factory=dict)
+
+    @model_validator(mode="after")
+    def _reject_image_attachments(self) -> "RunRequest":
+        # Source/fusion/debate prompts are text-only; images dropped silently
+        # is worse than a clear rejection — direct chat is the image path.
+        if any(attachment.is_image for attachment in self.attachments):
+            raise ValueError("image attachments are only supported in direct chat")
+        return self
+
+
+class DirectChatImageMeta(BaseModel):
+    """Provenance for an image attached to a direct-chat turn.
+
+    The current turn's pixels travel in ``DirectChatRequest.attachments``;
+    prior turns re-embed their pixels here as base64 ``content`` so follow-up
+    requests still carry earlier images. History persists only name and
+    content_type — never the payload.
+    """
+
+    name: str = Field(min_length=1, max_length=256)
+    content_type: str = Field(default="image/png", max_length=128)
+    content: str | None = Field(default=None, max_length=MAX_IMAGE_BASE64_CHARS)
+
+    @model_validator(mode="after")
+    def _validate_content(self) -> "DirectChatImageMeta":
+        if self.content_type not in SUPPORTED_IMAGE_TYPES:
+            raise ValueError(f"unsupported image type: {self.content_type}")
+        if self.content is None:
+            return self
+        try:
+            decoded = base64.b64decode(self.content, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("image content is not valid base64") from exc
+        if len(decoded) > MAX_IMAGE_ATTACHMENT_BYTES:
+            raise ValueError(
+                f"image content exceeds {MAX_IMAGE_ATTACHMENT_BYTES} bytes"
+            )
+        return self
 
 
 class DirectChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=100000)
+    images: list[DirectChatImageMeta] = Field(default_factory=list, max_length=5)
 
 
 class DirectChatRequest(BaseModel):
@@ -68,6 +172,42 @@ class DirectChatRequest(BaseModel):
     web_search_enabled: bool = False
     reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
     attachments: list[AttachmentInput] = Field(default_factory=list, max_length=5)
+    service_tier: ServiceTier | None = None
+
+    @model_validator(mode="after")
+    def _cap_total_image_bytes(self) -> "DirectChatRequest":
+        # Per-image caps alone let 200 messages x 5 images exceed what a
+        # single upstream call should carry — bound the cumulative payload.
+        # Mirrors _build_direct_chat_messages: when image attachments exist,
+        # the latest user turn's embedded pixels are dropped upstream, so
+        # they must not be counted here either.
+        last_user_index = next(
+            (
+                index
+                for index in range(len(self.messages) - 1, -1, -1)
+                if self.messages[index].role == "user"
+            ),
+            -1,
+        )
+        has_image_attachments = any(
+            attachment.is_image for attachment in self.attachments
+        )
+        total_bytes = sum(
+            base64_decoded_len(image.content)
+            for index, message in enumerate(self.messages)
+            if not (index == last_user_index and has_image_attachments)
+            for image in message.images
+            if image.content
+        ) + sum(
+            base64_decoded_len(attachment.content)
+            for attachment in self.attachments
+            if attachment.is_image
+        )
+        if total_bytes > MAX_TOTAL_IMAGE_BYTES:
+            raise ValueError(
+                f"total image payload exceeds {MAX_TOTAL_IMAGE_BYTES} bytes"
+            )
+        return self
 
 
 class PromptOptimizeRequest(BaseModel):
@@ -87,6 +227,7 @@ class FusionRegenerateRequest(BaseModel):
     reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
     source_results: list["SourceResult"] = Field(min_length=1)
     critique_output: str = ""
+    service_tier: ServiceTier | None = None
 
 
 class PersonaPreviewRequest(BaseModel):
@@ -149,6 +290,18 @@ class OpenRouterModelsResponse(BaseModel):
     data: list[OpenRouterModel]
 
 
+class ServiceTiersResponse(BaseModel):
+    """Non-default service tiers discovered for one model.
+
+    Populated from the model's provider endpoint list: tier-capable endpoints
+    carry a slug suffix (``openai/flex``, ``openai/fast``,
+    ``google-vertex/global/priority``). ``fast`` is an alias for ``priority``.
+    """
+
+    model: str
+    tiers: list[ServiceTier]
+
+
 class ChatHistorySummary(BaseModel):
     chat_id: str
     created_at: str
@@ -193,6 +346,7 @@ class WorkflowConfig(BaseModel):
     web_search_enabled: bool = False
     persona_enabled: bool = False
     attachments: list[WorkflowAttachmentMeta] = Field(default_factory=list, max_length=5)
+    service_tiers: dict[str, ServiceTier] = Field(default_factory=dict)
 
 
 class WorkflowCreateRequest(BaseModel):

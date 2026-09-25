@@ -49,6 +49,15 @@ export type AppSettingsUpdate = {
 
 export type DebateMode = "off" | "partial" | "full";
 
+// "default" is OpenRouter's standard tier; "fast" is an upstream alias for
+// "priority" and is normalized to "priority" everywhere in the app.
+export type ServiceTier = "default" | "flex" | "priority";
+
+export type ServiceTiersResponse = {
+  model: string;
+  tiers: ServiceTier[];
+};
+
 export type AttachmentInput = {
   name: string;
   size: number;
@@ -58,9 +67,22 @@ export type AttachmentInput = {
 
 export type DirectChatRole = "user" | "assistant";
 
+export type DirectChatImageRef = {
+  name: string;
+  content_type: string;
+  // In-session thumbnail source only — stripped before transport and never
+  // persisted in history.
+  data_url?: string;
+  // Base64 pixels, populated on the wire for PRIOR image turns so follow-up
+  // requests still carry earlier images (the current turn's pixels travel in
+  // `attachments`). Never populated client-side in stored state.
+  content?: string;
+};
+
 export type DirectChatMessage = {
   role: DirectChatRole;
   content: string;
+  images?: DirectChatImageRef[];
 };
 
 export type StreamEvent =
@@ -101,6 +123,7 @@ export type RunRequest = {
   persona_assignments_override?: PersonaAssignment[];
   reasoning?: ReasoningConfig;
   attachments?: AttachmentInput[];
+  service_tiers?: Record<string, ServiceTier>;
 };
 
 export type DirectChatRequest = {
@@ -112,6 +135,7 @@ export type DirectChatRequest = {
   web_search_enabled?: boolean;
   reasoning?: ReasoningConfig;
   attachments?: AttachmentInput[];
+  service_tier?: ServiceTier;
 };
 
 export type FusionRegenerateRequest = {
@@ -121,6 +145,7 @@ export type FusionRegenerateRequest = {
   reasoning?: ReasoningConfig;
   source_results: SourceModelResult[];
   critique_output: string;
+  service_tier?: ServiceTier;
 };
 
 export type FusionRegenerateResponse = {
@@ -220,6 +245,7 @@ export type SavedWorkflowConfig = {
   web_search_enabled: boolean;
   persona_enabled: boolean;
   attachments: WorkflowAttachmentMeta[];
+  service_tiers?: Record<string, ServiceTier>;
 };
 
 export type SavedWorkflow = {

@@ -22,7 +22,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 DEFAULT_HISTORY_LIMIT = 500
 _TITLE_MAX_CHARS = 500
 
@@ -55,6 +55,7 @@ _SCHEMA_STATEMENTS = (
         role TEXT NOT NULL CHECK(role IN ('user', 'assistant')),
         model TEXT NOT NULL DEFAULT '',
         content TEXT NOT NULL,
+        images_json TEXT,
         created_at TEXT NOT NULL,
         UNIQUE(conversation_id, seq)
     )
@@ -155,12 +156,25 @@ def _table_exists(connection: sqlite3.Connection, name: str) -> bool:
     return row is not None
 
 
+def _column_exists(connection: sqlite3.Connection, table: str, column: str) -> bool:
+    rows = connection.execute(f"PRAGMA table_info({table})").fetchall()
+    return any(row["name"] == column for row in rows)
+
+
 def _apply_migrations(connection: sqlite3.Connection) -> None:
     version = connection.execute("PRAGMA user_version").fetchone()[0]
     # Statements are all CREATE IF NOT EXISTS — always run them so a partially
     # versioned DB still ends up with the full schema.
     for statement in _SCHEMA_STATEMENTS:
         connection.execute(statement)
+    # v3 adds images_json to conversation_messages; CREATE TABLE is a no-op on
+    # existing v2 tables, so backfill the column explicitly.
+    if version < 3 and not _column_exists(
+        connection, "conversation_messages", "images_json"
+    ):
+        connection.execute(
+            "ALTER TABLE conversation_messages ADD COLUMN images_json TEXT"
+        )
     if version < 2:
         _migrate_legacy_chats(connection)
     connection.execute(f"PRAGMA user_version={SCHEMA_VERSION}")
@@ -285,9 +299,9 @@ def _insert_messages(
     connection.executemany(
         """
         INSERT INTO conversation_messages (
-            conversation_id, seq, role, model, content, created_at
+            conversation_id, seq, role, model, content, images_json, created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -296,6 +310,7 @@ def _insert_messages(
                 str(message.get("role", "user")),
                 str(message.get("model") or ""),
                 str(message.get("content", "")),
+                json.dumps(message["images"]) if message.get("images") else None,
                 created_at,
             )
             for seq, message in enumerate(messages)
@@ -509,17 +524,28 @@ def list_chat_records(db_path: str, *, limit: int = 100) -> list[dict[str, Any]]
 
 def _fetch_messages(
     connection: sqlite3.Connection, conversation_id: str
-) -> list[dict[str, str]]:
+) -> list[dict[str, Any]]:
     rows = connection.execute(
         """
-        SELECT role, content
+        SELECT role, content, images_json
         FROM conversation_messages
         WHERE conversation_id = ?
         ORDER BY seq ASC
         """,
         (conversation_id,),
     ).fetchall()
-    return [{"role": row["role"], "content": row["content"]} for row in rows]
+    messages: list[dict[str, Any]] = []
+    for row in rows:
+        message: dict[str, Any] = {"role": row["role"], "content": row["content"]}
+        if row["images_json"]:
+            try:
+                images = json.loads(row["images_json"])
+            except json.JSONDecodeError:
+                images = None
+            if isinstance(images, list) and images:
+                message["images"] = images
+        messages.append(message)
+    return messages
 
 
 def _fetch_source_results(

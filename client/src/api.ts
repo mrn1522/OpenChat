@@ -14,6 +14,8 @@ import type {
   PromptOptimizeRequest,
   PromptOptimizeResponse,
   RunRequest,
+  ServiceTier,
+  ServiceTiersResponse,
   StreamEvent,
   WorkflowCreateRequest,
   WorkflowListResponse,
@@ -219,6 +221,30 @@ export async function fetchModels(signal?: AbortSignal): Promise<OpenRouterModel
 
   const payload = (await response.json()) as OpenRouterModelsResponse;
   return payload.data;
+}
+
+export async function fetchServiceTiers(
+  modelId: string,
+  signal?: AbortSignal
+): Promise<ServiceTier[]> {
+  const base = await getApiBase();
+  const response = await fetch(
+    `${base}/api/service-tiers/${encodeURIComponent(modelId)}`,
+    {
+      method: "GET",
+      headers: {
+        "Content-Type": "application/json",
+      },
+      signal,
+    }
+  );
+
+  if (!response.ok) {
+    throw new Error(await extractErrorMessage(response));
+  }
+
+  const payload = (await response.json()) as ServiceTiersResponse;
+  return payload.tiers;
 }
 
 export async function optimizePrompt(
