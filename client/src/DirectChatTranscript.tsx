@@ -17,12 +17,15 @@ type TranscriptRow =
 type DirectChatTranscriptProps = {
   messages: DirectChatMessage[];
   isRunning: boolean;
+  onImageClick?: (src: string, alt: string) => void;
 };
 
 const DirectChatMessageBubble = memo(function DirectChatMessageBubble({
   message,
+  onImageClick,
 }: {
   message: DirectChatMessage;
+  onImageClick?: (src: string, alt: string) => void;
 }) {
   return (
     <article className={`direct-chat-bubble ${message.role}`}>
@@ -31,12 +34,16 @@ const DirectChatMessageBubble = memo(function DirectChatMessageBubble({
         <div className="direct-chat-image-row">
           {message.images.map((image, index) =>
             image.data_url ? (
-              <img
+              <button
                 key={`${image.name}-${index}`}
+                type="button"
                 className="direct-chat-image-thumb"
-                src={image.data_url}
-                alt={image.name}
-              />
+                title="Click to enlarge"
+                aria-label={`Enlarge image ${image.name}`}
+                onClick={() => image.data_url && onImageClick?.(image.data_url, image.name)}
+              >
+                <img src={image.data_url} alt={image.name} />
+              </button>
             ) : (
               <span key={`${image.name}-${index}`} className="direct-chat-image-chip">
                 {image.name}
@@ -64,7 +71,7 @@ const DirectChatPendingBubble = memo(function DirectChatPendingBubble() {
   );
 });
 
-function DirectChatTranscript({ messages, isRunning }: DirectChatTranscriptProps) {
+function DirectChatTranscript({ messages, isRunning, onImageClick }: DirectChatTranscriptProps) {
   const parentRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
   const previousCountRef = useRef(0);
@@ -226,7 +233,7 @@ function DirectChatTranscript({ messages, isRunning }: DirectChatTranscriptProps
               }}
             >
               {row.kind === "message" ? (
-                <DirectChatMessageBubble message={row.message} />
+                <DirectChatMessageBubble message={row.message} onImageClick={onImageClick} />
               ) : (
                 <DirectChatPendingBubble />
               )}

@@ -5,6 +5,7 @@ import type { CSSProperties } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import DirectChatTranscript from "./DirectChatTranscript";
+import ImageLightbox from "./ImageLightbox";
 import {
   Anthropic,
   Aws,
@@ -764,6 +765,11 @@ function App() {
   const [directReasoningEffort, setDirectReasoningEffort] = useState<ReasoningEffort>("medium");
   const [directAttachments, setDirectAttachments] = useState<ComposerAttachment[]>([]);
   const [isDirectSettingsOpen, setIsDirectSettingsOpen] = useState(false);
+  const [enlargedImage, setEnlargedImage] = useState<{ src: string; alt: string } | null>(null);
+  const enlargeImage = useCallback((src: string, alt: string) => {
+    setEnlargedImage({ src, alt });
+  }, []);
+  const closeImageLightbox = useCallback(() => setEnlargedImage(null), []);
 
   const pickerRef = useRef<HTMLDivElement | null>(null);
   const pickerSearchRef = useRef<HTMLInputElement | null>(null);
@@ -2138,6 +2144,7 @@ function App() {
       URL.revokeObjectURL(url);
       directThumbUrlsRef.current.delete(url);
     }
+    setEnlargedImage((current) => (current && urls.includes(current.src) ? null : current));
   };
 
   // Release any remaining object URLs when the app unmounts.
@@ -2637,7 +2644,15 @@ function App() {
       <div className="bg-lights" aria-hidden="true" />
 
       {isAppSettingsOpen && (
-        <div className="api-settings-overlay" role="presentation">
+        <div
+          className="api-settings-overlay"
+          role="presentation"
+          onMouseDown={(event) => {
+            if (event.button === 0 && event.target === event.currentTarget && appSettings?.api_key_configured) {
+              setIsAppSettingsOpen(false);
+            }
+          }}
+        >
           <section className="api-settings-panel" role="dialog" aria-modal="true" aria-labelledby="app-settings-title">
             <div className="api-settings-header">
               <div>
@@ -2716,6 +2731,10 @@ function App() {
             </div>
           </section>
         </div>
+      )}
+
+      {enlargedImage && (
+        <ImageLightbox src={enlargedImage.src} alt={enlargedImage.alt} onClose={closeImageLightbox} />
       )}
 
       <aside className="sidebar-rail">
@@ -3486,7 +3505,11 @@ function App() {
         {activePage === "direct" && (
           <div className="direct-page">
             <div className="direct-transcript-wrap">
-              <DirectChatTranscript messages={directMessages} isRunning={isDirectRunning} />
+              <DirectChatTranscript
+                messages={directMessages}
+                isRunning={isDirectRunning}
+                onImageClick={enlargeImage}
+              />
             </div>
 
             <section className="panel composer-panel direct-composer-panel">
@@ -3513,11 +3536,18 @@ function App() {
                   {directAttachments.map((attachment) => (
                     <div key={attachment.id} className="attachment-chip" role="listitem">
                       {isImageAttachment(attachment) && attachment.thumb_url && (
-                        <img
+                        <button
+                          type="button"
                           className="attachment-thumb"
-                          src={attachment.thumb_url}
-                          alt={`Attached image ${attachment.name}`}
-                        />
+                          title="Click to enlarge"
+                          aria-label={`Enlarge image ${attachment.name}`}
+                          onClick={() =>
+                            attachment.thumb_url &&
+                            enlargeImage(attachment.thumb_url, attachment.name)
+                          }
+                        >
+                          <img src={attachment.thumb_url} alt={`Attached image ${attachment.name}`} />
+                        </button>
                       )}
                       <span>{attachment.name}</span>
                       <button type="button" onClick={() => removeDirectAttachment(attachment.id)} aria-label={`Remove ${attachment.name}`}>
