@@ -32,7 +32,14 @@ from app.chat_store import (
     save_workflow_record,
 )
 from app.config import reload_settings, settings, settings_env_file
-from app.secrets_store import DPAPI_PREFIX, protect_secret
+from app.secrets_store import (
+    DPAPI_PREFIX,
+    delete_credential,
+    protect_secret,
+    read_credential,
+    unprotect_secret,
+    write_credential,
+)
 from app.llm import (
     MODEL_ID_PATTERN,
     aclose_clients,
@@ -450,24 +457,43 @@ def _upsert_env_values(path: Path, values: dict[str, str | None]) -> None:
 
 
 def _protect_api_key_at_rest() -> None:
-    """Re-write a plaintext OPENAI_API_KEY in the settings file DPAPI-encrypted.
+    """Keep the stored OPENAI_API_KEY protected, restoring it when missing.
 
-    No-op off Windows; on Windows this runs once at startup so keys saved by
-    older builds are upgraded without a settings round-trip.
+    No-op off Windows; on Windows this runs once at startup. A plaintext key
+    saved by an older build is upgraded to DPAPI form without a settings
+    round-trip, and a missing key is written back from the OS credential
+    store — e.g. after a reinstall wiped the app data directory.
     """
     if os.name != "nt":
         return
     env_file = settings_env_file()
-    if not env_file.exists():
-        return
-    stored = (dotenv_values(env_file).get("OPENAI_API_KEY") or "").strip()
-    if not stored or stored.startswith(DPAPI_PREFIX):
-        return
+    stored = (
+        (dotenv_values(env_file).get("OPENAI_API_KEY") or "").strip()
+        if env_file.exists()
+        else ""
+    )
     try:
-        _upsert_env_values(env_file, {"OPENAI_API_KEY": protect_secret(stored)})
-        logger.info("Encrypted stored OPENAI_API_KEY at rest")
+        recovered = ""
+        if stored and not stored.startswith(DPAPI_PREFIX):
+            _upsert_env_values(env_file, {"OPENAI_API_KEY": protect_secret(stored)})
+            logger.info("Encrypted stored OPENAI_API_KEY at rest")
+        elif not stored:
+            recovered = read_credential().strip()
+            if recovered:
+                _upsert_env_values(
+                    env_file, {"OPENAI_API_KEY": protect_secret(recovered)}
+                )
+                logger.info("Restored OPENAI_API_KEY from the OS credential store")
+        file_key = unprotect_secret(stored).strip() if stored else recovered
+        if file_key:
+            # Back the key up in the credential store too: keys saved before
+            # the mirror existed live only in .env, and a later app-data wipe
+            # would lose the sole copy. An inherited OPENAI_API_KEY env var is
+            # deliberately not mirrored — it is not something the user saved,
+            # and persisting it would keep it alive after the env var is unset.
+            write_credential(file_key)
     except Exception:
-        logger.exception("Failed to encrypt stored OPENAI_API_KEY")
+        logger.exception("Failed to sync stored OPENAI_API_KEY")
 
 
 def _settings_response() -> SettingsResponse:
@@ -493,6 +519,23 @@ async def update_settings(request: SettingsUpdateRequest) -> SettingsResponse:
         values: dict[str, str | None] = {}
         if request.api_key is not None:
             api_key = request.api_key.strip()
+            if not api_key and not await asyncio.to_thread(delete_credential):
+                # The credential store is the fallback a later load reads when
+                # no key is stored — leaving it behind would resurrect the
+                # cleared key, so the clear must fail instead of half-applying.
+                raise HTTPException(
+                    status_code=500,
+                    detail="Could not remove the stored credential — the API key was not cleared.",
+                )
+            if api_key and not await asyncio.to_thread(write_credential, api_key):
+                # A stale credential would resurrect the previous key after an
+                # app-data reset, so the save must fail unless the old
+                # credential can be dropped.
+                if not await asyncio.to_thread(delete_credential):
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Could not update the stored credential — the API key was not updated.",
+                    )
             values["OPENAI_API_KEY"] = protect_secret(api_key) or None
             if api_key:
                 os.environ["OPENAI_API_KEY"] = api_key
