@@ -139,8 +139,11 @@ function DirectChatTranscript({ messages, isRunning }: DirectChatTranscriptProps
     if (!stickToBottomRef.current && previousCount !== 0) return;
 
     const lastIndex = rows.length - 1;
+    // First render jumps; later growth (new turns, pending bubble) eases down
+    // so the conversation advances naturally.
+    const behavior = previousCount === 0 ? "auto" : "smooth";
     requestAnimationFrame(() => {
-      virtualizer.scrollToIndex(lastIndex, { align: "end", behavior: "auto" });
+      virtualizer.scrollToIndex(lastIndex, { align: "end", behavior });
       stickToBottomRef.current = true;
     });
   }, [rows.length, virtualizer]);
@@ -152,8 +155,9 @@ function DirectChatTranscript({ messages, isRunning }: DirectChatTranscriptProps
     if (!element) return;
 
     requestAnimationFrame(() => {
-      if (!stickToBottomRef.current || !parentRef.current) return;
-      parentRef.current.scrollTop = parentRef.current.scrollHeight;
+      const element = parentRef.current;
+      if (!stickToBottomRef.current || !element) return;
+      element.scrollTo({ top: element.scrollHeight, behavior: "smooth" });
     });
   }, [rows.length, totalSize]);
 

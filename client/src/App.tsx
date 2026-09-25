@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type { ChangeEvent, ClipboardEvent } from "react";
 import type { ComponentType } from "react";
 import type { CSSProperties } from "react";
@@ -315,6 +315,7 @@ const MAX_ATTACHMENT_CONTENT_CHARS = 100_000;
 // 5MB — the tightest image cap across common vision providers (Anthropic).
 const MAX_IMAGE_ATTACHMENT_SIZE_BYTES = 5_242_880;
 const IMAGE_CONTENT_TYPE_PREFIX = "image/";
+const DIRECT_TEXTAREA_MAX_HEIGHT_PX = 220;
 // Formats every major vision provider accepts via OpenRouter data URLs.
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
 const SUPPORTED_ATTACHMENT_TYPES = new Set([
@@ -767,6 +768,7 @@ function App() {
   const directSettingsRef = useRef<HTMLDivElement | null>(null);
   const directStreamControllerRef = useRef<AbortController | null>(null);
   const directRequestIdRef = useRef(0);
+  const directTextareaRef = useRef<HTMLTextAreaElement | null>(null);
   // Bumped whenever the direct session resets/hydrates so file reads started
   // against the old session cannot commit attachments into the new one.
   const directAttachmentGenerationRef = useRef(0);
@@ -1445,6 +1447,15 @@ function App() {
     directRequestIdRef.current += 1;
     setIsDirectRunning(false);
   }, [activePage, isDirectRunning]);
+
+  useLayoutEffect(() => {
+    const textarea = directTextareaRef.current;
+    if (!textarea) return;
+    textarea.style.height = "auto";
+    const cappedHeight = Math.min(textarea.scrollHeight, DIRECT_TEXTAREA_MAX_HEIGHT_PX);
+    textarea.style.height = `${cappedHeight}px`;
+    textarea.style.overflowY = textarea.scrollHeight > DIRECT_TEXTAREA_MAX_HEIGHT_PX ? "auto" : "hidden";
+  }, [activePage, directPrompt]);
 
   useEffect(() => {
     if (!activePicker) return;
@@ -2602,7 +2613,7 @@ function App() {
   };
 
   return (
-    <div className="app-shell">
+    <div className={`app-shell${activePage === "direct" ? " direct-shell" : ""}`}>
       <div className="bg-lights" aria-hidden="true" />
 
       {isAppSettingsOpen && (
@@ -3453,16 +3464,19 @@ function App() {
         )}
 
         {activePage === "direct" && (
-          <>
-            <section className="panel composer-panel direct-composer-panel">
+          <div className="direct-page">
+            <div className="direct-transcript-wrap">
               <DirectChatTranscript messages={directMessages} isRunning={isDirectRunning} />
+            </div>
 
+            <section className="panel composer-panel direct-composer-panel">
               <textarea
+                ref={directTextareaRef}
                 value={directPrompt}
                 onChange={(event) => setDirectPrompt(event.target.value)}
                 onPaste={onDirectComposerPaste}
                 placeholder="Message your selected model..."
-                rows={4}
+                rows={1}
               />
 
               <input
@@ -3573,7 +3587,7 @@ function App() {
             </section>
 
             {directError && <p className="error main-error">{directError}</p>}
-          </>
+          </div>
         )}
 
       </main>
