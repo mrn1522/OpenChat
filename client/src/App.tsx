@@ -773,7 +773,9 @@ function App() {
   // Mirror of directAttachments for reads that must not go through stale
   // closures (sendDirectMessage awaits in-flight reads, then snapshots this).
   const directAttachmentsRef = useRef<ComposerAttachment[]>([]);
-  const directAttachmentReadsRef = useRef<Promise<void>[]>([]);
+  const directAttachmentReadsRef = useRef<
+    { generation: number; task: Promise<void> }[]
+  >([]);
   // Every object URL minted for composer/transcript thumbnails, revoked when
   // nothing references it (see releaseDirectThumbs) or the session resets.
   const directThumbUrlsRef = useRef<Set<string>>(new Set());
@@ -2118,11 +2120,14 @@ function App() {
   // Tracks each addDirectFiles call so sendDirectMessage can wait for the
   // image read to finish instead of sending a turn without its attachment.
   const queueDirectFiles = (files: File[]) => {
-    const task = addDirectFiles(files).catch(() => undefined);
-    directAttachmentReadsRef.current.push(task);
-    void task.finally(() => {
+    const entry = {
+      generation: directAttachmentGenerationRef.current,
+      task: addDirectFiles(files).catch(() => undefined),
+    };
+    directAttachmentReadsRef.current.push(entry);
+    void entry.task.finally(() => {
       directAttachmentReadsRef.current = directAttachmentReadsRef.current.filter(
-        (entry) => entry !== task
+        (item) => item !== entry
       );
     });
   };
@@ -2201,11 +2206,18 @@ function App() {
     if (directSendGenerationRef.current === sendGeneration) return;
     directSendGenerationRef.current = sendGeneration;
     try {
+      // Consume the draft at click time: edits made while image reads settle
+      // become the next message instead of being silently dropped.
       const trimmedPrompt = directPrompt.trim();
-      // A pasted image can still be reading when Send fires — wait for it so
-      // the outgoing turn includes it instead of it landing in the next turn.
-      if (directAttachmentReadsRef.current.length > 0) {
-        await Promise.allSettled([...directAttachmentReadsRef.current]);
+      setDirectPrompt("");
+      // A pasted image can still be reading when Send fires — wait for this
+      // session's reads so the outgoing turn includes them. Reads queued by a
+      // previous session (pre-reset) are ignored, not awaited.
+      const pendingReads = directAttachmentReadsRef.current.filter(
+        (entry) => entry.generation === sendGeneration
+      );
+      if (pendingReads.length > 0) {
+        await Promise.allSettled(pendingReads.map((entry) => entry.task));
       }
       // The session may have been reset or rehydrated while reads settled;
       // the prompt/model/directMessages captured above belong to it, so bail.
@@ -2241,7 +2253,16 @@ function App() {
         },
       ];
       setDirectMessages(nextMessages);
-      setDirectPrompt("");
+      // Sent images now live on the transcript turn — drop them from the
+      // composer so follow-ups don't re-attach them. Keep their blob URLs:
+      // the transcript thumbnail and follow-up re-encoding both use them.
+      if (imageAttachments.length > 0) {
+        const remainingAttachments = directAttachmentsRef.current.filter(
+          (attachment) => !isImageAttachment(attachment)
+        );
+        directAttachmentsRef.current = remainingAttachments;
+        setDirectAttachments(remainingAttachments);
+      }
 
       const controller = new AbortController();
       directStreamControllerRef.current = controller;
