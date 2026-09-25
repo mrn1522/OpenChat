@@ -16,9 +16,13 @@ from app.secrets_store import (
 class TestSettingsCredentialMirror:
     def test_save_mirrors_key_to_credential_store(self, client, monkeypatch):
         writes = []
-        monkeypatch.setattr(main_module, "write_credential", writes.append)
         monkeypatch.setattr(
-            main_module, "delete_credential", lambda: writes.append(None)
+            main_module,
+            "write_credential",
+            lambda value: writes.append(value) or True,
+        )
+        monkeypatch.setattr(
+            main_module, "delete_credential", lambda: writes.append(None) or True
         )
         try:
             response = client.put(
@@ -32,15 +36,52 @@ class TestSettingsCredentialMirror:
 
     def test_clear_deletes_mirrored_credential(self, client, monkeypatch):
         deletes = []
-        monkeypatch.setattr(main_module, "write_credential", lambda v: None)
+        monkeypatch.setattr(main_module, "write_credential", lambda v: True)
         monkeypatch.setattr(
-            main_module, "delete_credential", lambda: deletes.append(True)
+            main_module,
+            "delete_credential",
+            lambda: deletes.append(True) or True,
         )
         client.put("/api/settings", json={"api_key": "sk-or-test-key"})
         response = client.put("/api/settings", json={"api_key": ""})
         assert response.status_code == 200
         assert response.json()["api_key_configured"] is False
         assert deletes == [True]
+
+    def test_clear_surfaces_failed_credential_delete(self, client, monkeypatch):
+        """A failed delete must not half-apply: a stale credential would
+        resurrect the cleared key on the next settings reload."""
+        response = client.put("/api/settings", json={"api_key": "sk-or-test-key"})
+        assert response.status_code == 200
+
+        monkeypatch.setattr(main_module, "delete_credential", lambda: False)
+        failed = client.put("/api/settings", json={"api_key": ""})
+        assert failed.status_code == 500
+        # Nothing was cleared — the stored key is still reported configured.
+        assert client.get("/api/settings").json()["api_key_configured"] is True
+
+        monkeypatch.undo()
+        client.put("/api/settings", json={"api_key": ""})
+
+    def test_failed_mirror_write_drops_stale_credential(
+        self, client, monkeypatch
+    ):
+        deletes = []
+        monkeypatch.setattr(main_module, "write_credential", lambda v: False)
+        monkeypatch.setattr(
+            main_module,
+            "delete_credential",
+            lambda: deletes.append(True) or True,
+        )
+        try:
+            response = client.put(
+                "/api/settings", json={"api_key": "sk-or-test-key"}
+            )
+            assert response.status_code == 200
+            assert response.json()["api_key_configured"] is True
+            assert deletes == [True]
+        finally:
+            client.put("/api/settings", json={"api_key": ""})
 
     def test_base_url_only_update_skips_credential_store(
         self, client, monkeypatch
@@ -94,5 +135,5 @@ class TestCredentialFallback:
 class TestCredentialStoreNoOpOffWindows:
     def test_public_helpers_are_safe_on_non_windows(self):
         assert read_credential() == ""
-        write_credential("sk-or-test")
-        delete_credential()
+        assert write_credential("sk-or-test") is True
+        assert delete_credential() is True

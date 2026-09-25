@@ -482,6 +482,12 @@ def _protect_api_key_at_rest() -> None:
                     env_file, {"OPENAI_API_KEY": protect_secret(recovered)}
                 )
                 logger.info("Restored OPENAI_API_KEY from the OS credential store")
+        resolved = settings.openai_api_key.strip()
+        if resolved:
+            # Back the key up in the credential store too: keys saved before
+            # the mirror existed live only in .env, and a later app-data wipe
+            # would lose the sole copy.
+            write_credential(resolved)
     except Exception:
         logger.exception("Failed to sync stored OPENAI_API_KEY")
 
@@ -509,6 +515,14 @@ async def update_settings(request: SettingsUpdateRequest) -> SettingsResponse:
         values: dict[str, str | None] = {}
         if request.api_key is not None:
             api_key = request.api_key.strip()
+            if not api_key and not await asyncio.to_thread(delete_credential):
+                # The credential store is the fallback a later load reads when
+                # no key is stored — leaving it behind would resurrect the
+                # cleared key, so the clear must fail instead of half-applying.
+                raise HTTPException(
+                    status_code=500,
+                    detail="Could not remove the stored credential — the API key was not cleared.",
+                )
             values["OPENAI_API_KEY"] = protect_secret(api_key) or None
             if api_key:
                 os.environ["OPENAI_API_KEY"] = api_key
@@ -526,13 +540,11 @@ async def update_settings(request: SettingsUpdateRequest) -> SettingsResponse:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
-            # Mirror before reloading: the credential store is the fallback a
-            # reload would read when the settings file has no key, so clearing
-            # must delete it first or the key would come back.
-            if request.api_key is not None:
-                if api_key:
-                    await asyncio.to_thread(write_credential, api_key)
-                else:
+            if request.api_key is not None and api_key:
+                # Keep the backup in sync: if the mirror write fails, drop the
+                # old credential rather than leave an outdated key behind that
+                # recovery would resurface after an app-data reset.
+                if not await asyncio.to_thread(write_credential, api_key):
                     await asyncio.to_thread(delete_credential)
             await asyncio.to_thread(reload_settings)
 

@@ -178,21 +178,25 @@ def read_credential() -> str:
         return ""
 
 
-def write_credential(value: str) -> None:
-    """Mirror ``value`` into the OS credential store (best effort)."""
+def write_credential(value: str) -> bool:
+    """Mirror ``value`` into the OS credential store. Returns success."""
     if not value or os.name != "nt":
-        return
+        return True
     try:
         _cred_write(value)
+        return True
     except Exception:
         logger.exception("Failed to write the stored credential")
+        return False
 
 
-def delete_credential() -> None:
-    """Drop the mirrored credential (best effort)."""
+def delete_credential() -> bool:
+    """Drop the mirrored credential. Returns success."""
     if os.name != "nt":
-        return
+        return True
     try:
         _cred_delete()
+        return True
     except Exception:
         logger.exception("Failed to delete the stored credential")
+        return False
