@@ -252,9 +252,10 @@ async fn install_update(
             Ok(Err(rx)) => {
                 // Keep update attempts blocked until the old process is
                 // confirmed dead, then restore the backend so the app stays
-                // usable. No upper bound here — kill() already succeeded, so
-                // the process will exit eventually; a second timeout would
-                // leave updates blocked forever even after it does.
+                // usable. No upper bound here — the exit listener stays
+                // installed, so the drain task fires the receiver when the
+                // child exits (whether kill() took or not); a second timeout
+                // would leave updates blocked forever even after it does.
                 let app = app.clone();
                 let stopping = stopping.clone();
                 tauri::async_runtime::spawn(async move {
@@ -262,6 +263,13 @@ async fn install_update(
                         .await
                         .unwrap_or(false);
                     if dead {
+                        // The orphan's Terminated fired — drop any lost-child
+                        // marker so a retry isn't refused on a stale flag.
+                        if let Ok(mut lost) =
+                            app.state::<SidecarState>().lost_child_termination.lock()
+                        {
+                            lost.take();
+                        }
                         // Hold the gate through the respawn so a retry can't
                         // launch an installer while the backend is coming back
                         // up, then clear it regardless — the killed process is
@@ -443,20 +451,15 @@ fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, Stri
         return Ok(None);
     }
     if kill_failed {
-        // A live process that wouldn't take the kill emits no Terminated
-        // event, so nothing would ever fire the receiver. kill() consumed
-        // the handle, so it can't be handed back — keep its termination
-        // flag so a retry can confirm the exit instead of assuming the
-        // backend is gone. The caller releases the update gate.
+        // kill() could not be confirmed, so the process may still be running.
+        // The handle is consumed either way — keep its Terminated flag as the
+        // lost-child marker so an empty slot is never read as "backend
+        // stopped", and leave the listener installed so the caller's
+        // supervised wait still learns when the orphan exits and can restore
+        // the backend it took down for the update.
         if let Ok(mut lost) = state.lost_child_termination.lock() {
             *lost = Some(terminated);
         }
-        if let Ok(mut listener) = state.exit_listener.lock() {
-            listener.take();
-        }
-        return Err(
-            "Could not stop the backend — restart OpenChat before retrying.".to_string(),
-        );
     }
     Ok(Some(rx))
 }

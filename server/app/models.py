@@ -178,9 +178,24 @@ class DirectChatRequest(BaseModel):
     def _cap_total_image_bytes(self) -> "DirectChatRequest":
         # Per-image caps alone let 200 messages x 5 images exceed what a
         # single upstream call should carry — bound the cumulative payload.
+        # Mirrors _build_direct_chat_messages: when image attachments exist,
+        # the latest user turn's embedded pixels are dropped upstream, so
+        # they must not be counted here either.
+        last_user_index = next(
+            (
+                index
+                for index in range(len(self.messages) - 1, -1, -1)
+                if self.messages[index].role == "user"
+            ),
+            -1,
+        )
+        has_image_attachments = any(
+            attachment.is_image for attachment in self.attachments
+        )
         total_bytes = sum(
             base64_decoded_len(image.content)
-            for message in self.messages
+            for index, message in enumerate(self.messages)
+            if not (index == last_user_index and has_image_attachments)
             for image in message.images
             if image.content
         ) + sum(
