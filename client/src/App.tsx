@@ -2140,6 +2140,7 @@ function App() {
       URL.revokeObjectURL(url);
       directThumbUrlsRef.current.delete(url);
     }
+    setEnlargedImage((current) => (current && urls.includes(current.src) ? null : current));
   };
 
   // Release any remaining object URLs when the app unmounts.

@@ -1753,6 +1753,7 @@ body {
   padding: 24px;
   background: var(--th-ink-21);
   backdrop-filter: blur(8px);
+  outline: none;
 }
 
 .image-lightbox-image {
