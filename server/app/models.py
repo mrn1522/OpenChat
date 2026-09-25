@@ -126,10 +126,10 @@ class DirectChatImageMeta(BaseModel):
 
     @model_validator(mode="after")
     def _validate_content(self) -> "DirectChatImageMeta":
-        if self.content is None:
-            return self
         if self.content_type not in SUPPORTED_IMAGE_TYPES:
             raise ValueError(f"unsupported image type: {self.content_type}")
+        if self.content is None:
+            return self
         try:
             decoded = base64.b64decode(self.content, validate=True)
         except (binascii.Error, ValueError) as exc:

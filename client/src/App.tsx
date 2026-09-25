@@ -786,6 +786,9 @@ function App() {
   // Set on unmount so late image reads revoke their object URLs instead of
   // committing state to a dead component.
   const directUnmountedRef = useRef(false);
+  // Mirror of activePage for the async send path — navigation away from
+  // Direct Chat during the pre-request read wait cancels the pending send.
+  const activePageRef = useRef(activePage);
 
   useEffect(() => {
     mountedRef.current = true;
@@ -1434,6 +1437,7 @@ function App() {
   }, [isDirectSettingsOpen]);
 
   useEffect(() => {
+    activePageRef.current = activePage;
     if (activePage === "direct") return;
     if (!isDirectRunning) return;
     directStreamControllerRef.current?.abort();
@@ -2107,12 +2111,17 @@ function App() {
 
   // Release any remaining object URLs when the app unmounts.
   useEffect(
-    () => () => {
-      directUnmountedRef.current = true;
-      for (const url of directThumbUrlsRef.current) {
-        URL.revokeObjectURL(url);
-      }
-      directThumbUrlsRef.current.clear();
+    () => {
+      // StrictMode remounts run cleanup then setup again — reset the flag so
+      // dev-mode image reads aren't discarded as post-unmount work.
+      directUnmountedRef.current = false;
+      return () => {
+        directUnmountedRef.current = true;
+        for (const url of directThumbUrlsRef.current) {
+          URL.revokeObjectURL(url);
+        }
+        directThumbUrlsRef.current.clear();
+      };
     },
     []
   );
@@ -2211,17 +2220,21 @@ function App() {
       const trimmedPrompt = directPrompt.trim();
       setDirectPrompt("");
       // A pasted image can still be reading when Send fires — wait for this
-      // session's reads so the outgoing turn includes them. Reads queued by a
-      // previous session (pre-reset) are ignored, not awaited.
-      const pendingReads = directAttachmentReadsRef.current.filter(
-        (entry) => entry.generation === sendGeneration
-      );
-      if (pendingReads.length > 0) {
+      // session's reads so the outgoing turn includes them, draining until no
+      // same-generation read remains (images pasted during the wait count too).
+      // Reads queued by a previous session (pre-reset) are ignored.
+      for (;;) {
+        const pendingReads = directAttachmentReadsRef.current.filter(
+          (entry) => entry.generation === sendGeneration
+        );
+        if (pendingReads.length === 0) break;
         await Promise.allSettled(pendingReads.map((entry) => entry.task));
       }
-      // The session may have been reset or rehydrated while reads settled;
-      // the prompt/model/directMessages captured above belong to it, so bail.
+      // The session may have been reset or rehydrated while reads settled, or
+      // the user navigated away — the captured prompt/model/messages belong
+      // to the direct page at click time, so bail in either case.
       if (sendGeneration !== directAttachmentGenerationRef.current) return;
+      if (activePageRef.current !== "direct") return;
       const attachments = directAttachmentsRef.current;
       const promptText =
         trimmedPrompt || (attachments.some(isImageAttachment) ? "What's in this image?" : "");
