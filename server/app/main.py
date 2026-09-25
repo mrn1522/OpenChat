@@ -32,7 +32,13 @@ from app.chat_store import (
     save_workflow_record,
 )
 from app.config import reload_settings, settings, settings_env_file
-from app.secrets_store import DPAPI_PREFIX, protect_secret
+from app.secrets_store import (
+    DPAPI_PREFIX,
+    delete_credential,
+    protect_secret,
+    read_credential,
+    write_credential,
+)
 from app.llm import (
     MODEL_ID_PATTERN,
     aclose_clients,
@@ -450,24 +456,34 @@ def _upsert_env_values(path: Path, values: dict[str, str | None]) -> None:
 
 
 def _protect_api_key_at_rest() -> None:
-    """Re-write a plaintext OPENAI_API_KEY in the settings file DPAPI-encrypted.
+    """Keep the stored OPENAI_API_KEY protected, restoring it when missing.
 
-    No-op off Windows; on Windows this runs once at startup so keys saved by
-    older builds are upgraded without a settings round-trip.
+    No-op off Windows; on Windows this runs once at startup. A plaintext key
+    saved by an older build is upgraded to DPAPI form without a settings
+    round-trip, and a missing key is written back from the OS credential
+    store — e.g. after a reinstall wiped the app data directory.
     """
     if os.name != "nt":
         return
     env_file = settings_env_file()
-    if not env_file.exists():
-        return
-    stored = (dotenv_values(env_file).get("OPENAI_API_KEY") or "").strip()
-    if not stored or stored.startswith(DPAPI_PREFIX):
-        return
+    stored = (
+        (dotenv_values(env_file).get("OPENAI_API_KEY") or "").strip()
+        if env_file.exists()
+        else ""
+    )
     try:
-        _upsert_env_values(env_file, {"OPENAI_API_KEY": protect_secret(stored)})
-        logger.info("Encrypted stored OPENAI_API_KEY at rest")
+        if stored and not stored.startswith(DPAPI_PREFIX):
+            _upsert_env_values(env_file, {"OPENAI_API_KEY": protect_secret(stored)})
+            logger.info("Encrypted stored OPENAI_API_KEY at rest")
+        elif not stored:
+            recovered = read_credential().strip()
+            if recovered:
+                _upsert_env_values(
+                    env_file, {"OPENAI_API_KEY": protect_secret(recovered)}
+                )
+                logger.info("Restored OPENAI_API_KEY from the OS credential store")
     except Exception:
-        logger.exception("Failed to encrypt stored OPENAI_API_KEY")
+        logger.exception("Failed to sync stored OPENAI_API_KEY")
 
 
 def _settings_response() -> SettingsResponse:
@@ -510,6 +526,14 @@ async def update_settings(request: SettingsUpdateRequest) -> SettingsResponse:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
+            # Mirror before reloading: the credential store is the fallback a
+            # reload would read when the settings file has no key, so clearing
+            # must delete it first or the key would come back.
+            if request.api_key is not None:
+                if api_key:
+                    await asyncio.to_thread(write_credential, api_key)
+                else:
+                    await asyncio.to_thread(delete_credential)
             await asyncio.to_thread(reload_settings)
 
     return _settings_response()

@@ -6,6 +6,11 @@ cipher to the current Windows user, so the file is unreadable by other users
 or after being copied elsewhere. On other platforms values pass through
 unchanged (``secrets_store`` is a no-op there and ``.env`` keeps its 0600
 permissions).
+
+On Windows the key is additionally mirrored into Windows Credential Manager
+so it survives the app-data directory being recreated — reinstalls that wipe
+``%APPDATA%\\com.openchat.desktop`` no longer force a settings round-trip.
+Other platforms have no managed credential store here and are no-ops.
 """
 
 import base64
@@ -91,3 +96,103 @@ def unprotect_secret(value: str) -> str:
     except Exception:
         logger.exception("Failed to decrypt stored secret; treating it as unset")
         return ""
+
+
+CREDENTIAL_TARGET = "OpenChat/openrouter-api-key"
+
+_CRED_TYPE_GENERIC = 1
+_CRED_PERSIST_LOCAL_MACHINE = 2
+_ERROR_NOT_FOUND = 1168
+
+
+class _Credential(ctypes.Structure):
+    # CREDENTIALW from wincred.h; fields the code never sets stay zeroed.
+    _fields_ = [
+        ("Flags", ctypes.wintypes.DWORD),
+        ("Type", ctypes.wintypes.DWORD),
+        ("TargetName", ctypes.wintypes.LPWSTR),
+        ("Comment", ctypes.wintypes.LPWSTR),
+        ("LastWritten", ctypes.wintypes.FILETIME),
+        ("CredentialBlobSize", ctypes.wintypes.DWORD),
+        ("CredentialBlob", ctypes.POINTER(ctypes.c_char)),
+        ("Persist", ctypes.wintypes.DWORD),
+        ("AttributeCount", ctypes.wintypes.DWORD),
+        ("Attributes", ctypes.c_void_p),
+        ("TargetAlias", ctypes.wintypes.LPWSTR),
+        ("UserName", ctypes.wintypes.LPWSTR),
+    ]
+
+
+def _advapi32() -> "ctypes.WinDLL":
+    return ctypes.WinDLL("advapi32", use_last_error=True)
+
+
+def _cred_read() -> str:
+    advapi32 = _advapi32()
+    cred_ptr = ctypes.POINTER(_Credential)()
+    if not advapi32.CredReadW(
+        CREDENTIAL_TARGET, _CRED_TYPE_GENERIC, 0, ctypes.byref(cred_ptr)
+    ):
+        if ctypes.get_last_error() == _ERROR_NOT_FOUND:
+            return ""
+        raise ctypes.WinError(ctypes.get_last_error())
+    try:
+        blob = cred_ptr.contents.CredentialBlob
+        return ctypes.string_at(blob, cred_ptr.contents.CredentialBlobSize).decode(
+            "utf-8"
+        )
+    finally:
+        advapi32.CredFree(cred_ptr)
+
+
+def _cred_write(value: str) -> None:
+    blob = ctypes.create_string_buffer(value.encode("utf-8"))
+    cred = _Credential(
+        Type=_CRED_TYPE_GENERIC,
+        TargetName=CREDENTIAL_TARGET,
+        # Exclude create_string_buffer's trailing NUL from the stored blob.
+        CredentialBlobSize=len(blob.raw) - 1,
+        CredentialBlob=ctypes.cast(blob, ctypes.POINTER(ctypes.c_char)),
+        Persist=_CRED_PERSIST_LOCAL_MACHINE,
+        UserName="openchat",
+    )
+    if not _advapi32().CredWriteW(ctypes.byref(cred), 0):
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def _cred_delete() -> None:
+    if not _advapi32().CredDeleteW(CREDENTIAL_TARGET, _CRED_TYPE_GENERIC, 0):
+        if ctypes.get_last_error() == _ERROR_NOT_FOUND:
+            return
+        raise ctypes.WinError(ctypes.get_last_error())
+
+
+def read_credential() -> str:
+    """Return the API key mirrored in the OS credential store, or ""."""
+    if os.name != "nt":
+        return ""
+    try:
+        return _cred_read()
+    except Exception:
+        logger.exception("Failed to read the stored credential")
+        return ""
+
+
+def write_credential(value: str) -> None:
+    """Mirror ``value`` into the OS credential store (best effort)."""
+    if not value or os.name != "nt":
+        return
+    try:
+        _cred_write(value)
+    except Exception:
+        logger.exception("Failed to write the stored credential")
+
+
+def delete_credential() -> None:
+    """Drop the mirrored credential (best effort)."""
+    if os.name != "nt":
+        return
+    try:
+        _cred_delete()
+    except Exception:
+        logger.exception("Failed to delete the stored credential")

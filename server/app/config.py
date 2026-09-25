@@ -5,7 +5,7 @@ from dotenv import dotenv_values
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
-from app.secrets_store import unprotect_secret
+from app.secrets_store import read_credential, unprotect_secret
 
 
 class Settings(BaseSettings):
@@ -57,6 +57,10 @@ def _load_settings() -> Settings:
         if not configured_history_path:
             loaded.openchat_history_db_path = str(data_dir / "openchat_history.db")
     loaded.openai_api_key = unprotect_secret(loaded.openai_api_key)
+    if not loaded.openai_api_key.strip():
+        # The OS credential store outlives the settings file, so it restores
+        # the key after a reinstall wiped the app data directory.
+        loaded.openai_api_key = read_credential()
     return loaded
 
 
