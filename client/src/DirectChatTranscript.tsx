@@ -8,6 +8,7 @@ const ESTIMATED_MESSAGE_HEIGHT_PX = 120;
 const ESTIMATED_PENDING_HEIGHT_PX = 72;
 const OVERSCAN_COUNT = 6;
 const STICK_TO_BOTTOM_THRESHOLD_PX = 96;
+const BOTTOM_SCROLL_GAP_PX = 40;
 
 type TranscriptRow =
   | { kind: "message"; key: string; message: DirectChatMessage; index: number }
@@ -101,6 +102,8 @@ function DirectChatTranscript({ messages, isRunning }: DirectChatTranscriptProps
     getScrollElement: () => parentRef.current,
     estimateSize,
     overscan: OVERSCAN_COUNT,
+    paddingEnd: BOTTOM_SCROLL_GAP_PX,
+    scrollPaddingEnd: BOTTOM_SCROLL_GAP_PX,
     getItemKey: (index) => rows[index]?.key ?? index,
   });
 

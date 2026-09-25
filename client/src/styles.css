@@ -1620,9 +1620,11 @@ body {
   overscroll-behavior: contain;
   scrollbar-width: thin;
   scrollbar-color: var(--th-edge-15) transparent;
-  /* Blend the log into the fixed composer: rows fade out near the edges. */
-  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - 44px), transparent 100%);
-  mask-image: linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - 44px), transparent 100%);
+  /* Blend the log into the fixed composer: rows fade out near the edges.
+     The bottom band stays inside the scroll gap so resting text keeps
+     full contrast. */
+  -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - 28px), transparent 100%);
+  mask-image: linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - 28px), transparent 100%);
 }
 
 /* Slim, buttonless scrollbar so the chrome stays out of the way. */
