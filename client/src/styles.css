@@ -302,11 +302,21 @@ body {
 }
 
 /* Direct chat behaves like a chat app: the header/model row stays put,
-   the transcript scrolls between it and the always-visible composer. */
+   the transcript scrolls between it and the always-visible composer. The
+   shell only scrolls itself when the fixed rows cannot fit (short or
+   high-zoom viewports), so the composer stays reachable. */
 .app-shell.direct-shell {
+  min-height: 0;
   height: 100vh;
   height: 100dvh;
-  overflow: hidden;
+  overflow-x: hidden;
+  overflow-y: auto;
+}
+
+/* The transcript row stays bounded at every width so the composer keeps
+   its place inside the viewport-locked shell. */
+.app-shell.direct-shell:has(> .page-top) {
+  grid-template-rows: auto minmax(0, 1fr);
 }
 
 .app-shell.direct-shell > .main-column {
@@ -1551,6 +1561,15 @@ body {
   padding: 12px;
 }
 
+/* The pinned composer sits at the shell's bottom edge, so its settings
+   popover opens upward and scrolls internally on short viewports. */
+.direct-composer-panel .composer-settings-popover {
+  top: auto;
+  bottom: calc(100% + 10px);
+  max-height: min(400px, calc(100dvh - 140px));
+  overflow-y: auto;
+}
+
 .direct-chat-header {
   display: flex;
   justify-content: space-between;
@@ -1607,6 +1626,7 @@ body {
 }
 
 /* Slim, buttonless scrollbar so the chrome stays out of the way. */
+.app-shell.direct-shell::-webkit-scrollbar,
 .direct-chat-transcript::-webkit-scrollbar,
 .direct-chat-transcript-virtual::-webkit-scrollbar,
 .direct-composer-panel textarea::-webkit-scrollbar {
@@ -1614,6 +1634,7 @@ body {
   height: 6px;
 }
 
+.app-shell.direct-shell::-webkit-scrollbar-button,
 .direct-chat-transcript::-webkit-scrollbar-button,
 .direct-chat-transcript-virtual::-webkit-scrollbar-button,
 .direct-composer-panel textarea::-webkit-scrollbar-button {
@@ -1622,12 +1643,14 @@ body {
   height: 0;
 }
 
+.app-shell.direct-shell::-webkit-scrollbar-track,
 .direct-chat-transcript::-webkit-scrollbar-track,
 .direct-chat-transcript-virtual::-webkit-scrollbar-track,
 .direct-composer-panel textarea::-webkit-scrollbar-track {
   background: transparent;
 }
 
+.app-shell.direct-shell::-webkit-scrollbar-thumb,
 .direct-chat-transcript::-webkit-scrollbar-thumb,
 .direct-chat-transcript-virtual::-webkit-scrollbar-thumb,
 .direct-composer-panel textarea::-webkit-scrollbar-thumb {
@@ -1635,6 +1658,7 @@ body {
   border-radius: 999px;
 }
 
+.app-shell.direct-shell::-webkit-scrollbar-thumb:hover,
 .direct-chat-transcript::-webkit-scrollbar-thumb:hover,
 .direct-chat-transcript-virtual::-webkit-scrollbar-thumb:hover,
 .direct-composer-panel textarea::-webkit-scrollbar-thumb:hover {
