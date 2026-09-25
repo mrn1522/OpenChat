@@ -51,6 +51,7 @@ import {
   fetchChatHistory,
   fetchChatHistoryDetail,
   fetchModels,
+  fetchServiceTiers,
   fetchWorkflows,
   getAppVersion,
   getSettings,
@@ -80,6 +81,7 @@ import type {
   RunRequest,
   SavedWorkflow,
   SavedWorkflowConfig,
+  ServiceTier,
   SourceAgentSpec,
   SourceModelResult,
   StreamEvent,
@@ -285,6 +287,11 @@ const ORCHESTRATION_FLOW: Array<{ id: OrchestrationStep; label: string; detail: 
 
 const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ["max", "xhigh", "high", "medium", "low", "minimal", "none"];
 const DEBATE_MODE_OPTIONS: DebateMode[] = ["off", "partial", "full"];
+const SERVICE_TIER_LABELS: Record<ServiceTier, string> = {
+  default: "Default",
+  flex: "Flex · lower cost",
+  priority: "Priority · faster",
+};
 const OPENROUTER_TOKEN_LIMIT = 10_000;
 const MAX_ATTACHMENTS = 5;
 const MAX_ATTACHMENT_SIZE_BYTES = 262_144;
@@ -638,6 +645,13 @@ function App() {
   const [catalog, setCatalog] = useState<OpenRouterModel[]>([]);
   const [catalogError, setCatalogError] = useState<string | null>(null);
   const [isCatalogLoading, setIsCatalogLoading] = useState(false);
+
+  // Per-model service tiers: `serviceTiersByModel` caches which non-default
+  // tiers each model exposes (absent = not yet fetched, [] = none);
+  // `serviceTierByModel` holds the user's selection per model.
+  const [serviceTiersByModel, setServiceTiersByModel] = useState<Record<string, ServiceTier[]>>({});
+  const [serviceTierByModel, setServiceTierByModel] = useState<Record<string, ServiceTier>>({});
+  const serviceTierFetchInFlightRef = useRef<Set<string>>(new Set());
 
   const [activePicker, setActivePicker] = useState<PickerKind | null>(null);
   const [pickerQuery, setPickerQuery] = useState("");
@@ -1078,6 +1092,82 @@ function App() {
     ? filteredModels.find((model) => model.id === focusedModelId) ?? null
     : null;
 
+  const modelsNeedingTierLookup = useMemo(() => {
+    const ids = new Set<string>(sourceModels);
+    if (fusionModel) ids.add(fusionModel);
+    if (directModel) ids.add(directModel);
+    if (focusedModelId) ids.add(focusedModelId);
+    return [...ids];
+  }, [sourceModels, fusionModel, directModel, focusedModelId]);
+
+  // Lazily discover non-default service tiers for every model in view;
+  // results (including "none") are cached so each model is fetched once.
+  useEffect(() => {
+    let isActive = true;
+    for (const modelId of modelsNeedingTierLookup) {
+      if (modelId in serviceTiersByModel || serviceTierFetchInFlightRef.current.has(modelId)) {
+        continue;
+      }
+      serviceTierFetchInFlightRef.current.add(modelId);
+      fetchServiceTiers(modelId)
+        .then((tiers) => {
+          if (isActive) {
+            setServiceTiersByModel((prev) => ({ ...prev, [modelId]: tiers }));
+          }
+        })
+        .catch(() => {
+          // Discovery failures hide the dropdown rather than blocking the app.
+          if (isActive) {
+            setServiceTiersByModel((prev) => ({ ...prev, [modelId]: [] }));
+          }
+        })
+        .finally(() => {
+          serviceTierFetchInFlightRef.current.delete(modelId);
+        });
+    }
+    return () => {
+      isActive = false;
+    };
+  }, [modelsNeedingTierLookup, serviceTiersByModel]);
+
+  const activeServiceTierSelection = useMemo(() => {
+    const relevant = new Set<string>(sourceModels);
+    if (fusionModel) relevant.add(fusionModel);
+    const entries = Object.entries(serviceTierByModel).filter(
+      ([model, tier]) => relevant.has(model) && tier !== "default"
+    );
+    return Object.fromEntries(entries) as Record<string, ServiceTier>;
+  }, [serviceTierByModel, sourceModels, fusionModel]);
+
+  const renderServiceTierSelect = (modelId: string, disabled: boolean) => {
+    const tiers = serviceTiersByModel[modelId];
+    if (!tiers || tiers.length === 0) return null;
+    return (
+      <label className="service-tier-control">
+        <span className="service-tier-label">Tier</span>
+        <select
+          className="service-tier-select"
+          aria-label={`Service tier for ${modelId}`}
+          value={serviceTierByModel[modelId] ?? "default"}
+          disabled={disabled}
+          onChange={(event) =>
+            setServiceTierByModel((prev) => ({
+              ...prev,
+              [modelId]: event.target.value as ServiceTier,
+            }))
+          }
+        >
+          <option value="default">{SERVICE_TIER_LABELS.default}</option>
+          {tiers.map((tier) => (
+            <option key={tier} value={tier}>
+              {SERVICE_TIER_LABELS[tier] ?? tier}
+            </option>
+          ))}
+        </select>
+      </label>
+    );
+  };
+
   const isOptimizationReviewPending = pendingOriginalPrompt !== null && (
     pendingOptimizedPrompt !== null || pendingPersonaAssignments.length > 0
   );
@@ -1325,6 +1415,7 @@ function App() {
     setAgentCounts({});
     setActiveRuntimeAgents([]);
     setFusionModel("");
+    setServiceTierByModel({});
     setTemperature(1.0);
     setReasoningEffort("medium");
     setDebateMode("partial");
@@ -1370,6 +1461,7 @@ function App() {
           }));
     setActiveRuntimeAgents(hydratedAgents);
     setFusionModel(chat.request.fusion_model);
+    setServiceTierByModel(chat.request.service_tiers ?? {});
     setDebateMode(chat.request.debate_mode ?? "partial");
     setTemperature(chat.request.temperature ?? 1.0);
     setWebSearchEnabled(chat.request.web_search_enabled ?? false);
@@ -1405,7 +1497,15 @@ function App() {
 
   const hydrateDirectFromHistory = (chat: ChatHistoryDetail) => {
     setActivePage("direct");
-    setDirectModel(chat.request.fusion_model || chat.request.source_models[0] || "");
+    const hydratedDirectModel = chat.request.fusion_model || chat.request.source_models[0] || "";
+    setDirectModel(hydratedDirectModel);
+    const hydratedDirectTier = chat.request.service_tiers?.[hydratedDirectModel];
+    setServiceTierByModel((prev) => ({
+      ...prev,
+      ...(hydratedDirectModel && hydratedDirectTier
+        ? { [hydratedDirectModel]: hydratedDirectTier }
+        : {}),
+    }));
     setDirectPrompt("");
     setDirectAttachments([]);
     setIsDirectSettingsOpen(false);
@@ -1489,6 +1589,7 @@ function App() {
         exclude: false,
       },
       attachments: attachments.map(({ id: _id, ...attachment }) => attachment),
+      service_tiers: activeServiceTierSelection,
     };
 
     try {
@@ -1605,6 +1706,7 @@ function App() {
     setDebateMode(config.debate_mode);
     setWebSearchEnabled(config.web_search_enabled);
     setPersonaEnabled(config.persona_enabled ?? false);
+    setServiceTierByModel(config.service_tiers ?? {});
     setAttachments([]);
   };
 
@@ -1664,6 +1766,7 @@ function App() {
           debate_mode: debateMode,
           web_search_enabled: webSearchEnabled,
           persona_enabled: personaEnabled,
+          service_tiers: activeServiceTierSelection,
           attachments: attachments.map((attachment) => ({
             name: attachment.name,
             size: attachment.size,
@@ -1850,6 +1953,7 @@ function App() {
             exclude: false,
           },
           attachments: directAttachments.map(({ id: _id, ...attachment }) => attachment),
+          service_tier: serviceTierByModel[directModel] ?? undefined,
         },
         (event) => onDirectEvent(event, requestId),
         controller.signal
@@ -2032,6 +2136,7 @@ function App() {
         },
         source_results: sourceResults,
         critique_output: critiqueOutput,
+        service_tier: serviceTierByModel[fusionModel] ?? undefined,
       });
 
       setFusionOutput(result.content);
@@ -2047,6 +2152,8 @@ function App() {
 
   const renderPicker = () => {
     if (!activePicker) return null;
+
+    const focusedTiers = focusedModel ? serviceTiersByModel[focusedModel.id] ?? [] : [];
 
     return (
       <div className="model-picker-popover" role="dialog" aria-label="Model picker" ref={pickerRef}>
@@ -2113,6 +2220,10 @@ function App() {
                   <div>
                     <dt>Output</dt>
                     <dd>{focusedModel.completionPrice ?? "—"}</dd>
+                  </div>
+                  <div>
+                    <dt>Tiers</dt>
+                    <dd>{focusedTiers.length > 0 ? focusedTiers.join(", ") : "—"}</dd>
                   </div>
                 </dl>
               </>
@@ -2373,6 +2484,7 @@ function App() {
                 <span className="muted">Select direct chat model</span>
               )}
             </button>
+            {directModel && renderServiceTierSelect(directModel, isDirectRunning)}
             <div className="picker-anchor">{activePicker === "direct" && renderPicker()}</div>
           </section>
         </div>
@@ -2504,27 +2616,30 @@ function App() {
                     )}
                     <p className={`agent-status status-${agentStatus}`}>Status: {formatAgentStatus(agentStatus)}</p>
                     {isFirstInstance ? (
-                      <div className="agent-count-control" role="group" aria-label={`Instance count for ${modelDisplay.name}`}>
-                        <button
-                          type="button"
-                          className="agent-count-btn"
-                          onClick={() => decrementAgentCount(agent.model)}
-                          disabled={count <= 1 || isRunning}
-                          aria-label="Decrease instance count"
-                        >
-                          −
-                        </button>
-                        <span className="agent-count-value" aria-live="polite">{count}</span>
-                        <button
-                          type="button"
-                          className="agent-count-btn"
-                          onClick={() => incrementAgentCount(agent.model)}
-                          disabled={count >= MAX_AGENT_COUNT || isRunning}
-                          aria-label="Increase instance count"
-                        >
-                          +
-                        </button>
-                      </div>
+                      <>
+                        <div className="agent-count-control" role="group" aria-label={`Instance count for ${modelDisplay.name}`}>
+                          <button
+                            type="button"
+                            className="agent-count-btn"
+                            onClick={() => decrementAgentCount(agent.model)}
+                            disabled={count <= 1 || isRunning}
+                            aria-label="Decrease instance count"
+                          >
+                            −
+                          </button>
+                          <span className="agent-count-value" aria-live="polite">{count}</span>
+                          <button
+                            type="button"
+                            className="agent-count-btn"
+                            onClick={() => incrementAgentCount(agent.model)}
+                            disabled={count >= MAX_AGENT_COUNT || isRunning}
+                            aria-label="Increase instance count"
+                          >
+                            +
+                          </button>
+                        </div>
+                        {renderServiceTierSelect(agent.model, isRunning)}
+                      </>
                     ) : (
                       <p className="agent-instance-label">Instance #{agent.id.split("#")[1] ?? ""}</p>
                     )}
@@ -2563,6 +2678,7 @@ function App() {
                 <span className="muted">Select fusion model</span>
               )}
             </button>
+            {fusionModel && renderServiceTierSelect(fusionModel, isRunning)}
             <div className="picker-anchor">{activePicker === "fusion" && renderPicker()}</div>
           </div>
         </section>

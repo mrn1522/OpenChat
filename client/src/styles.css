@@ -948,6 +948,34 @@ body {
   font-size: 0.79rem;
 }
 
+.service-tier-control {
+  margin-top: 8px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.service-tier-label {
+  color: var(--muted);
+  font-size: 0.72rem;
+  letter-spacing: 0.5px;
+  text-transform: uppercase;
+}
+
+.service-tier-select {
+  border: 1px solid var(--th-edge-12);
+  border-radius: 8px;
+  background: var(--th-ink-30);
+  color: inherit;
+  padding: 5px 8px;
+  font: inherit;
+  font-size: 0.8rem;
+}
+
+.service-tier-select:disabled {
+  opacity: 0.6;
+}
+
 .fusion-star {
   inline-size: 34px;
   block-size: 34px;

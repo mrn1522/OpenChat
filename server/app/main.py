@@ -35,6 +35,7 @@ from app.secrets_store import DPAPI_PREFIX, protect_secret
 from app.llm import (
     aclose_clients,
     build_client,
+    fetch_model_service_tiers,
     fetch_openrouter_models,
     generate_persona_assignments,
     optimize_prompt_text,
@@ -54,6 +55,7 @@ from app.models import (
     PromptOptimizeRequest,
     PromptOptimizeResponse,
     RunRequest,
+    ServiceTiersResponse,
     SettingsResponse,
     SettingsUpdateRequest,
     SourceAgentSpec,
@@ -234,6 +236,7 @@ class DebateJob:
     target_id: str
     target_model: str
     prompt: str
+    service_tier: str | None = None
 
 
 @dataclass(frozen=True)
@@ -265,6 +268,7 @@ def build_debate_jobs(
     source_by_agent: dict[str, SourceResult],
     agent_by_id: dict[str, SourceAgentSpec],
     user_prompt: str,
+    service_tier_by_model: dict[str, str] | None = None,
 ) -> list[DebateJob]:
     """Materialize independent debate jobs in stable pair order."""
     jobs: list[DebateJob] = []
@@ -293,6 +297,7 @@ def build_debate_jobs(
                 target_id=target_id,
                 target_model=target_result.model,
                 prompt=debate_prompt,
+                service_tier=(service_tier_by_model or {}).get(reviewer_model),
             )
         )
     return jobs
@@ -336,6 +341,7 @@ async def run_debate_jobs(
                     reasoning_effort=reasoning_effort,
                     reasoning_exclude=reasoning_exclude,
                     context="Debate",
+                    service_tier=job.service_tier,
                 )
         except Exception as exc:  # noqa: BLE001
             return DebateJobFailure(
@@ -637,6 +643,7 @@ async def run_stream(request: RunRequest):
             attachments=request.attachments,
             temperature_by_agent=source_temperature_by_agent,
             system_prompt_by_agent=source_system_prompt_by_agent,
+            service_tier_by_model=request.service_tiers,
         ):
             result_persona = persona_by_agent.get(result.agent_id or result.model)
             if result_persona is not None and result.persona is None:
@@ -700,6 +707,7 @@ async def run_stream(request: RunRequest):
                 source_by_agent=source_by_agent,
                 agent_by_id=agent_by_id,
                 user_prompt=request.prompt,
+                service_tier_by_model=request.service_tiers,
             )
 
             # Collect successes keyed by original pair order so the final
@@ -780,6 +788,7 @@ async def run_stream(request: RunRequest):
                 reasoning_effort=request.reasoning.effort,
                 reasoning_exclude=request.reasoning.exclude,
                 context="Fusion",
+                service_tier=request.service_tiers.get(request.fusion_model),
             )
         except Exception as exc:  # noqa: BLE001
             # Fusion is the terminal stage. Never let a provider failure tear
@@ -904,6 +913,7 @@ async def direct_chat_stream(request: DirectChatRequest):
                 reasoning_effort=request.reasoning.effort,
                 reasoning_exclude=request.reasoning.exclude,
                 attachments=request.attachments,
+                service_tier=request.service_tier,
             )
         except Exception as exc:  # noqa: BLE001
             yield sse("error", {"message": str(exc)})
@@ -945,6 +955,9 @@ async def direct_chat_stream(request: DirectChatRequest):
                     "persona_assignments_override": [],
                     "reasoning": request.reasoning.model_dump(),
                     "attachments": [attachment.model_dump() for attachment in request.attachments],
+                    "service_tiers": (
+                        {request.model: request.service_tier} if request.service_tier else {}
+                    ),
                 },
                 source_results=[
                     {
@@ -983,6 +996,29 @@ async def get_models() -> OpenRouterModelsResponse:
         raise HTTPException(status_code=502, detail=detail) from exc
     except httpx.HTTPError as exc:
         raise HTTPException(status_code=502, detail=f"OpenRouter models request failed: {exc}") from exc
+
+
+@app.get("/api/service-tiers/{model_id:path}", response_model=ServiceTiersResponse)
+async def get_service_tiers(model_id: str) -> ServiceTiersResponse:
+    """Return the non-default service tiers a model's providers expose.
+
+    Discovered from the model's endpoint roster — see
+    ``fetch_model_service_tiers``. An empty ``tiers`` list means no tier
+    endpoints exist and the caller should not offer tier selection.
+    """
+    model_id = model_id.strip()
+    if not model_id:
+        raise HTTPException(status_code=422, detail="Model id is required")
+    try:
+        tiers = await fetch_model_service_tiers(model_id)
+    except httpx.HTTPStatusError as exc:
+        detail = f"OpenRouter endpoints request failed: {exc.response.status_code}"
+        raise HTTPException(status_code=502, detail=detail) from exc
+    except httpx.HTTPError as exc:
+        raise HTTPException(
+            status_code=502, detail=f"OpenRouter endpoints request failed: {exc}"
+        ) from exc
+    return ServiceTiersResponse(model=model_id, tiers=tiers)
 
 
 @app.get("/api/chats", response_model=ChatHistoryListResponse)
@@ -1151,6 +1187,7 @@ async def regenerate_fusion(request: FusionRegenerateRequest) -> SynthesisResult
             reasoning_effort=request.reasoning.effort,
             reasoning_exclude=request.reasoning.exclude,
             context="Fusion regeneration",
+            service_tier=request.service_tier,
         )
     except Exception as exc:  # noqa: BLE001
         detail = _build_synthesis_error_message(
