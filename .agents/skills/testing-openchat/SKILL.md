@@ -6,7 +6,10 @@ description: Exercise first-run connection settings and isolated persistence thr
 # OpenChat settings testing
 
 ## Devin Secrets Needed
-None for configuration persistence tests: use a clearly fake API key. Real model generation requires an authorized OPENAI_API_KEY.
+- `OPENROUTER_TEST_API_KEY` (org scope) — real OpenRouter key for tests needing actual completions. Bind it in exec via `env={"OPENROUTER_TEST_API_KEY": "secret:org:OPENROUTER_TEST_API_KEY"}`, then pass to the backend as `OPENAI_API_KEY` (or paste it into the app's Connect OpenRouter settings).
+- Always use `openai/gpt-oss-20b` for real completions (cheap, fast, ~12 endpoints; it has NO flex/priority tier tags, so the tier dropdown correctly stays hidden for it). Tier-capable fixtures for tier tests: `google/gemini-2.5-flash` (flex+priority), `openai/gpt-5-mini` (flex only).
+- For real-completion tests that exercise a service tier, only ever send `flex` (cheapest) or omit `service_tier` (default). NEVER send `priority` — it is the pricier tier and must not be used in tests.
+- None needed for configuration persistence tests: use a clearly fake API key.
 
 ## Local runtime
 - Reuse server/.venv-desktop and client/node_modules if available; otherwise create a Python venv from server/requirements.txt and run npm ci in client/. The venv may exist but be empty — if `python -m app` fails with ModuleNotFoundError, run `.venv-desktop/bin/pip install -r requirements-desktop.txt`.
@@ -33,6 +36,14 @@ None for configuration persistence tests: use a clearly fake API key. Real model
 - `.env` lands in the data dir with 0600 (plaintext on Linux — DPAPI/`secrets_store` is Windows-only); masked hint `first6…last4` appears as the API-key input placeholder and in `api_key_hint`. Nothing may be written under server/.
 - Webview devtools: Ctrl+Shift+I opens the WebKitGTK inspector in debug builds; `window.__TAURI_INTERNALS__.invoke('install_update', {downloadUrl:'https://github.com/mrn1522/OpenChat/releases/download/v0.0.0/x.exe', sha256:'<64 hex>', fileName:'x.exe'})` must reject "In-app updating is only supported on Windows." — useful when api.github.com is rate-limited (403) and the UI install button can't render.
 - A clearly fake `sk-or-...` key still loads the model catalog (server fetches `/models` unauthenticated) and streams through the whole pipeline; upstream 401 errors are expected and differ from a missing-header failure — cross-check by curling OpenRouter with the same fake key.
+
+## Verifying request payloads without a real upstream key
+- Service-tier references below assume the tier feature (PR #44, targets `develop`): on branches without it `/api/service-tiers` 404s and requests carry no `service_tier`/`service_tiers`.
+- API route names: run = `POST /api/run/stream`, direct chat = `POST /api/direct-chat/stream`, fusion regenerate = `POST /api/fusion/regenerate` (`/api/run` 404s).
+- Orchestrated runs persist the validated `request.model_dump()` in sqlite at `<data-dir>/openchat_history.db`, table `conversations.request_json` — even for upstream-401 failures saved as `failed_fusion`. Direct chat saves a reconstructed request payload on success only; direct-chat failures and fusion regenerations persist nothing. Query `request_json` to verify parsed request values (e.g. `json_extract(request_json,'$.service_tiers')`); capture the raw HTTP request body when a test must verify which fields the client explicitly sent.
+- To prove what reaches OpenRouter, run a second backend with `OPENAI_BASE_URL=http://127.0.0.1:<stubport>` and `OPENAI_API_KEY=sk-stub` pointed at a ~30-line `http.server` stub that logs POST bodies and returns a canned chat-completion JSON (`{id,choices:[{message:{content}}]}`). Compare the logged bodies against expectations (e.g. `extra_body` keys like `service_tier`; the `default` tier is intentionally never sent).
+- GET `/api/service-tiers/{model_id}` fetches `{base}/models/{id}/endpoints` UNAUTHENTICATED — tier discovery works with a fake key. Useful fixtures: `google/gemini-2.5-flash`→[flex,priority], `openai/gpt-5-mini`→[flex] only, `openai/gpt-5`/`anthropic/claude-sonnet-4.5`→[]. Unknown models 502.
+- No UI route returns from the direct-chat page to fusion without resetting state (`Start new chat` clears everything); restore via the history page or a saved workflow instead.
 
 ## Clicking small UI targets
 - The desktop is typically 1600x1200 while the computer tool uses 1024x768 (1.5625 scale); screenshots show real pixels, so eyeballing icon positions can miss small targets like the 34px rail buttons by a few px.
