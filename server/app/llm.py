@@ -1,6 +1,7 @@
 import asyncio
 import json
 import logging
+import re
 import time
 from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any, TypeVar
@@ -157,6 +158,11 @@ def _drop_inflight_tier_fetch(
 # `google-vertex/global/priority`). "fast" is OpenAI's rename of the priority
 # tier and is reported back as "priority", so it normalizes here.
 _ENDPOINT_TAG_TIER_BY_SUFFIX = {"flex": "flex", "fast": "priority", "priority": "priority"}
+
+# OpenRouter model ids look like "<author>/<slug>[:variant]". Anything outside
+# this shape (path separators, query chars, traversal segments) must never be
+# interpolated into the endpoints URL.
+MODEL_ID_PATTERN = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*/[A-Za-z0-9][A-Za-z0-9._:-]*")
 
 
 def _shared_http() -> httpx.AsyncClient:
@@ -350,6 +356,8 @@ async def fetch_model_service_tiers(model_id: str) -> list[str]:
     entry when one exists. An empty list is a valid cached result — the model
     simply has no tier endpoints.
     """
+    if MODEL_ID_PATTERN.fullmatch(model_id) is None:
+        raise ValueError(f"Invalid model id: {model_id!r}")
     base_url = settings.openai_base_url.rstrip("/")
     endpoints_url = f"{base_url}/models/{model_id}/endpoints"
     cache_key = (base_url, model_id)
@@ -1174,6 +1182,7 @@ def _build_direct_chat_messages(
     resolved_system_prompt = (system_prompt or "").strip() or build_source_system_prompt(None)
 
     normalized_messages: list[dict[str, Any]] = [{"role": "system", "content": resolved_system_prompt}]
+    has_image_attachments = any(attachment.is_image for attachment in attachments)
     last_user_message_index = next(
         (
             index
@@ -1186,8 +1195,9 @@ def _build_direct_chat_messages(
     for index, message in enumerate(messages):
         # Prior image turns re-embed their pixels in the message so follow-up
         # requests keep earlier images in context. The latest turn's pixels
-        # arrive separately in `attachments` (handled below) — skipping them
-        # here avoids sending the same image twice.
+        # normally arrive separately in `attachments` (handled below) —
+        # skipping them here avoids sending the same image twice; callers that
+        # embed pixels only in the message keep them instead.
         embedded_image_parts = (
             [
                 {
@@ -1199,7 +1209,7 @@ def _build_direct_chat_messages(
                 for image in message.images
                 if image.content
             ]
-            if index != last_user_message_index
+            if index != last_user_message_index or not has_image_attachments
             else []
         )
         normalized_messages.append(

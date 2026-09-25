@@ -193,20 +193,48 @@ async fn install_update(
     if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("Installer integrity digest is missing or invalid.".to_string());
     }
-    let installer = tauri::async_runtime::spawn_blocking(move || {
+
+    // Claim the update gate before the download: overlapping calls write the
+    // same temp installer path, so a second call must be rejected before it
+    // can truncate the file the first call already verified. `stopping` stays
+    // set through the installer launch so no second installer can spawn; it
+    // is released on every early-return failure path below.
+    let stopping = app.state::<SidecarState>().stopping.clone();
+    if stopping
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("An update is already in progress.".to_string());
+    }
+
+    let installer = match tauri::async_runtime::spawn_blocking(move || {
         download_installer(&download_url, &file_name, &expected)
     })
     .await
-    .map_err(|e| format!("Installer download failed: {e}"))??;
+    {
+        Ok(Ok(installer)) => installer,
+        Ok(Err(e)) => {
+            stopping.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+        Err(e) => {
+            stopping.store(false, Ordering::SeqCst);
+            return Err(format!("Installer download failed: {e}"));
+        }
+    };
 
     let port = *app.state::<u16>();
-    let stopping = app.state::<SidecarState>().stopping.clone();
 
     // Stop the sidecar and wait for its Terminated event so the installer
-    // never writes over a still-locked openchat-server.exe. `stopping` stays
-    // set through the installer launch so a concurrent call can't slip past
-    // stop_sidecar and spawn a second installer.
-    if let Some(terminated) = stop_sidecar(&app.state::<SidecarState>())? {
+    // never writes over a still-locked openchat-server.exe.
+    let terminated = match stop_sidecar(&app.state::<SidecarState>()) {
+        Ok(terminated) => terminated,
+        Err(e) => {
+            stopping.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+    };
+    if let Some(terminated) = terminated {
         match tauri::async_runtime::spawn_blocking(move || {
             match terminated.recv_timeout(Duration::from_secs(5)) {
                 Ok(()) => Ok(()),
@@ -246,6 +274,7 @@ async fn install_update(
                 );
             }
             Err(_) => {
+                stopping.store(false, Ordering::SeqCst);
                 return Err(
                     "Could not confirm the backend stopped — restart OpenChat before retrying."
                         .to_string(),
@@ -356,21 +385,13 @@ fn restore_sidecar(app: &AppHandle, port: u16) -> Result<(), String> {
 
 // Kills the sidecar and returns a receiver that fires once the process has
 // actually terminated (its Terminated command event). Returns None when the
-// exit is already confirmed, and errors while a previous stop is still pending.
+// exit is already confirmed or no sidecar is running. The caller must already
+// hold the `stopping` gate — this function does not claim or release it.
 fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, String> {
     let mut slot = state
         .child
         .lock()
         .map_err(|_| "Sidecar state is unavailable.".to_string())?;
-    if state.stopping.load(Ordering::SeqCst) {
-        return Err(
-            "The backend is still shutting down — try again in a moment.".to_string(),
-        );
-    }
-    // Claim the gate while the child lock is held so only one call ever
-    // proceeds to the installer launch; it clears when a cancelled update
-    // restores the backend (a launched update exits the app anyway).
-    state.stopping.store(true, Ordering::SeqCst);
     let Some((child, terminated)) = slot.take() else {
         return Ok(None);
     };
@@ -381,17 +402,14 @@ fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, Stri
         // The slot was already emptied — put the running sidecar back so the
         // next attempt still finds (and kills) it instead of seeing no child.
         *slot = Some((child, terminated));
-        state.stopping.store(false, Ordering::SeqCst);
         return Err("Sidecar state is unavailable.".to_string());
     }
     let kill_failed = child.kill().is_err();
     // The drain task flips `terminated` on every Terminated — including an
     // exit that already happened, where kill() can still succeed but no event
     // is left to fire the receiver. When the flag is set there is nothing to
-    // wait for; a live process that wouldn't take the kill still owns the exe,
-    // so only a failed kill without confirmed death waits like a normal stop.
-    // A dead process whose event is still in flight gets a brief window to
-    // deliver it first.
+    // wait for. A dead process whose event is still in flight gets a brief
+    // window to deliver it first.
     let confirmed = terminated.load(Ordering::SeqCst)
         || (kill_failed
             && (rx.recv_timeout(Duration::from_millis(500)).is_ok()
@@ -401,6 +419,19 @@ fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, Stri
             listener.take();
         }
         return Ok(None);
+    }
+    if kill_failed {
+        // A live process that wouldn't take the kill emits no Terminated
+        // event, so nothing would ever fire the receiver. The handle is
+        // consumed by kill() either way, so it can't be handed back — just
+        // drop the listener and report the failure; the caller releases the
+        // gate instead of deadlocking every later update.
+        if let Ok(mut listener) = state.exit_listener.lock() {
+            listener.take();
+        }
+        return Err(
+            "Could not stop the backend — restart OpenChat before retrying.".to_string(),
+        );
     }
     Ok(Some(rx))
 }
