@@ -5,6 +5,10 @@ app-data directory. These tests exercise the wiring; the wincred calls
 themselves are no-ops off Windows.
 """
 
+import os
+
+import pytest
+
 import app.main as main_module
 from app.secrets_store import (
     delete_credential,
@@ -51,17 +55,44 @@ class TestSettingsCredentialMirror:
     def test_clear_surfaces_failed_credential_delete(self, client, monkeypatch):
         """A failed delete must not half-apply: a stale credential would
         resurrect the cleared key on the next settings reload."""
-        response = client.put("/api/settings", json={"api_key": "sk-or-test-key"})
-        assert response.status_code == 200
+        try:
+            response = client.put(
+                "/api/settings", json={"api_key": "sk-or-test-key"}
+            )
+            assert response.status_code == 200
 
-        monkeypatch.setattr(main_module, "delete_credential", lambda: False)
-        failed = client.put("/api/settings", json={"api_key": ""})
-        assert failed.status_code == 500
-        # Nothing was cleared — the stored key is still reported configured.
-        assert client.get("/api/settings").json()["api_key_configured"] is True
+            monkeypatch.setattr(main_module, "delete_credential", lambda: False)
+            failed = client.put("/api/settings", json={"api_key": ""})
+            assert failed.status_code == 500
+            # Nothing was cleared — the stored key is still reported configured.
+            assert client.get("/api/settings").json()["api_key_configured"] is True
+        finally:
+            monkeypatch.undo()
+            client.put("/api/settings", json={"api_key": ""})
 
-        monkeypatch.undo()
-        client.put("/api/settings", json={"api_key": ""})
+    def test_save_surfaces_failed_mirror_cleanup(self, client, monkeypatch):
+        """When the mirror write fails and the stale credential cannot be
+        dropped either, the save must fail before touching .env — otherwise
+        the old key would come back after an app-data reset."""
+        try:
+            response = client.put(
+                "/api/settings", json={"api_key": "sk-or-first"}
+            )
+            assert response.status_code == 200
+
+            monkeypatch.setattr(main_module, "write_credential", lambda v: False)
+            monkeypatch.setattr(main_module, "delete_credential", lambda: False)
+            failed = client.put(
+                "/api/settings", json={"api_key": "sk-or-second"}
+            )
+            assert failed.status_code == 500
+            # The save was rejected atomically: the previous key is still the
+            # one in effect.
+            assert os.environ["OPENAI_API_KEY"] == "sk-or-first"
+            assert client.get("/api/settings").json()["api_key_configured"] is True
+        finally:
+            monkeypatch.undo()
+            client.put("/api/settings", json={"api_key": ""})
 
     def test_failed_mirror_write_drops_stale_credential(
         self, client, monkeypatch
@@ -115,10 +146,12 @@ class TestCredentialFallback:
         # Fresh data dir with no .env and no inherited key env var.
         monkeypatch.setenv("OPENCHAT_DATA_DIR", str(tmp_path / "fresh"))
         monkeypatch.delenv("OPENAI_API_KEY", raising=False)
-        config.reload_settings()
-        assert config.settings.openai_api_key == "sk-or-restored"
-        monkeypatch.undo()
-        config.reload_settings()
+        try:
+            config.reload_settings()
+            assert config.settings.openai_api_key == "sk-or-restored"
+        finally:
+            monkeypatch.undo()
+            config.reload_settings()
 
     def test_env_key_wins_over_credential_store(self, tmp_path, monkeypatch):
         import app.config as config
@@ -126,13 +159,19 @@ class TestCredentialFallback:
         monkeypatch.setattr(config, "read_credential", lambda: "sk-or-stale")
         monkeypatch.setenv("OPENCHAT_DATA_DIR", str(tmp_path / "fresh"))
         monkeypatch.setenv("OPENAI_API_KEY", "sk-or-live")
-        config.reload_settings()
-        assert config.settings.openai_api_key == "sk-or-live"
-        monkeypatch.undo()
-        config.reload_settings()
+        try:
+            config.reload_settings()
+            assert config.settings.openai_api_key == "sk-or-live"
+        finally:
+            monkeypatch.undo()
+            config.reload_settings()
 
 
 class TestCredentialStoreNoOpOffWindows:
+    @pytest.mark.skipif(
+        os.name == "nt",
+        reason="would read and overwrite the real Windows Credential Manager",
+    )
     def test_public_helpers_are_safe_on_non_windows(self):
         assert read_credential() == ""
         assert write_credential("sk-or-test") is True

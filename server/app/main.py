@@ -37,6 +37,7 @@ from app.secrets_store import (
     delete_credential,
     protect_secret,
     read_credential,
+    unprotect_secret,
     write_credential,
 )
 from app.llm import (
@@ -472,6 +473,7 @@ def _protect_api_key_at_rest() -> None:
         else ""
     )
     try:
+        recovered = ""
         if stored and not stored.startswith(DPAPI_PREFIX):
             _upsert_env_values(env_file, {"OPENAI_API_KEY": protect_secret(stored)})
             logger.info("Encrypted stored OPENAI_API_KEY at rest")
@@ -482,12 +484,14 @@ def _protect_api_key_at_rest() -> None:
                     env_file, {"OPENAI_API_KEY": protect_secret(recovered)}
                 )
                 logger.info("Restored OPENAI_API_KEY from the OS credential store")
-        resolved = settings.openai_api_key.strip()
-        if resolved:
+        file_key = unprotect_secret(stored).strip() if stored else recovered
+        if file_key:
             # Back the key up in the credential store too: keys saved before
             # the mirror existed live only in .env, and a later app-data wipe
-            # would lose the sole copy.
-            write_credential(resolved)
+            # would lose the sole copy. An inherited OPENAI_API_KEY env var is
+            # deliberately not mirrored — it is not something the user saved,
+            # and persisting it would keep it alive after the env var is unset.
+            write_credential(file_key)
     except Exception:
         logger.exception("Failed to sync stored OPENAI_API_KEY")
 
@@ -523,6 +527,15 @@ async def update_settings(request: SettingsUpdateRequest) -> SettingsResponse:
                     status_code=500,
                     detail="Could not remove the stored credential — the API key was not cleared.",
                 )
+            if api_key and not await asyncio.to_thread(write_credential, api_key):
+                # A stale credential would resurrect the previous key after an
+                # app-data reset, so the save must fail unless the old
+                # credential can be dropped.
+                if not await asyncio.to_thread(delete_credential):
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Could not update the stored credential — the API key was not updated.",
+                    )
             values["OPENAI_API_KEY"] = protect_secret(api_key) or None
             if api_key:
                 os.environ["OPENAI_API_KEY"] = api_key
@@ -540,12 +553,6 @@ async def update_settings(request: SettingsUpdateRequest) -> SettingsResponse:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
-            if request.api_key is not None and api_key:
-                # Keep the backup in sync: if the mirror write fails, drop the
-                # old credential rather than leave an outdated key behind that
-                # recovery would resurface after an app-data reset.
-                if not await asyncio.to_thread(write_credential, api_key):
-                    await asyncio.to_thread(delete_credential)
             await asyncio.to_thread(reload_settings)
 
     return _settings_response()

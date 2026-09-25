@@ -15,6 +15,22 @@ import pytest
 from fastapi.testclient import TestClient
 
 
+@pytest.fixture(autouse=True, scope="session")
+def _isolate_credential_store():
+    import app.config as config
+    import app.main as main_module
+
+    # A separate patch context so a test-level monkeypatch.undo() restores
+    # these stubs rather than the real helpers — on Windows the real ones
+    # would overwrite/delete the developer's actual saved credential.
+    with pytest.MonkeyPatch.context() as isolated:
+        isolated.setattr(config, "read_credential", lambda: "")
+        isolated.setattr(main_module, "read_credential", lambda: "")
+        isolated.setattr(main_module, "write_credential", lambda value: True)
+        isolated.setattr(main_module, "delete_credential", lambda: True)
+        yield
+
+
 @pytest.fixture(scope="session")
 def client():
     from app.main import app
