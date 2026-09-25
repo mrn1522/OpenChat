@@ -44,6 +44,7 @@ from app.llm import (
     run_source_models,
 )
 from app.models import (
+    AttachmentInput,
     ChatHistoryDetail,
     ChatHistoryListResponse,
     DirectChatRequest,
@@ -868,6 +869,16 @@ async def run_stream(request: RunRequest):
     )
 
 
+def _history_attachment_payload(attachment: AttachmentInput) -> dict[str, Any]:
+    """Attachment shape persisted in history: image payloads are replaced
+    with a placeholder since multi-MB base64 is never needed to rehydrate
+    a chat record."""
+    payload = attachment.model_dump()
+    if attachment.is_image:
+        payload["content"] = f"[image data omitted: {attachment.size} bytes]"
+    return payload
+
+
 @app.post("/api/direct-chat/stream")
 async def direct_chat_stream(request: DirectChatRequest):
     try:
@@ -954,7 +965,10 @@ async def direct_chat_stream(request: DirectChatRequest):
                     "persona_enabled": False,
                     "persona_assignments_override": [],
                     "reasoning": request.reasoning.model_dump(),
-                    "attachments": [attachment.model_dump() for attachment in request.attachments],
+                    "attachments": [
+                        _history_attachment_payload(attachment)
+                        for attachment in request.attachments
+                    ],
                     "service_tiers": (
                         {request.model: request.service_tier} if request.service_tier else {}
                     ),

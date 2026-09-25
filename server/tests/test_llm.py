@@ -8,6 +8,7 @@ import app.llm as llm
 import app.main as main
 from app.config import settings
 from app.models import (
+    AttachmentInput,
     DirectChatMessage,
     OpenRouterModelsResponse,
     SourceAgentSpec,
@@ -292,6 +293,89 @@ class TestRunSourceModels:
 
         asyncio.run(run())
         assert cancelled.is_set()
+
+
+class TestBuildDirectChatMessages:
+    _messages = [
+        DirectChatMessage(role="user", content="first"),
+        DirectChatMessage(role="assistant", content="reply"),
+        DirectChatMessage(role="user", content="describe this"),
+    ]
+
+    def _image(self) -> AttachmentInput:
+        return AttachmentInput(
+            name="shot.png",
+            size=10,
+            content_type="image/png",
+            content="QUJD",
+        )
+
+    def test_no_attachments_keeps_string_content(self):
+        built = llm._build_direct_chat_messages(
+            messages=self._messages,
+            attachments=[],
+            system_prompt="sys",
+        )
+        assert built[0] == {"role": "system", "content": "sys"}
+        assert built[-1] == {"role": "user", "content": "describe this"}
+
+    def test_text_attachments_merge_into_last_user_message(self):
+        built = llm._build_direct_chat_messages(
+            messages=self._messages,
+            attachments=[
+                AttachmentInput(
+                    name="notes.txt",
+                    size=5,
+                    content_type="text/plain",
+                    content="hello",
+                )
+            ],
+            system_prompt="sys",
+        )
+        assert built[1]["content"] == "first"  # earlier turns untouched
+        last = built[-1]["content"]
+        assert isinstance(last, str)
+        assert "describe this" in last
+        assert "notes.txt" in last
+        assert "hello" in last
+
+    def test_image_attachments_build_multipart_content(self):
+        built = llm._build_direct_chat_messages(
+            messages=self._messages,
+            attachments=[self._image()],
+            system_prompt="sys",
+        )
+        last = built[-1]["content"]
+        assert isinstance(last, list)
+        assert last[0] == {"type": "text", "text": "describe this"}
+        assert last[1] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,QUJD"},
+        }
+
+    def test_mixed_attachments_merge_text_and_images(self):
+        built = llm._build_direct_chat_messages(
+            messages=self._messages,
+            attachments=[
+                AttachmentInput(
+                    name="notes.txt",
+                    size=5,
+                    content_type="text/plain",
+                    content="ctx",
+                ),
+                self._image(),
+            ],
+            system_prompt="sys",
+        )
+        last = built[-1]["content"]
+        assert isinstance(last, list)
+        assert last[0]["type"] == "text"
+        assert "ctx" in last[0]["text"]
+        assert last[1]["type"] == "image_url"
+
+    def test_prompt_with_attachments_skips_images(self):
+        prompt = llm._build_prompt_with_attachments("hello", [self._image()])
+        assert prompt == "hello"
 
 
 class TestDebateJobConcurrency:

@@ -372,11 +372,12 @@ async def fetch_model_service_tiers(model_id: str) -> list[str]:
 
 
 def _build_prompt_with_attachments(prompt: str, attachments: list[AttachmentInput]) -> str:
-    if not attachments:
+    text_attachments = [attachment for attachment in attachments if not attachment.is_image]
+    if not text_attachments:
         return prompt
 
     blocks: list[str] = [prompt.strip(), "", "Attached context files:"]
-    for attachment in attachments:
+    for attachment in text_attachments:
         blocks.append(f"\n---\nFile: {attachment.name} ({attachment.content_type}, {attachment.size} bytes)\n")
         blocks.append(attachment.content.strip())
     return "\n".join(blocks).strip()
@@ -1181,7 +1182,26 @@ def _build_direct_chat_messages(
 
     if attachments and last_user_index >= 0:
         original = str(normalized_messages[last_user_index]["content"])
-        normalized_messages[last_user_index]["content"] = _build_prompt_with_attachments(original, attachments)
+        text_attachments = [attachment for attachment in attachments if not attachment.is_image]
+        image_attachments = [attachment for attachment in attachments if attachment.is_image]
+        composed = _build_prompt_with_attachments(original, text_attachments)
+        # OpenRouter multi-part content: text first, then image_url data URLs.
+        normalized_messages[last_user_index]["content"] = (
+            [
+                {"type": "text", "text": composed},
+                *[
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{attachment.content_type};base64,{attachment.content}"
+                        },
+                    }
+                    for attachment in image_attachments
+                ],
+            ]
+            if image_attachments
+            else composed
+        )
 
     return normalized_messages
 

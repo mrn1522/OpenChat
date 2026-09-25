@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import type { ChangeEvent } from "react";
+import type { ChangeEvent, ClipboardEvent } from "react";
 import type { ComponentType } from "react";
 import type { CSSProperties } from "react";
 import ReactMarkdown from "react-markdown";
@@ -307,6 +307,9 @@ const OPENROUTER_TOKEN_LIMIT = 10_000;
 const MAX_ATTACHMENTS = 5;
 const MAX_ATTACHMENT_SIZE_BYTES = 262_144;
 const MAX_ATTACHMENT_CONTENT_CHARS = 100_000;
+// 5MB — the tightest image cap across common vision providers (Anthropic).
+const MAX_IMAGE_ATTACHMENT_SIZE_BYTES = 5_242_880;
+const IMAGE_CONTENT_TYPE_PREFIX = "image/";
 const SUPPORTED_ATTACHMENT_TYPES = new Set([
   "txt",
   "md",
@@ -466,6 +469,14 @@ const getChatType = (status: string): "fusion" | "direct" =>
 const toChatTypeLabel = (status: string): string =>
   getChatType(status) === "direct" ? "Direct" : "Fusion";
 
+const isImageFile = (file: File): boolean => file.type.startsWith(IMAGE_CONTENT_TYPE_PREFIX);
+
+const isImageAttachment = (attachment: Pick<AttachmentInput, "content_type">): boolean =>
+  attachment.content_type.startsWith(IMAGE_CONTENT_TYPE_PREFIX);
+
+const attachmentImageDataUrl = (attachment: Pick<AttachmentInput, "content_type" | "content">): string =>
+  `data:${attachment.content_type};base64,${attachment.content}`;
+
 const readAttachmentFile = async (file: File): Promise<ComposerAttachment | null> => {
   const extension = file.name.includes(".") ? file.name.split(".").pop()?.toLowerCase() ?? "" : "";
   const looksLikeText = file.type.startsWith("text/") || SUPPORTED_ATTACHMENT_TYPES.has(extension);
@@ -483,6 +494,30 @@ const readAttachmentFile = async (file: File): Promise<ComposerAttachment | null
     content,
   };
 };
+
+const readImageAttachmentFile = (file: File): Promise<ComposerAttachment | null> =>
+  new Promise((resolve) => {
+    const reader = new FileReader();
+    reader.onerror = () => resolve(null);
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      const match = /^data:(image\/[\w.+-]+);base64,(.+)$/.exec(result);
+      if (!match) {
+        resolve(null);
+        return;
+      }
+      const [, contentType, base64] = match;
+      const extension = contentType.split("/")[1]?.split("+")[0] ?? "png";
+      resolve({
+        id: `image-${crypto.randomUUID()}`,
+        name: file.name || `pasted-image.${extension}`,
+        size: file.size,
+        content_type: contentType,
+        content: base64,
+      });
+    };
+    reader.readAsDataURL(file);
+  });
 
 const SettingsUpdateSection = ({ appVersion }: { appVersion: string | null }) => {
   const [updateState, setUpdateState] = useState<UpdateState>({ kind: "idle" });
@@ -1270,8 +1305,11 @@ function App() {
   );
 
   const canSendDirect = useMemo(
-    () => directPrompt.trim().length > 0 && directModel.length > 0 && !isDirectRunning,
-    [directModel.length, directPrompt, isDirectRunning]
+    () =>
+      (directPrompt.trim().length > 0 || directAttachments.some(isImageAttachment)) &&
+      directModel.length > 0 &&
+      !isDirectRunning,
+    [directAttachments, directModel.length, directPrompt, isDirectRunning]
   );
 
   const hasSourceResults = sourceResults.length > 0;
@@ -1940,10 +1978,8 @@ function App() {
     directFileInputRef.current?.click();
   };
 
-  const onDirectAttachmentChange = async (event: ChangeEvent<HTMLInputElement>) => {
-    const selected = Array.from(event.target.files ?? []);
-    event.target.value = "";
-    if (selected.length === 0) return;
+  const addDirectFiles = async (files: File[]) => {
+    if (files.length === 0) return;
 
     const slotsRemaining = MAX_ATTACHMENTS - directAttachments.length;
     if (slotsRemaining <= 0) {
@@ -1951,19 +1987,24 @@ function App() {
       return;
     }
 
-    const nextFiles = selected.slice(0, slotsRemaining);
-    const oversize = nextFiles.find((file) => file.size > MAX_ATTACHMENT_SIZE_BYTES);
+    const nextFiles = files.slice(0, slotsRemaining);
+    const oversize = nextFiles.find(
+      (file) => file.size > (isImageFile(file) ? MAX_IMAGE_ATTACHMENT_SIZE_BYTES : MAX_ATTACHMENT_SIZE_BYTES)
+    );
     if (oversize) {
-      setDirectError(`Attachment ${oversize.name} exceeds 256KB and cannot be added.`);
+      const limitLabel = isImageFile(oversize) ? "5MB" : "256KB";
+      setDirectError(`Attachment ${oversize.name} exceeds ${limitLabel} and cannot be added.`);
       return;
     }
 
-    const parsed = await Promise.all(nextFiles.map((file) => readAttachmentFile(file)));
+    const parsed = await Promise.all(
+      nextFiles.map((file) => (isImageFile(file) ? readImageAttachmentFile(file) : readAttachmentFile(file)))
+    );
     const rejectedCount = parsed.filter((item) => !item).length;
     const accepted = parsed.filter((item): item is ComposerAttachment => item !== null);
 
     if (accepted.length === 0) {
-      setDirectError("No supported text attachments found. Use text-based files like .txt, .md, .json, .csv, or code files.");
+      setDirectError("No supported attachments found. Use text files like .txt, .md, .json, .csv, or images.");
       return;
     }
 
@@ -1979,6 +2020,22 @@ function App() {
     } else {
       setDirectError(null);
     }
+  };
+
+  const onDirectAttachmentChange = async (event: ChangeEvent<HTMLInputElement>) => {
+    const selected = Array.from(event.target.files ?? []);
+    event.target.value = "";
+    await addDirectFiles(selected);
+  };
+
+  const onDirectComposerPaste = (event: ClipboardEvent<HTMLTextAreaElement>) => {
+    const imageFiles = Array.from(event.clipboardData?.items ?? [])
+      .filter((item) => item.kind === "file" && item.type.startsWith(IMAGE_CONTENT_TYPE_PREFIX))
+      .map((item) => item.getAsFile())
+      .filter((file): file is File => file !== null);
+    if (imageFiles.length === 0) return;
+    event.preventDefault();
+    void addDirectFiles(imageFiles);
   };
 
   const removeDirectAttachment = (attachmentId: string) => {
@@ -2006,7 +2063,9 @@ function App() {
 
   const sendDirectMessage = async () => {
     const trimmedPrompt = directPrompt.trim();
-    if (!trimmedPrompt || !directModel || isDirectRunning) return;
+    const promptText =
+      trimmedPrompt || (directAttachments.some(isImageAttachment) ? "What's in this image?" : "");
+    if (!promptText || !directModel || isDirectRunning) return;
 
     const requestId = directRequestIdRef.current + 1;
     directRequestIdRef.current = requestId;
@@ -2016,7 +2075,7 @@ function App() {
 
     const conversationId = directConversationId ?? crypto.randomUUID();
     setDirectConversationId(conversationId);
-    const nextMessages: DirectChatMessage[] = [...directMessages, { role: "user", content: trimmedPrompt }];
+    const nextMessages: DirectChatMessage[] = [...directMessages, { role: "user", content: promptText }];
     setDirectMessages(nextMessages);
     setDirectPrompt("");
 
@@ -3179,6 +3238,7 @@ function App() {
               <textarea
                 value={directPrompt}
                 onChange={(event) => setDirectPrompt(event.target.value)}
+                onPaste={onDirectComposerPaste}
                 placeholder="Message your selected model..."
                 rows={4}
               />
@@ -3189,13 +3249,20 @@ function App() {
                 className="composer-file-input"
                 onChange={onDirectAttachmentChange}
                 multiple
-                accept=".txt,.md,.json,.csv,.py,.js,.ts,.tsx,.jsx,.html,.css,.yaml,.yml,.xml,.log,text/*"
+                accept=".txt,.md,.json,.csv,.py,.js,.ts,.tsx,.jsx,.html,.css,.yaml,.yml,.xml,.log,text/*,image/*"
               />
 
               {directAttachments.length > 0 && (
                 <div className="attachment-chip-row" role="list" aria-label="Attached files">
                   {directAttachments.map((attachment) => (
                     <div key={attachment.id} className="attachment-chip" role="listitem">
+                      {isImageAttachment(attachment) && (
+                        <img
+                          className="attachment-thumb"
+                          src={attachmentImageDataUrl(attachment)}
+                          alt={`Attached image ${attachment.name}`}
+                        />
+                      )}
                       <span>{attachment.name}</span>
                       <button type="button" onClick={() => removeDirectAttachment(attachment.id)} aria-label={`Remove ${attachment.name}`}>
                         ×
@@ -3211,7 +3278,7 @@ function App() {
                     className="composer-icon-btn"
                     type="button"
                     aria-label="Add attachment"
-                    title="Attach up to 5 text files (max 256KB each)"
+                    title="Attach text files or images, or paste an image with Ctrl+V"
                     onClick={triggerDirectAttachmentPicker}
                   >
                     <img src={paperclipIcon} alt="" aria-hidden="true" className="ui-icon" />
