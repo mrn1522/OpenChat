@@ -30,6 +30,11 @@ struct SidecarState {
     // Set while a killed sidecar's Terminated event is still pending — blocks
     // further update attempts so nothing proceeds on an unconfirmed exit.
     stopping: Arc<AtomicBool>,
+    // Terminated flag of a child whose kill() could not be confirmed — the
+    // handle is consumed by kill(), so the flag is kept here instead. An
+    // empty `child` slot must not be read as "backend stopped" while this is
+    // set: the update refuses to proceed until the orphan's exit is observed.
+    lost_child_termination: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 #[tauri::command]
@@ -193,20 +198,48 @@ async fn install_update(
     if expected.len() != 64 || !expected.chars().all(|c| c.is_ascii_hexdigit()) {
         return Err("Installer integrity digest is missing or invalid.".to_string());
     }
-    let installer = tauri::async_runtime::spawn_blocking(move || {
+
+    // Claim the update gate before the download: overlapping calls write the
+    // same temp installer path, so a second call must be rejected before it
+    // can truncate the file the first call already verified. `stopping` stays
+    // set through the installer launch so no second installer can spawn; it
+    // is released on every early-return failure path below.
+    let stopping = app.state::<SidecarState>().stopping.clone();
+    if stopping
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        return Err("An update is already in progress.".to_string());
+    }
+
+    let installer = match tauri::async_runtime::spawn_blocking(move || {
         download_installer(&download_url, &file_name, &expected)
     })
     .await
-    .map_err(|e| format!("Installer download failed: {e}"))??;
+    {
+        Ok(Ok(installer)) => installer,
+        Ok(Err(e)) => {
+            stopping.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+        Err(e) => {
+            stopping.store(false, Ordering::SeqCst);
+            return Err(format!("Installer download failed: {e}"));
+        }
+    };
 
     let port = *app.state::<u16>();
-    let stopping = app.state::<SidecarState>().stopping.clone();
 
     // Stop the sidecar and wait for its Terminated event so the installer
-    // never writes over a still-locked openchat-server.exe. `stopping` stays
-    // set through the installer launch so a concurrent call can't slip past
-    // stop_sidecar and spawn a second installer.
-    if let Some(terminated) = stop_sidecar(&app.state::<SidecarState>())? {
+    // never writes over a still-locked openchat-server.exe.
+    let terminated = match stop_sidecar(&app.state::<SidecarState>()) {
+        Ok(terminated) => terminated,
+        Err(e) => {
+            stopping.store(false, Ordering::SeqCst);
+            return Err(e);
+        }
+    };
+    if let Some((terminated, kill_confirmed)) = terminated {
         match tauri::async_runtime::spawn_blocking(move || {
             match terminated.recv_timeout(Duration::from_secs(5)) {
                 Ok(()) => Ok(()),
@@ -217,35 +250,75 @@ async fn install_update(
         {
             Ok(Ok(())) => {}
             Ok(Err(rx)) => {
-                // Keep update attempts blocked until the old process is
-                // confirmed dead, then restore the backend so the app stays
-                // usable. No upper bound here — kill() already succeeded, so
-                // the process will exit eventually; a second timeout would
-                // leave updates blocked forever even after it does.
+                if kill_confirmed {
+                    // The child took the kill but hasn't exited yet — hold
+                    // the gate until the drain task fires the receiver, then
+                    // restore the backend so the app stays usable. No upper
+                    // bound: the exit listener stays installed, so a dead
+                    // child always reports in; a second timeout would leave
+                    // updates blocked forever even after it does.
+                    let app = app.clone();
+                    let stopping = stopping.clone();
+                    tauri::async_runtime::spawn(async move {
+                        let dead =
+                            tauri::async_runtime::spawn_blocking(move || rx.recv().is_ok())
+                                .await
+                                .unwrap_or(false);
+                        if dead {
+                            // Restore before dropping markers/gates so a retry
+                            // finds a real child to stop rather than an empty
+                            // slot while the new backend comes up.
+                            let restored = restore_sidecar(&app, port);
+                            if let Ok(mut lost) = app
+                                .state::<SidecarState>()
+                                .lost_child_termination
+                                .lock()
+                            {
+                                lost.take();
+                            }
+                            stopping.store(false, Ordering::SeqCst);
+                            if let Err(e) = restored {
+                                eprintln!("Failed to restart openchat-server: {e}");
+                            }
+                        }
+                    });
+                    return Err(
+                        "The backend is still stopping — the update was cancelled. Try again in a moment."
+                            .to_string(),
+                    );
+                }
+                // kill() never took — the process may outlive this call, so
+                // holding the gate on an unbounded wait would refuse every
+                // later update until restart. Keep a supervised wait that
+                // restores the backend on a late exit, but release `stopping`
+                // now: lost_child_termination is what refuses unsafe retries
+                // until the orphan's Terminated is observed.
                 let app = app.clone();
-                let stopping = stopping.clone();
                 tauri::async_runtime::spawn(async move {
                     let dead = tauri::async_runtime::spawn_blocking(move || rx.recv().is_ok())
                         .await
                         .unwrap_or(false);
                     if dead {
-                        // Hold the gate through the respawn so a retry can't
-                        // launch an installer while the backend is coming back
-                        // up, then clear it regardless — the killed process is
-                        // confirmed gone either way.
+                        // Restore before clearing the marker so a retry that
+                        // slips past it finds a real child to stop.
                         let restored = restore_sidecar(&app, port);
-                        stopping.store(false, Ordering::SeqCst);
+                        if let Ok(mut lost) =
+                            app.state::<SidecarState>().lost_child_termination.lock()
+                        {
+                            lost.take();
+                        }
                         if let Err(e) = restored {
                             eprintln!("Failed to restart openchat-server: {e}");
                         }
                     }
                 });
+                stopping.store(false, Ordering::SeqCst);
                 return Err(
-                    "The backend is still stopping — the update was cancelled. Try again in a moment."
-                        .to_string(),
+                    "Could not stop the backend — restart OpenChat before retrying.".to_string(),
                 );
             }
             Err(_) => {
+                stopping.store(false, Ordering::SeqCst);
                 return Err(
                     "Could not confirm the backend stopped — restart OpenChat before retrying."
                         .to_string(),
@@ -355,23 +428,34 @@ fn restore_sidecar(app: &AppHandle, port: u16) -> Result<(), String> {
 }
 
 // Kills the sidecar and returns a receiver that fires once the process has
-// actually terminated (its Terminated command event). Returns None when the
-// exit is already confirmed, and errors while a previous stop is still pending.
-fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, String> {
+// actually terminated (its Terminated command event), plus whether kill()
+// was issued successfully — false means the process may still be running and
+// lost_child_termination guards unsafe retries. Returns None when the exit
+// is already confirmed or no sidecar is running. The caller must already
+// hold the `stopping` gate — this function does not claim or release it.
+fn stop_sidecar(
+    state: &SidecarState,
+) -> Result<Option<(mpsc::Receiver<()>, bool)>, String> {
     let mut slot = state
         .child
         .lock()
         .map_err(|_| "Sidecar state is unavailable.".to_string())?;
-    if state.stopping.load(Ordering::SeqCst) {
-        return Err(
-            "The backend is still shutting down — try again in a moment.".to_string(),
-        );
-    }
-    // Claim the gate while the child lock is held so only one call ever
-    // proceeds to the installer launch; it clears when a cancelled update
-    // restores the backend (a launched update exits the app anyway).
-    state.stopping.store(true, Ordering::SeqCst);
     let Some((child, terminated)) = slot.take() else {
+        // An earlier attempt can lose the handle of a child whose kill was
+        // never confirmed; an empty slot alone does not prove the backend
+        // exited. Any marker refuses the update: it stays authoritative
+        // until the supervised wait has restored the backend, so a retry
+        // can't launch the installer while that respawn is still in flight.
+        if let Ok(lost) = state.lost_child_termination.lock() {
+            if let Some(flag) = lost.as_ref() {
+                return Err(if flag.load(Ordering::SeqCst) {
+                    "The backend is being restored — try again in a moment.".to_string()
+                } else {
+                    "The backend may still be running — restart OpenChat before updating."
+                        .to_string()
+                });
+            }
+        }
         return Ok(None);
     };
     let (tx, rx) = mpsc::channel::<()>();
@@ -381,17 +465,14 @@ fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, Stri
         // The slot was already emptied — put the running sidecar back so the
         // next attempt still finds (and kills) it instead of seeing no child.
         *slot = Some((child, terminated));
-        state.stopping.store(false, Ordering::SeqCst);
         return Err("Sidecar state is unavailable.".to_string());
     }
     let kill_failed = child.kill().is_err();
     // The drain task flips `terminated` on every Terminated — including an
     // exit that already happened, where kill() can still succeed but no event
     // is left to fire the receiver. When the flag is set there is nothing to
-    // wait for; a live process that wouldn't take the kill still owns the exe,
-    // so only a failed kill without confirmed death waits like a normal stop.
-    // A dead process whose event is still in flight gets a brief window to
-    // deliver it first.
+    // wait for. A dead process whose event is still in flight gets a brief
+    // window to deliver it first.
     let confirmed = terminated.load(Ordering::SeqCst)
         || (kill_failed
             && (rx.recv_timeout(Duration::from_millis(500)).is_ok()
@@ -402,7 +483,19 @@ fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, Stri
         }
         return Ok(None);
     }
-    Ok(Some(rx))
+    if kill_failed {
+        // kill() could not be confirmed, so the process may still be running.
+        // The handle is consumed either way — keep its Terminated flag as the
+        // lost-child marker so an empty slot is never read as "backend
+        // stopped", and leave the listener installed so the caller's
+        // supervised wait still learns when the orphan exits and can restore
+        // the backend it took down for the update.
+        if let Ok(mut lost) = state.lost_child_termination.lock() {
+            *lost = Some(terminated);
+        }
+        return Ok(Some((rx, false)));
+    }
+    Ok(Some((rx, true)))
 }
 
 fn kill_sidecar(state: &SidecarState) {
@@ -424,6 +517,7 @@ pub fn run() {
                 child: Mutex::new(None),
                 exit_listener: exit_listener.clone(),
                 stopping: Arc::new(AtomicBool::new(false)),
+                lost_child_termination: Mutex::new(None),
             });
 
             let spawned = spawn_sidecar(&app.handle(), port, exit_listener)?;

@@ -308,6 +308,9 @@ const SERVICE_TIER_TOOLTIPS: Record<ServiceTier, string> = {
   priority: "Priority — faster, higher cost",
 };
 const SERVICE_TIER_RETRY_MS = 60_000;
+// Matches the server-side roster cache TTL — long-lived sessions re-probe
+// tier availability instead of pinning the first result forever.
+const SERVICE_TIER_REFRESH_MS = 300_000;
 const OPENROUTER_TOKEN_LIMIT = 10_000;
 const MAX_ATTACHMENTS = 5;
 const MAX_ATTACHMENT_SIZE_BYTES = 262_144;
@@ -727,6 +730,9 @@ function App() {
   // modelId -> last failed discovery time; failed models retry once the
   // cooldown elapses via the retry timer below.
   const serviceTierFailedAtRef = useRef<Record<string, number>>({});
+  // modelId -> last successful discovery time; rosters refresh once the
+  // TTL elapses via the same retry-timer mechanism as failures.
+  const serviceTierFetchedAtRef = useRef<Record<string, number>>({});
   const serviceTierRetryTimerRef = useRef<Record<string, number>>({});
   // Bumped when the provider base URL changes so stale in-flight lookups
   // from the previous provider can never commit into the fresh caches.
@@ -898,6 +904,7 @@ function App() {
         setServiceTierByModel({});
         serviceTierFetchInFlightRef.current.clear();
         serviceTierFailedAtRef.current = {};
+        serviceTierFetchedAtRef.current = {};
         Object.values(serviceTierRetryTimerRef.current).forEach(clearTimeout);
         serviceTierRetryTimerRef.current = {};
       }
@@ -1226,14 +1233,26 @@ function App() {
     return [...ids];
   }, [sourceModels, fusionModel, directModel, focusedModelId]);
 
-  // Lazily discover non-default service tiers for every model in view;
-  // results (including "none") are cached so each model is fetched once.
+  // Lazily discover non-default service tiers for every model in view.
+  // Results (including "none") are cached per model and re-probed once the
+  // roster TTL elapses so long-lived sessions pick up tier changes.
   // Each lookup commits its own outcome — earlier passes must not be
   // invalidated when a sibling lookup resolves and reruns this effect.
   useEffect(() => {
     const generation = serviceTierGenerationRef.current;
     for (const modelId of modelsNeedingTierLookup) {
-      if (modelId in serviceTiersByModel || serviceTierFetchInFlightRef.current.has(modelId)) {
+      if (serviceTierFetchInFlightRef.current.has(modelId)) {
+        continue;
+      }
+      const fetchedAt = serviceTierFetchedAtRef.current[modelId];
+      if (fetchedAt !== undefined && Date.now() - fetchedAt < SERVICE_TIER_REFRESH_MS) {
+        // Fresh roster — arm a one-shot re-check at expiry when none is pending.
+        if (serviceTierRetryTimerRef.current[modelId] === undefined) {
+          serviceTierRetryTimerRef.current[modelId] = window.setTimeout(() => {
+            delete serviceTierRetryTimerRef.current[modelId];
+            bumpTierRetryTick((tick) => tick + 1);
+          }, SERVICE_TIER_REFRESH_MS - (Date.now() - fetchedAt));
+        }
         continue;
       }
       const failedAt = serviceTierFailedAtRef.current[modelId];
@@ -1245,6 +1264,7 @@ function App() {
         .then((tiers) => {
           if (!mountedRef.current || serviceTierGenerationRef.current !== generation) return;
           delete serviceTierFailedAtRef.current[modelId];
+          serviceTierFetchedAtRef.current[modelId] = Date.now();
           setServiceTiersByModel((prev) => ({ ...prev, [modelId]: tiers }));
         })
         .catch(() => {

@@ -34,6 +34,7 @@ from app.chat_store import (
 from app.config import reload_settings, settings, settings_env_file
 from app.secrets_store import DPAPI_PREFIX, protect_secret
 from app.llm import (
+    MODEL_ID_PATTERN,
     aclose_clients,
     build_client,
     fetch_model_service_tiers,
@@ -1041,6 +1042,8 @@ async def get_service_tiers(model_id: str) -> ServiceTiersResponse:
     model_id = model_id.strip()
     if not model_id:
         raise HTTPException(status_code=422, detail="Model id is required")
+    if MODEL_ID_PATTERN.fullmatch(model_id) is None:
+        raise HTTPException(status_code=422, detail="Model id is invalid")
     try:
         tiers = await fetch_model_service_tiers(model_id)
     except httpx.HTTPStatusError as exc:

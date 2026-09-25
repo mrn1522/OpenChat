@@ -6,11 +6,19 @@ from pydantic import BaseModel, Field, model_validator
 
 MAX_TEXT_ATTACHMENT_BYTES = 262_144
 MAX_IMAGE_ATTACHMENT_BYTES = 5 * 1024 * 1024
+# Bound on the total decoded image payload one direct-chat request can carry
+# (current attachments plus prior-turn re-embedded pixels).
+MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024
 MAX_TEXT_ATTACHMENT_CHARS = 100_000
 # ceil(5MiB / 3) * 4 base64 chars, with padding headroom.
 MAX_IMAGE_BASE64_CHARS = 7_000_000
 # Formats every major vision provider accepts via OpenRouter data URLs.
 SUPPORTED_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+
+
+def base64_decoded_len(content: str) -> int:
+    """Decoded byte length of a base64 string, excluding trailing `=` padding."""
+    return 3 * (len(content) // 4) - (len(content) - len(content.rstrip("=")))
 
 # OpenRouter service tiers. "fast" is an upstream alias for "priority" and is
 # normalized to "priority" at the boundary, so only these three are valid here.
@@ -110,6 +118,14 @@ class RunRequest(BaseModel):
     # reviewers, and the fusion model all resolve through this map).
     service_tiers: dict[str, ServiceTier] = Field(default_factory=dict)
 
+    @model_validator(mode="after")
+    def _reject_image_attachments(self) -> "RunRequest":
+        # Source/fusion/debate prompts are text-only; images dropped silently
+        # is worse than a clear rejection — direct chat is the image path.
+        if any(attachment.is_image for attachment in self.attachments):
+            raise ValueError("image attachments are only supported in direct chat")
+        return self
+
 
 class DirectChatImageMeta(BaseModel):
     """Provenance for an image attached to a direct-chat turn.
@@ -157,6 +173,41 @@ class DirectChatRequest(BaseModel):
     reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
     attachments: list[AttachmentInput] = Field(default_factory=list, max_length=5)
     service_tier: ServiceTier | None = None
+
+    @model_validator(mode="after")
+    def _cap_total_image_bytes(self) -> "DirectChatRequest":
+        # Per-image caps alone let 200 messages x 5 images exceed what a
+        # single upstream call should carry — bound the cumulative payload.
+        # Mirrors _build_direct_chat_messages: when image attachments exist,
+        # the latest user turn's embedded pixels are dropped upstream, so
+        # they must not be counted here either.
+        last_user_index = next(
+            (
+                index
+                for index in range(len(self.messages) - 1, -1, -1)
+                if self.messages[index].role == "user"
+            ),
+            -1,
+        )
+        has_image_attachments = any(
+            attachment.is_image for attachment in self.attachments
+        )
+        total_bytes = sum(
+            base64_decoded_len(image.content)
+            for index, message in enumerate(self.messages)
+            if not (index == last_user_index and has_image_attachments)
+            for image in message.images
+            if image.content
+        ) + sum(
+            base64_decoded_len(attachment.content)
+            for attachment in self.attachments
+            if attachment.is_image
+        )
+        if total_bytes > MAX_TOTAL_IMAGE_BYTES:
+            raise ValueError(
+                f"total image payload exceeds {MAX_TOTAL_IMAGE_BYTES} bytes"
+            )
+        return self
 
 
 class PromptOptimizeRequest(BaseModel):
