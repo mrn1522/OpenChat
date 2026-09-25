@@ -30,6 +30,11 @@ struct SidecarState {
     // Set while a killed sidecar's Terminated event is still pending — blocks
     // further update attempts so nothing proceeds on an unconfirmed exit.
     stopping: Arc<AtomicBool>,
+    // Terminated flag of a child whose kill() could not be confirmed — the
+    // handle is consumed by kill(), so the flag is kept here instead. An
+    // empty `child` slot must not be read as "backend stopped" while this is
+    // set: the update refuses to proceed until the orphan's exit is observed.
+    lost_child_termination: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 #[tauri::command]
@@ -393,6 +398,23 @@ fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, Stri
         .lock()
         .map_err(|_| "Sidecar state is unavailable.".to_string())?;
     let Some((child, terminated)) = slot.take() else {
+        // An earlier attempt can lose the handle of a child whose kill was
+        // never confirmed; an empty slot alone does not prove the backend
+        // exited. Proceed only once that orphan's Terminated flag was seen.
+        if let Ok(mut lost) = state.lost_child_termination.lock() {
+            match lost.as_ref() {
+                Some(flag) if flag.load(Ordering::SeqCst) => {
+                    lost.take();
+                }
+                Some(_) => {
+                    return Err(
+                        "The backend may still be running — restart OpenChat before updating."
+                            .to_string(),
+                    );
+                }
+                None => {}
+            }
+        }
         return Ok(None);
     };
     let (tx, rx) = mpsc::channel::<()>();
@@ -422,10 +444,13 @@ fn stop_sidecar(state: &SidecarState) -> Result<Option<mpsc::Receiver<()>>, Stri
     }
     if kill_failed {
         // A live process that wouldn't take the kill emits no Terminated
-        // event, so nothing would ever fire the receiver. The handle is
-        // consumed by kill() either way, so it can't be handed back — just
-        // drop the listener and report the failure; the caller releases the
-        // gate instead of deadlocking every later update.
+        // event, so nothing would ever fire the receiver. kill() consumed
+        // the handle, so it can't be handed back — keep its termination
+        // flag so a retry can confirm the exit instead of assuming the
+        // backend is gone. The caller releases the update gate.
+        if let Ok(mut lost) = state.lost_child_termination.lock() {
+            *lost = Some(terminated);
+        }
         if let Ok(mut listener) = state.exit_listener.lock() {
             listener.take();
         }
@@ -455,6 +480,7 @@ pub fn run() {
                 child: Mutex::new(None),
                 exit_listener: exit_listener.clone(),
                 stopping: Arc::new(AtomicBool::new(false)),
+                lost_child_termination: Mutex::new(None),
             });
 
             let spawned = spawn_sidecar(&app.handle(), port, exit_listener)?;

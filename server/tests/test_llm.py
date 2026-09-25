@@ -412,6 +412,71 @@ class TestBuildDirectChatMessages:
         assert last[0]["type"] == "text"
         assert last[1]["type"] == "image_url"
 
+    def test_last_turn_embedded_images_kept_without_attachments(self):
+        messages = [
+            DirectChatMessage.model_validate(
+                {
+                    "role": "user",
+                    "content": "describe",
+                    "images": [
+                        {
+                            "name": "a.png",
+                            "content_type": "image/png",
+                            "content": "QUJD",
+                        }
+                    ],
+                }
+            ),
+        ]
+        built = llm._build_direct_chat_messages(
+            messages=messages, attachments=[], system_prompt="sys"
+        )
+        last = built[-1]["content"]
+        assert isinstance(last, list)
+        assert last[0] == {"type": "text", "text": "describe"}
+        assert last[1] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,QUJD"},
+        }
+
+    def test_last_turn_embedded_images_survive_text_attachments(self):
+        messages = [
+            DirectChatMessage.model_validate(
+                {
+                    "role": "user",
+                    "content": "describe",
+                    "images": [
+                        {
+                            "name": "a.png",
+                            "content_type": "image/png",
+                            "content": "QUJD",
+                        }
+                    ],
+                }
+            ),
+        ]
+        built = llm._build_direct_chat_messages(
+            messages=messages,
+            attachments=[
+                AttachmentInput(
+                    name="notes.txt",
+                    size=3,
+                    content_type="text/plain",
+                    content="ctx",
+                )
+            ],
+            system_prompt="sys",
+        )
+        last = built[-1]["content"]
+        assert isinstance(last, list)
+        assert last[0]["type"] == "text"
+        assert "notes.txt" in last[0]["text"]
+        assert "ctx" in last[0]["text"]
+        assert last[1] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,QUJD"},
+        }
+
     def test_prior_turn_metadata_only_stays_string_content(self):
         messages = [
             DirectChatMessage.model_validate(

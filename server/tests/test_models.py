@@ -63,6 +63,21 @@ class TestRunRequest:
         with pytest.raises(ValidationError):
             RunRequest(**_run_payload(debate_mode="everything"))
 
+    def test_rejects_image_attachments(self):
+        with pytest.raises(ValidationError):
+            RunRequest(
+                **_run_payload(
+                    attachments=[
+                        {
+                            "name": "shot.png",
+                            "size": 10,
+                            "content_type": "image/png",
+                            "content": "QUJD",
+                        }
+                    ]
+                )
+            )
+
     def test_rejects_over_five_attachments(self):
         attachments = [
             {"name": f"file-{i}", "size": 1, "content": "x"} for i in range(6)
@@ -181,6 +196,38 @@ class TestDirectChatRequest:
             messages=[{"role": "user", "content": "hi"}],
         )
         assert request.messages[0].role == "user"
+
+    def test_total_image_cap_boundary_counts_decoded_bytes(self):
+        # 4 x 5 MiB images decode to exactly MAX_TOTAL_IMAGE_BYTES: the cap
+        # must account for base64 padding per string, not len() * 3 // 4.
+        import base64
+
+        from app.models import MAX_TOTAL_IMAGE_BYTES, base64_decoded_len
+
+        each = MAX_TOTAL_IMAGE_BYTES // 4
+        chunk = base64.b64encode(b"\0" * each).decode()
+        assert base64_decoded_len(chunk) == each
+
+        def image() -> AttachmentInput:
+            return AttachmentInput(
+                name="i.png",
+                size=each,
+                content_type="image/png",
+                content=chunk,
+            )
+
+        ok = DirectChatRequest(
+            model="m",
+            messages=[{"role": "user", "content": "look"}],
+            attachments=[image(), image(), image(), image()],
+        )
+        assert len(ok.attachments) == 4
+        with pytest.raises(ValidationError):
+            DirectChatRequest(
+                model="m",
+                messages=[{"role": "user", "content": "look"}],
+                attachments=[image(), image(), image(), image(), image()],
+            )
 
     def test_rejects_system_role(self):
         with pytest.raises(ValidationError):

@@ -15,6 +15,11 @@ MAX_IMAGE_BASE64_CHARS = 7_000_000
 # Formats every major vision provider accepts via OpenRouter data URLs.
 SUPPORTED_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 
+
+def base64_decoded_len(content: str) -> int:
+    """Decoded byte length of a base64 string, excluding trailing `=` padding."""
+    return 3 * (len(content) // 4) - (len(content) - len(content.rstrip("=")))
+
 # OpenRouter service tiers. "fast" is an upstream alias for "priority" and is
 # normalized to "priority" at the boundary, so only these three are valid here.
 ServiceTier = Literal["default", "flex", "priority"]
@@ -173,17 +178,17 @@ class DirectChatRequest(BaseModel):
     def _cap_total_image_bytes(self) -> "DirectChatRequest":
         # Per-image caps alone let 200 messages x 5 images exceed what a
         # single upstream call should carry — bound the cumulative payload.
-        total_base64 = sum(
-            len(image.content)
+        total_bytes = sum(
+            base64_decoded_len(image.content)
             for message in self.messages
             for image in message.images
             if image.content
         ) + sum(
-            len(attachment.content)
+            base64_decoded_len(attachment.content)
             for attachment in self.attachments
             if attachment.is_image
         )
-        if total_base64 * 3 // 4 > MAX_TOTAL_IMAGE_BYTES:
+        if total_bytes > MAX_TOTAL_IMAGE_BYTES:
             raise ValueError(
                 f"total image payload exceeds {MAX_TOTAL_IMAGE_BYTES} bytes"
             )

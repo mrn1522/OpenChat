@@ -1226,25 +1226,40 @@ def _build_direct_chat_messages(
             last_user_index = len(normalized_messages) - 1
 
     if attachments and last_user_index >= 0:
-        original = str(normalized_messages[last_user_index]["content"])
+        existing = normalized_messages[last_user_index]["content"]
         text_attachments = [attachment for attachment in attachments if not attachment.is_image]
         image_attachments = [attachment for attachment in attachments if attachment.is_image]
+        if isinstance(existing, list):
+            # The message already carries embedded image parts — merge text
+            # attachments into its text part rather than stringifying the
+            # whole multipart list into the prompt.
+            original = "\n".join(
+                str(part.get("text", ""))
+                for part in existing
+                if isinstance(part, dict) and part.get("type") == "text"
+            )
+            embedded_parts = [
+                part
+                for part in existing
+                if not (isinstance(part, dict) and part.get("type") == "text")
+            ]
+        else:
+            original = str(existing)
+            embedded_parts = []
         composed = _build_prompt_with_attachments(original, text_attachments)
         # OpenRouter multi-part content: text first, then image_url data URLs.
+        image_parts = [
+            {
+                "type": "image_url",
+                "image_url": {
+                    "url": f"data:{attachment.content_type};base64,{attachment.content}"
+                },
+            }
+            for attachment in image_attachments
+        ]
         normalized_messages[last_user_index]["content"] = (
-            [
-                {"type": "text", "text": composed},
-                *[
-                    {
-                        "type": "image_url",
-                        "image_url": {
-                            "url": f"data:{attachment.content_type};base64,{attachment.content}"
-                        },
-                    }
-                    for attachment in image_attachments
-                ],
-            ]
-            if image_attachments
+            [{"type": "text", "text": composed}, *embedded_parts, *image_parts]
+            if embedded_parts or image_parts
             else composed
         )
 
