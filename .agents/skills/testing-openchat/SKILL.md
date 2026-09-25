@@ -8,6 +8,7 @@ description: Exercise first-run connection settings and isolated persistence thr
 ## Devin Secrets Needed
 - `OPENROUTER_TEST_API_KEY` (org scope) — real OpenRouter key for tests needing actual completions. Bind it in exec via `env={"OPENROUTER_TEST_API_KEY": "secret:org:OPENROUTER_TEST_API_KEY"}`, then pass to the backend as `OPENAI_API_KEY` (or paste it into the app's Connect OpenRouter settings).
 - Always use `openai/gpt-oss-20b` for real completions (cheap, fast, ~12 endpoints; it has NO flex/priority tier tags, so the tier dropdown correctly stays hidden for it). Tier-capable fixtures for tier tests: `google/gemini-2.5-flash` (flex+priority), `openai/gpt-5-mini` (flex only).
+- For real-completion tests that exercise a service tier, only ever send `flex` (cheapest) or omit `service_tier` (default). NEVER send `priority` — it is the pricier tier and must not be used in tests.
 - None needed for configuration persistence tests: use a clearly fake API key.
 
 ## Local runtime
