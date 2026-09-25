@@ -8,6 +8,7 @@ const ESTIMATED_MESSAGE_HEIGHT_PX = 120;
 const ESTIMATED_PENDING_HEIGHT_PX = 72;
 const OVERSCAN_COUNT = 6;
 const STICK_TO_BOTTOM_THRESHOLD_PX = 96;
+const BOTTOM_SCROLL_GAP_PX = 40;
 
 type TranscriptRow =
   | { kind: "message"; key: string; message: DirectChatMessage; index: number }
@@ -67,6 +68,7 @@ function DirectChatTranscript({ messages, isRunning }: DirectChatTranscriptProps
   const parentRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
   const previousCountRef = useRef(0);
+  const programmaticScrollRef = useRef(false);
 
   const rows = useMemo<TranscriptRow[]>(() => {
     const next: TranscriptRow[] = messages.map((message, index) => ({
@@ -100,27 +102,56 @@ function DirectChatTranscript({ messages, isRunning }: DirectChatTranscriptProps
     getScrollElement: () => parentRef.current,
     estimateSize,
     overscan: OVERSCAN_COUNT,
+    paddingEnd: BOTTOM_SCROLL_GAP_PX,
+    scrollPaddingEnd: BOTTOM_SCROLL_GAP_PX,
     getItemKey: (index) => rows[index]?.key ?? index,
   });
 
   const virtualItems = virtualizer.getVirtualItems();
   const totalSize = virtualizer.getTotalSize();
 
+  const smoothScrollBehavior = useCallback((): ScrollBehavior => {
+    return window.matchMedia("(prefers-reduced-motion: reduce)").matches ? "auto" : "smooth";
+  }, []);
+
   const updateStickToBottom = useCallback(() => {
     const element = parentRef.current;
     if (!element) return;
     const distanceFromBottom = element.scrollHeight - element.scrollTop - element.clientHeight;
-    stickToBottomRef.current = distanceFromBottom <= STICK_TO_BOTTOM_THRESHOLD_PX;
+    if (distanceFromBottom <= STICK_TO_BOTTOM_THRESHOLD_PX) {
+      stickToBottomRef.current = true;
+      programmaticScrollRef.current = false;
+      return;
+    }
+    // Positions crossed mid-smooth-scroll are animation frames, not the
+    // user scrolling away; wheel/pointer input cancels the flag below.
+    if (programmaticScrollRef.current) return;
+    stickToBottomRef.current = false;
   }, []);
 
   useEffect(() => {
     const element = parentRef.current;
     if (!element) return;
 
+    const cancelProgrammaticScroll = () => {
+      programmaticScrollRef.current = false;
+    };
+    const cancelProgrammaticScrollOnKeydown = (event: KeyboardEvent) => {
+      if (["ArrowDown", "ArrowUp", "PageDown", "PageUp", "Home", "End", " "].includes(event.key)) {
+        cancelProgrammaticScroll();
+      }
+    };
+
     updateStickToBottom();
     element.addEventListener("scroll", updateStickToBottom, { passive: true });
+    element.addEventListener("wheel", cancelProgrammaticScroll, { passive: true });
+    element.addEventListener("pointerdown", cancelProgrammaticScroll);
+    element.addEventListener("keydown", cancelProgrammaticScrollOnKeydown);
     return () => {
       element.removeEventListener("scroll", updateStickToBottom);
+      element.removeEventListener("wheel", cancelProgrammaticScroll);
+      element.removeEventListener("pointerdown", cancelProgrammaticScroll);
+      element.removeEventListener("keydown", cancelProgrammaticScrollOnKeydown);
     };
   }, [updateStickToBottom]);
 
@@ -139,11 +170,15 @@ function DirectChatTranscript({ messages, isRunning }: DirectChatTranscriptProps
     if (!stickToBottomRef.current && previousCount !== 0) return;
 
     const lastIndex = rows.length - 1;
+    // First render jumps; later growth (new turns, pending bubble) eases down
+    // so the conversation advances naturally.
+    const behavior = previousCount === 0 ? "auto" : smoothScrollBehavior();
     requestAnimationFrame(() => {
-      virtualizer.scrollToIndex(lastIndex, { align: "end", behavior: "auto" });
+      programmaticScrollRef.current = true;
+      virtualizer.scrollToIndex(lastIndex, { align: "end", behavior });
       stickToBottomRef.current = true;
     });
-  }, [rows.length, virtualizer]);
+  }, [rows.length, virtualizer, smoothScrollBehavior]);
 
   // Keep the viewport pinned after dynamic Markdown measurement when the user is following the latest messages.
   useLayoutEffect(() => {
@@ -152,10 +187,12 @@ function DirectChatTranscript({ messages, isRunning }: DirectChatTranscriptProps
     if (!element) return;
 
     requestAnimationFrame(() => {
-      if (!stickToBottomRef.current || !parentRef.current) return;
-      parentRef.current.scrollTop = parentRef.current.scrollHeight;
+      const element = parentRef.current;
+      if (!stickToBottomRef.current || !element) return;
+      programmaticScrollRef.current = true;
+      element.scrollTo({ top: element.scrollHeight, behavior: smoothScrollBehavior() });
     });
-  }, [rows.length, totalSize]);
+  }, [rows.length, totalSize, smoothScrollBehavior]);
 
   if (rows.length === 0) {
     return (
