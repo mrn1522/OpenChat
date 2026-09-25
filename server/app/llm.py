@@ -372,11 +372,12 @@ async def fetch_model_service_tiers(model_id: str) -> list[str]:
 
 
 def _build_prompt_with_attachments(prompt: str, attachments: list[AttachmentInput]) -> str:
-    if not attachments:
+    text_attachments = [attachment for attachment in attachments if not attachment.is_image]
+    if not text_attachments:
         return prompt
 
     blocks: list[str] = [prompt.strip(), "", "Attached context files:"]
-    for attachment in attachments:
+    for attachment in text_attachments:
         blocks.append(f"\n---\nFile: {attachment.name} ({attachment.content_type}, {attachment.size} bytes)\n")
         blocks.append(attachment.content.strip())
     return "\n".join(blocks).strip()
@@ -1173,15 +1174,69 @@ def _build_direct_chat_messages(
     resolved_system_prompt = (system_prompt or "").strip() or build_source_system_prompt(None)
 
     normalized_messages: list[dict[str, Any]] = [{"role": "system", "content": resolved_system_prompt}]
+    last_user_message_index = next(
+        (
+            index
+            for index in range(len(messages) - 1, -1, -1)
+            if messages[index].role == "user"
+        ),
+        -1,
+    )
     last_user_index = -1
-    for message in messages:
-        normalized_messages.append({"role": message.role, "content": message.content})
+    for index, message in enumerate(messages):
+        # Prior image turns re-embed their pixels in the message so follow-up
+        # requests keep earlier images in context. The latest turn's pixels
+        # arrive separately in `attachments` (handled below) — skipping them
+        # here avoids sending the same image twice.
+        embedded_image_parts = (
+            [
+                {
+                    "type": "image_url",
+                    "image_url": {
+                        "url": f"data:{image.content_type};base64,{image.content}"
+                    },
+                }
+                for image in message.images
+                if image.content
+            ]
+            if index != last_user_message_index
+            else []
+        )
+        normalized_messages.append(
+            {
+                "role": message.role,
+                "content": (
+                    [{"type": "text", "text": message.content}, *embedded_image_parts]
+                    if embedded_image_parts
+                    else message.content
+                ),
+            }
+        )
         if message.role == "user":
             last_user_index = len(normalized_messages) - 1
 
     if attachments and last_user_index >= 0:
         original = str(normalized_messages[last_user_index]["content"])
-        normalized_messages[last_user_index]["content"] = _build_prompt_with_attachments(original, attachments)
+        text_attachments = [attachment for attachment in attachments if not attachment.is_image]
+        image_attachments = [attachment for attachment in attachments if attachment.is_image]
+        composed = _build_prompt_with_attachments(original, text_attachments)
+        # OpenRouter multi-part content: text first, then image_url data URLs.
+        normalized_messages[last_user_index]["content"] = (
+            [
+                {"type": "text", "text": composed},
+                *[
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": f"data:{attachment.content_type};base64,{attachment.content}"
+                        },
+                    }
+                    for attachment in image_attachments
+                ],
+            ]
+            if image_attachments
+            else composed
+        )
 
     return normalized_messages
 

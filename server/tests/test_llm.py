@@ -8,6 +8,7 @@ import app.llm as llm
 import app.main as main
 from app.config import settings
 from app.models import (
+    AttachmentInput,
     DirectChatMessage,
     OpenRouterModelsResponse,
     SourceAgentSpec,
@@ -292,6 +293,169 @@ class TestRunSourceModels:
 
         asyncio.run(run())
         assert cancelled.is_set()
+
+
+class TestBuildDirectChatMessages:
+    _messages = [
+        DirectChatMessage(role="user", content="first"),
+        DirectChatMessage(role="assistant", content="reply"),
+        DirectChatMessage(role="user", content="describe this"),
+    ]
+
+    def _image(self) -> AttachmentInput:
+        return AttachmentInput(
+            name="shot.png",
+            size=10,
+            content_type="image/png",
+            content="QUJD",
+        )
+
+    def test_no_attachments_keeps_string_content(self):
+        built = llm._build_direct_chat_messages(
+            messages=self._messages,
+            attachments=[],
+            system_prompt="sys",
+        )
+        assert built[0] == {"role": "system", "content": "sys"}
+        assert built[-1] == {"role": "user", "content": "describe this"}
+
+    def test_text_attachments_merge_into_last_user_message(self):
+        built = llm._build_direct_chat_messages(
+            messages=self._messages,
+            attachments=[
+                AttachmentInput(
+                    name="notes.txt",
+                    size=5,
+                    content_type="text/plain",
+                    content="hello",
+                )
+            ],
+            system_prompt="sys",
+        )
+        assert built[1]["content"] == "first"  # earlier turns untouched
+        last = built[-1]["content"]
+        assert isinstance(last, str)
+        assert "describe this" in last
+        assert "notes.txt" in last
+        assert "hello" in last
+
+    def test_image_attachments_build_multipart_content(self):
+        built = llm._build_direct_chat_messages(
+            messages=self._messages,
+            attachments=[self._image()],
+            system_prompt="sys",
+        )
+        last = built[-1]["content"]
+        assert isinstance(last, list)
+        assert last[0] == {"type": "text", "text": "describe this"}
+        assert last[1] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,QUJD"},
+        }
+
+    def test_mixed_attachments_merge_text_and_images(self):
+        built = llm._build_direct_chat_messages(
+            messages=self._messages,
+            attachments=[
+                AttachmentInput(
+                    name="notes.txt",
+                    size=5,
+                    content_type="text/plain",
+                    content="ctx",
+                ),
+                self._image(),
+            ],
+            system_prompt="sys",
+        )
+        last = built[-1]["content"]
+        assert isinstance(last, list)
+        assert last[0]["type"] == "text"
+        assert "ctx" in last[0]["text"]
+        assert last[1]["type"] == "image_url"
+
+    def test_prompt_with_attachments_skips_images(self):
+        prompt = llm._build_prompt_with_attachments("hello", [self._image()])
+        assert prompt == "hello"
+
+    def test_prior_turn_embedded_images_build_multipart(self):
+        messages = [
+            DirectChatMessage.model_validate(
+                {
+                    "role": "user",
+                    "content": "first image",
+                    "images": [
+                        {
+                            "name": "one.png",
+                            "content_type": "image/png",
+                            "content": "QUJD",
+                        }
+                    ],
+                }
+            ),
+            DirectChatMessage(role="assistant", content="seen"),
+            DirectChatMessage(role="user", content="compare to this"),
+        ]
+        built = llm._build_direct_chat_messages(
+            messages=messages,
+            attachments=[self._image()],
+            system_prompt="sys",
+        )
+        first = built[1]["content"]
+        assert isinstance(first, list)
+        assert first[0] == {"type": "text", "text": "first image"}
+        assert first[1] == {
+            "type": "image_url",
+            "image_url": {"url": "data:image/png;base64,QUJD"},
+        }
+        last = built[-1]["content"]
+        assert isinstance(last, list)
+        assert last[0]["type"] == "text"
+        assert last[1]["type"] == "image_url"
+
+    def test_prior_turn_metadata_only_stays_string_content(self):
+        messages = [
+            DirectChatMessage.model_validate(
+                {
+                    "role": "user",
+                    "content": "first image",
+                    "images": [{"name": "one.png", "content_type": "image/png"}],
+                }
+            ),
+            DirectChatMessage(role="user", content="follow up"),
+        ]
+        built = llm._build_direct_chat_messages(
+            messages=messages, attachments=[], system_prompt="sys"
+        )
+        assert built[1] == {"role": "user", "content": "first image"}
+
+
+class TestHistoryAttachmentPayload:
+    def test_image_payload_replaced_with_base64_placeholder(self):
+        import base64
+
+        image = AttachmentInput(
+            name="shot.png",
+            size=10,
+            content_type="image/png",
+            content="QUJD",
+        )
+        payload = main._history_attachment_payload(image)
+        assert payload["name"] == "shot.png"
+        assert payload["content"] != "QUJD"
+        decoded = base64.b64decode(payload["content"], validate=True)
+        assert decoded.decode() == "[image data omitted: 10 bytes]"
+        # The persisted record must still pass strict image validation on read.
+        AttachmentInput.model_validate(payload)
+
+    def test_text_payload_passes_through(self):
+        text = AttachmentInput(
+            name="notes.txt",
+            size=5,
+            content_type="text/plain",
+            content="hello",
+        )
+        payload = main._history_attachment_payload(text)
+        assert payload["content"] == "hello"
 
 
 class TestDebateJobConcurrency:

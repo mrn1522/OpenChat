@@ -67,9 +67,22 @@ export type AttachmentInput = {
 
 export type DirectChatRole = "user" | "assistant";
 
+export type DirectChatImageRef = {
+  name: string;
+  content_type: string;
+  // In-session thumbnail source only — stripped before transport and never
+  // persisted in history.
+  data_url?: string;
+  // Base64 pixels, populated on the wire for PRIOR image turns so follow-up
+  // requests still carry earlier images (the current turn's pixels travel in
+  // `attachments`). Never populated client-side in stored state.
+  content?: string;
+};
+
 export type DirectChatMessage = {
   role: DirectChatRole;
   content: string;
+  images?: DirectChatImageRef[];
 };
 
 export type StreamEvent =

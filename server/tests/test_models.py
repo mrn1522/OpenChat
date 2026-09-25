@@ -2,6 +2,11 @@ import pytest
 from pydantic import ValidationError
 
 from app.models import (
+    MAX_IMAGE_ATTACHMENT_BYTES,
+    MAX_IMAGE_BASE64_CHARS,
+    MAX_TEXT_ATTACHMENT_BYTES,
+    MAX_TEXT_ATTACHMENT_CHARS,
+    AttachmentInput,
     DirectChatMessage,
     DirectChatRequest,
     PersonaAssignment,
@@ -71,6 +76,90 @@ class TestRunRequest:
         ]
         with pytest.raises(ValidationError):
             RunRequest(**_run_payload(persona_assignments_override=overrides))
+
+
+class TestAttachmentInput:
+    def test_text_attachment_valid(self):
+        attachment = AttachmentInput(
+            name="notes.txt",
+            size=100,
+            content_type="text/plain",
+            content="hello",
+        )
+        assert not attachment.is_image
+
+    def test_image_attachment_valid(self):
+        attachment = AttachmentInput(
+            name="shot.png",
+            size=10,
+            content_type="image/png",
+            content="QUJD",  # b"ABC"
+        )
+        assert attachment.is_image
+
+    def test_image_attachment_rejects_unsupported_type(self):
+        with pytest.raises(ValidationError):
+            AttachmentInput(
+                name="icon.svg",
+                size=10,
+                content_type="image/svg+xml",
+                content="QUJD",
+            )
+
+    def test_image_attachment_rejects_invalid_base64(self):
+        with pytest.raises(ValidationError):
+            AttachmentInput(
+                name="shot.png",
+                size=10,
+                content_type="image/png",
+                content="not base64!!!",
+            )
+
+    def test_image_attachment_rejects_oversize_file(self):
+        with pytest.raises(ValidationError):
+            AttachmentInput(
+                name="big.png",
+                size=MAX_IMAGE_ATTACHMENT_BYTES + 1,
+                content_type="image/png",
+                content="QUJD",
+            )
+
+    def test_image_attachment_rejects_oversize_base64(self):
+        with pytest.raises(ValidationError):
+            AttachmentInput(
+                name="big.png",
+                size=MAX_IMAGE_ATTACHMENT_BYTES,
+                content_type="image/png",
+                content="a" * (MAX_IMAGE_BASE64_CHARS + 1),
+            )
+
+    def test_image_attachment_rejects_oversize_decoded_bytes(self):
+        # At the encoded limit the payload still decodes to >5MiB.
+        with pytest.raises(ValidationError):
+            AttachmentInput(
+                name="big.png",
+                size=10,
+                content_type="image/png",
+                content="a" * MAX_IMAGE_BASE64_CHARS,
+            )
+
+    def test_text_attachment_rejects_oversize_file(self):
+        with pytest.raises(ValidationError):
+            AttachmentInput(
+                name="big.txt",
+                size=MAX_TEXT_ATTACHMENT_BYTES + 1,
+                content_type="text/plain",
+                content="a",
+            )
+
+    def test_text_attachment_rejects_oversize_content(self):
+        with pytest.raises(ValidationError):
+            AttachmentInput(
+                name="big.txt",
+                size=100,
+                content_type="text/plain",
+                content="a" * (MAX_TEXT_ATTACHMENT_CHARS + 1),
+            )
 
 
 class TestReasoningConfig:
