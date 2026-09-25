@@ -952,7 +952,8 @@ body {
   margin-top: 8px;
   display: inline-flex;
   align-items: center;
-  gap: 7px;
+  gap: 6px;
+  max-width: 100%;
 }
 
 .service-tier-label {
@@ -967,9 +968,11 @@ body {
   border-radius: 8px;
   background: var(--th-ink-30);
   color: inherit;
-  padding: 5px 8px;
+  padding: 3px 6px;
   font: inherit;
-  font-size: 0.8rem;
+  font-size: 0.75rem;
+  min-width: 0;
+  max-width: 100%;
 }
 
 .service-tier-select:disabled {

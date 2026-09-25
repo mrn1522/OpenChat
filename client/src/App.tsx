@@ -289,8 +289,13 @@ const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ["max", "xhigh", "high", "me
 const DEBATE_MODE_OPTIONS: DebateMode[] = ["off", "partial", "full"];
 const SERVICE_TIER_LABELS: Record<ServiceTier, string> = {
   default: "Default",
-  flex: "Flex · lower cost",
-  priority: "Priority · faster",
+  flex: "Flex",
+  priority: "Priority",
+};
+const SERVICE_TIER_HINTS: Record<ServiceTier, string> = {
+  default: "Default routing",
+  flex: "Flex — lower cost, slower",
+  priority: "Priority — faster, higher cost",
 };
 const SERVICE_TIER_RETRY_MS = 60_000;
 const OPENROUTER_TOKEN_LIMIT = 10_000;
@@ -1209,6 +1214,7 @@ function App() {
         <select
           className="service-tier-select"
           aria-label={`Service tier for ${modelId}`}
+          title={SERVICE_TIER_HINTS[effectiveTier(modelId) ?? "default"]}
           value={effectiveTier(modelId) ?? "default"}
           disabled={disabled}
           onChange={(event) =>
@@ -1220,7 +1226,7 @@ function App() {
         >
           <option value="default">{SERVICE_TIER_LABELS.default}</option>
           {tiers.map((tier) => (
-            <option key={tier} value={tier}>
+            <option key={tier} value={tier} title={SERVICE_TIER_HINTS[tier]}>
               {SERVICE_TIER_LABELS[tier] ?? tier}
             </option>
           ))}
