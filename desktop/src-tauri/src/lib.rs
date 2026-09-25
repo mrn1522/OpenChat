@@ -443,19 +443,17 @@ fn stop_sidecar(
     let Some((child, terminated)) = slot.take() else {
         // An earlier attempt can lose the handle of a child whose kill was
         // never confirmed; an empty slot alone does not prove the backend
-        // exited. Proceed only once that orphan's Terminated flag was seen.
-        if let Ok(mut lost) = state.lost_child_termination.lock() {
-            match lost.as_ref() {
-                Some(flag) if flag.load(Ordering::SeqCst) => {
-                    lost.take();
-                }
-                Some(_) => {
-                    return Err(
-                        "The backend may still be running — restart OpenChat before updating."
-                            .to_string(),
-                    );
-                }
-                None => {}
+        // exited. Any marker refuses the update: it stays authoritative
+        // until the supervised wait has restored the backend, so a retry
+        // can't launch the installer while that respawn is still in flight.
+        if let Ok(lost) = state.lost_child_termination.lock() {
+            if let Some(flag) = lost.as_ref() {
+                return Err(if flag.load(Ordering::SeqCst) {
+                    "The backend is being restored — try again in a moment.".to_string()
+                } else {
+                    "The backend may still be running — restart OpenChat before updating."
+                        .to_string()
+                });
             }
         }
         return Ok(None);
