@@ -14,6 +14,17 @@ os.environ.pop("OPENAI_API_KEY", None)
 import pytest
 from fastapi.testclient import TestClient
 
+import app.secrets_store as _secrets_store
+
+# Windows-only isolation: app.config's import-time _load_settings() falls back
+# to the OS credential store when no key is configured, and tests must never
+# touch a developer's real credentials. Stub the private impls for the whole
+# session — the public helpers already no-op off Windows.
+_credential_isolation = pytest.MonkeyPatch()
+_credential_isolation.setattr(_secrets_store, "_cred_read", lambda: "")
+_credential_isolation.setattr(_secrets_store, "_cred_write", lambda value: None)
+_credential_isolation.setattr(_secrets_store, "_cred_delete", lambda: None)
+
 
 @pytest.fixture(autouse=True, scope="session")
 def _isolate_credential_store():
