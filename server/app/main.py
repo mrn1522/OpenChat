@@ -555,48 +555,62 @@ async def update_settings(request: SettingsUpdateRequest) -> SettingsResponse:
             # fail the way a second write could (e.g. a full disk).
             backup_file = None
             if env_file.exists():
-                backup_file = env_file.with_name(
-                    f"{env_file.name}.rollback-{uuid.uuid4().hex[:8]}"
+                # mkstemp so the backup — which contains the stored key — is
+                # 0600 regardless of umask, unlike a bare copyfile target.
+                fd, backup_name = tempfile.mkstemp(
+                    dir=env_file.parent,
+                    prefix=env_file.name + ".rollback-",
+                    suffix=".tmp",
                 )
+                os.close(fd)
+                backup_file = Path(backup_name)
                 await asyncio.to_thread(shutil.copyfile, env_file, backup_file)
-            await asyncio.to_thread(_upsert_env_values, env_file, values)
+            try:
+                await asyncio.to_thread(_upsert_env_values, env_file, values)
 
-            if request.api_key is not None:
-                api_key = request.api_key.strip()
-                if api_key:
-                    mirrored = await asyncio.to_thread(write_credential, api_key)
-                    if not mirrored:
-                        # Dropping the stale credential leaves the save without
-                        # a backup but consistent; if even that fails, a stale
-                        # credential would resurrect the previous key after an
-                        # app-data reset, so roll the file back and fail.
+                if request.api_key is not None:
+                    api_key = request.api_key.strip()
+                    if api_key:
+                        mirrored = await asyncio.to_thread(write_credential, api_key)
+                        if not mirrored:
+                            # Dropping the stale credential leaves the save without
+                            # a backup but consistent; if even that fails, a stale
+                            # credential would resurrect the previous key after an
+                            # app-data reset, so roll the file back and fail.
+                            mirrored = await asyncio.to_thread(delete_credential)
+                    else:
                         mirrored = await asyncio.to_thread(delete_credential)
-                else:
-                    mirrored = await asyncio.to_thread(delete_credential)
-                if not mirrored:
-                    restored = False
+                    if not mirrored:
+                        restored = False
+                        try:
+                            if backup_file is not None:
+                                await asyncio.to_thread(os.replace, backup_file, env_file)
+                                backup_file = None
+                            else:
+                                await asyncio.to_thread(env_file.unlink, missing_ok=True)
+                            restored = True
+                        except OSError:
+                            logger.exception(
+                                "Failed to roll back settings file after credential error"
+                            )
+                        raise HTTPException(
+                            status_code=500,
+                            detail=(
+                                "Could not update the stored credential — the API key was not saved."
+                                if restored
+                                else "Could not update the stored credential, and the previous settings could not be restored — the saved settings may still reflect this change."
+                            ),
+                        )
+            finally:
+                # Backup leftovers must not reject a save that already
+                # committed — just log them.
+                if backup_file is not None:
                     try:
-                        if backup_file is not None:
-                            await asyncio.to_thread(os.replace, backup_file, env_file)
-                            backup_file = None
-                        else:
-                            await asyncio.to_thread(env_file.unlink, missing_ok=True)
-                        restored = True
+                        backup_file.unlink(missing_ok=True)
                     except OSError:
                         logger.exception(
-                            "Failed to roll back settings file after credential error"
+                            "Failed to remove settings backup %s", backup_file
                         )
-                    raise HTTPException(
-                        status_code=500,
-                        detail=(
-                            "Could not update the stored credential — the API key was not saved."
-                            if restored
-                            else "Could not update the stored credential, and the previous settings could not be restored — the saved settings may still reflect this change."
-                        ),
-                    )
-
-            if backup_file is not None:
-                await asyncio.to_thread(backup_file.unlink, missing_ok=True)
 
             for key, value in values.items():
                 if key == "OPENAI_API_KEY":
