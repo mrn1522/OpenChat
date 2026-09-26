@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+import tempfile
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -450,10 +451,30 @@ def _upsert_env_values(path: Path, values: dict[str, str | None]) -> None:
         if value is not None:
             updated.append(f"{key}={value}")
 
+    _write_text_atomic(path, "\n".join(updated) + ("\n" if updated else ""))
+
+
+def _write_text_atomic(path: Path, text: str) -> None:
+    """Write ``text`` to ``path`` atomically via a temp file + os.replace.
+
+    Path.write_text truncates first, so a failure mid-write can leave a
+    damaged settings file that the next startup then reads. The temp file
+    lives in the same directory so os.replace is atomic on every platform.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(updated) + ("\n" if updated else ""), encoding="utf-8")
-    if os.name != "nt":
-        os.chmod(path, 0o600)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as tmp_file:
+            tmp_file.write(text)
+        if os.name != "nt":
+            os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _protect_api_key_at_rest() -> None:
@@ -526,11 +547,12 @@ async def update_settings(request: SettingsUpdateRequest) -> SettingsResponse:
 
         if values:
             env_file = settings_env_file()
-            # Snapshot the keys being overwritten so a failed credential update
-            # can roll the file back — the credential store must never end up
-            # ahead of a save the endpoint reported as rejected.
-            stored = dotenv_values(env_file) if env_file.exists() else {}
-            rollback = {key: stored.get(key) for key in values}
+            # Snapshot the raw file so a failed credential update can restore
+            # it byte-for-byte (quoting and comments intact) — the credential
+            # store must never end up ahead of a save the endpoint rejected.
+            previous_text = (
+                env_file.read_text(encoding="utf-8") if env_file.exists() else None
+            )
             await asyncio.to_thread(_upsert_env_values, env_file, values)
 
             if request.api_key is not None:
@@ -547,9 +569,12 @@ async def update_settings(request: SettingsUpdateRequest) -> SettingsResponse:
                     mirrored = await asyncio.to_thread(delete_credential)
                 if not mirrored:
                     try:
-                        await asyncio.to_thread(
-                            _upsert_env_values, env_file, rollback
-                        )
+                        if previous_text is None:
+                            await asyncio.to_thread(env_file.unlink, missing_ok=True)
+                        else:
+                            await asyncio.to_thread(
+                                _write_text_atomic, env_file, previous_text
+                            )
                     except Exception:
                         logger.exception(
                             "Failed to roll back settings file after credential error"
