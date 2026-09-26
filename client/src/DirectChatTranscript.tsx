@@ -8,6 +8,7 @@ const ESTIMATED_MESSAGE_HEIGHT_PX = 120;
 const ESTIMATED_PENDING_HEIGHT_PX = 72;
 const OVERSCAN_COUNT = 6;
 const STICK_TO_BOTTOM_THRESHOLD_PX = 96;
+const TOP_SCROLL_GAP_PX = 28;
 const BOTTOM_SCROLL_GAP_PX = 40;
 
 type TranscriptRow =
@@ -17,12 +18,15 @@ type TranscriptRow =
 type DirectChatTranscriptProps = {
   messages: DirectChatMessage[];
   isRunning: boolean;
+  onImageClick?: (src: string, alt: string) => void;
 };
 
 const DirectChatMessageBubble = memo(function DirectChatMessageBubble({
   message,
+  onImageClick,
 }: {
   message: DirectChatMessage;
+  onImageClick?: (src: string, alt: string) => void;
 }) {
   return (
     <article className={`direct-chat-bubble ${message.role}`}>
@@ -31,12 +35,16 @@ const DirectChatMessageBubble = memo(function DirectChatMessageBubble({
         <div className="direct-chat-image-row">
           {message.images.map((image, index) =>
             image.data_url ? (
-              <img
+              <button
                 key={`${image.name}-${index}`}
+                type="button"
                 className="direct-chat-image-thumb"
-                src={image.data_url}
-                alt={image.name}
-              />
+                title="Click to enlarge"
+                aria-label={`Enlarge image ${image.name}`}
+                onClick={() => image.data_url && onImageClick?.(image.data_url, image.name)}
+              >
+                <img src={image.data_url} alt={image.name} />
+              </button>
             ) : (
               <span key={`${image.name}-${index}`} className="direct-chat-image-chip">
                 {image.name}
@@ -64,7 +72,7 @@ const DirectChatPendingBubble = memo(function DirectChatPendingBubble() {
   );
 });
 
-function DirectChatTranscript({ messages, isRunning }: DirectChatTranscriptProps) {
+function DirectChatTranscript({ messages, isRunning, onImageClick }: DirectChatTranscriptProps) {
   const parentRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
   const previousCountRef = useRef(0);
@@ -102,6 +110,8 @@ function DirectChatTranscript({ messages, isRunning }: DirectChatTranscriptProps
     getScrollElement: () => parentRef.current,
     estimateSize,
     overscan: OVERSCAN_COUNT,
+    paddingStart: TOP_SCROLL_GAP_PX,
+    scrollPaddingStart: TOP_SCROLL_GAP_PX,
     paddingEnd: BOTTOM_SCROLL_GAP_PX,
     scrollPaddingEnd: BOTTOM_SCROLL_GAP_PX,
     getItemKey: (index) => rows[index]?.key ?? index,
@@ -226,7 +236,7 @@ function DirectChatTranscript({ messages, isRunning }: DirectChatTranscriptProps
               }}
             >
               {row.kind === "message" ? (
-                <DirectChatMessageBubble message={row.message} />
+                <DirectChatMessageBubble message={row.message} onImageClick={onImageClick} />
               ) : (
                 <DirectChatPendingBubble />
               )}
