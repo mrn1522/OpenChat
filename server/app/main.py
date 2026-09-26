@@ -3,6 +3,8 @@ import base64
 import json
 import logging
 import os
+import shutil
+import tempfile
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -450,10 +452,30 @@ def _upsert_env_values(path: Path, values: dict[str, str | None]) -> None:
         if value is not None:
             updated.append(f"{key}={value}")
 
+    _write_file_atomic(path, ("\n".join(updated) + ("\n" if updated else "")).encode("utf-8"))
+
+
+def _write_file_atomic(path: Path, data: bytes) -> None:
+    """Write ``data`` to ``path`` atomically via a temp file + os.replace.
+
+    Path.write_* truncates first, so a failure mid-write can leave a
+    damaged settings file that the next startup then reads. The temp file
+    lives in the same directory so os.replace is atomic on every platform.
+    """
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text("\n".join(updated) + ("\n" if updated else ""), encoding="utf-8")
-    if os.name != "nt":
-        os.chmod(path, 0o600)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "wb") as tmp_file:
+            tmp_file.write(data)
+        if os.name != "nt":
+            os.chmod(tmp_name, 0o600)
+        os.replace(tmp_name, path)
+    except BaseException:
+        try:
+            os.unlink(tmp_name)
+        except OSError:
+            pass
+        raise
 
 
 def _protect_api_key_at_rest() -> None:
@@ -518,38 +540,85 @@ async def update_settings(request: SettingsUpdateRequest) -> SettingsResponse:
     async with _settings_write_lock:
         values: dict[str, str | None] = {}
         if request.api_key is not None:
-            api_key = request.api_key.strip()
-            if not api_key and not await asyncio.to_thread(delete_credential):
-                # The credential store is the fallback a later load reads when
-                # no key is stored — leaving it behind would resurrect the
-                # cleared key, so the clear must fail instead of half-applying.
-                raise HTTPException(
-                    status_code=500,
-                    detail="Could not remove the stored credential — the API key was not cleared.",
-                )
-            if api_key and not await asyncio.to_thread(write_credential, api_key):
-                # A stale credential would resurrect the previous key after an
-                # app-data reset, so the save must fail unless the old
-                # credential can be dropped.
-                if not await asyncio.to_thread(delete_credential):
-                    raise HTTPException(
-                        status_code=500,
-                        detail="Could not update the stored credential — the API key was not updated.",
-                    )
-            values["OPENAI_API_KEY"] = protect_secret(api_key) or None
-            if api_key:
-                os.environ["OPENAI_API_KEY"] = api_key
-            else:
-                os.environ.pop("OPENAI_API_KEY", None)
+            values["OPENAI_API_KEY"] = (
+                protect_secret(request.api_key.strip()) or None
+            )
         if request.base_url is not None:
             values["OPENAI_BASE_URL"] = request.base_url.strip() or None
 
         if values:
-            await asyncio.to_thread(_upsert_env_values, settings_env_file(), values)
+            # resolve() so a symlinked settings file is updated at its target
+            # instead of being replaced by the atomic write.
+            env_file = settings_env_file().resolve()
+            # Stage a backup copy before committing the new file: if the
+            # credential update then fails, restoring is a rename — it cannot
+            # fail the way a second write could (e.g. a full disk).
+            backup_file = None
+            try:
+                if env_file.exists():
+                    # mkstemp so the backup — which contains the stored key — is
+                    # 0600 regardless of umask, unlike a bare copyfile target.
+                    fd, backup_name = tempfile.mkstemp(
+                        dir=env_file.parent,
+                        prefix=env_file.name + ".rollback-",
+                        suffix=".tmp",
+                    )
+                    os.close(fd)
+                    backup_file = Path(backup_name)
+                    await asyncio.to_thread(shutil.copyfile, env_file, backup_file)
+                await asyncio.to_thread(_upsert_env_values, env_file, values)
+
+                if request.api_key is not None:
+                    api_key = request.api_key.strip()
+                    if api_key:
+                        mirrored = await asyncio.to_thread(write_credential, api_key)
+                        if not mirrored:
+                            # Dropping the stale credential leaves the save without
+                            # a backup but consistent; if even that fails, a stale
+                            # credential would resurrect the previous key after an
+                            # app-data reset, so roll the file back and fail.
+                            mirrored = await asyncio.to_thread(delete_credential)
+                    else:
+                        mirrored = await asyncio.to_thread(delete_credential)
+                    if not mirrored:
+                        restored = False
+                        try:
+                            if backup_file is not None:
+                                await asyncio.to_thread(os.replace, backup_file, env_file)
+                                backup_file = None
+                            else:
+                                await asyncio.to_thread(env_file.unlink, missing_ok=True)
+                            restored = True
+                        except OSError:
+                            logger.exception(
+                                "Failed to roll back settings file after credential error"
+                            )
+                        raise HTTPException(
+                            status_code=500,
+                            detail=(
+                                "Could not update the stored credential — the API key was not saved."
+                                if restored
+                                else "Could not update the stored credential, and the previous settings could not be restored — the saved settings may still reflect this change."
+                            ),
+                        )
+            finally:
+                # Backup leftovers must not reject a save that already
+                # committed — just log them.
+                if backup_file is not None:
+                    try:
+                        backup_file.unlink(missing_ok=True)
+                    except OSError:
+                        logger.exception(
+                            "Failed to remove settings backup %s", backup_file
+                        )
+
             for key, value in values.items():
                 if key == "OPENAI_API_KEY":
-                    continue  # process env already holds the plaintext key
-                if value is None:
+                    if request.api_key is not None and request.api_key.strip():
+                        os.environ[key] = request.api_key.strip()
+                    else:
+                        os.environ.pop(key, None)
+                elif value is None:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value

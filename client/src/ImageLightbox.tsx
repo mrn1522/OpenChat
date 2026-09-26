@@ -8,10 +8,11 @@ type ImageLightboxProps = {
 
 function ImageLightbox({ src, alt, onClose }: ImageLightboxProps) {
   const overlayRef = useRef<HTMLDivElement | null>(null);
+  const closeRef = useRef<HTMLButtonElement | null>(null);
 
   useEffect(() => {
     const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
-    overlayRef.current?.focus();
+    closeRef.current?.focus();
     const handleKeydown = (event: KeyboardEvent) => {
       if (event.key === "Escape") onClose();
       if (event.key === "Tab") event.preventDefault();
@@ -33,6 +34,18 @@ function ImageLightbox({ src, alt, onClose }: ImageLightboxProps) {
       tabIndex={-1}
       onClick={onClose}
     >
+      <button
+        ref={closeRef}
+        type="button"
+        className="image-lightbox-close"
+        aria-label="Close image viewer"
+        onClick={(event) => {
+          event.stopPropagation();
+          onClose();
+        }}
+      >
+        ×
+      </button>
       <img
         className="image-lightbox-image"
         src={src}
