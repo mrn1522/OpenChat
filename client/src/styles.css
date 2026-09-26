@@ -1765,6 +1765,28 @@ body {
   box-shadow: 0 28px 80px var(--th-shade-5);
 }
 
+.image-lightbox-close {
+  position: absolute;
+  top: 18px;
+  right: 20px;
+  width: 36px;
+  height: 36px;
+  display: grid;
+  place-items: center;
+  border: 1px solid var(--th-edge-16);
+  border-radius: 999px;
+  background: var(--th-ink-36);
+  color: var(--th-bright-4);
+  font-size: 1.2rem;
+  line-height: 1;
+  cursor: pointer;
+}
+
+.image-lightbox-close:hover {
+  background: var(--th-ink-44);
+  border-color: var(--th-edge-21);
+}
+
 .direct-chat-image-chip {
   border: 1px solid var(--th-edge-9);
   border-radius: 999px;

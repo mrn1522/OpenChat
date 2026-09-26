@@ -518,38 +518,54 @@ async def update_settings(request: SettingsUpdateRequest) -> SettingsResponse:
     async with _settings_write_lock:
         values: dict[str, str | None] = {}
         if request.api_key is not None:
-            api_key = request.api_key.strip()
-            if not api_key and not await asyncio.to_thread(delete_credential):
-                # The credential store is the fallback a later load reads when
-                # no key is stored — leaving it behind would resurrect the
-                # cleared key, so the clear must fail instead of half-applying.
-                raise HTTPException(
-                    status_code=500,
-                    detail="Could not remove the stored credential — the API key was not cleared.",
-                )
-            if api_key and not await asyncio.to_thread(write_credential, api_key):
-                # A stale credential would resurrect the previous key after an
-                # app-data reset, so the save must fail unless the old
-                # credential can be dropped.
-                if not await asyncio.to_thread(delete_credential):
-                    raise HTTPException(
-                        status_code=500,
-                        detail="Could not update the stored credential — the API key was not updated.",
-                    )
-            values["OPENAI_API_KEY"] = protect_secret(api_key) or None
-            if api_key:
-                os.environ["OPENAI_API_KEY"] = api_key
-            else:
-                os.environ.pop("OPENAI_API_KEY", None)
+            values["OPENAI_API_KEY"] = (
+                protect_secret(request.api_key.strip()) or None
+            )
         if request.base_url is not None:
             values["OPENAI_BASE_URL"] = request.base_url.strip() or None
 
         if values:
-            await asyncio.to_thread(_upsert_env_values, settings_env_file(), values)
+            env_file = settings_env_file()
+            # Snapshot the keys being overwritten so a failed credential update
+            # can roll the file back — the credential store must never end up
+            # ahead of a save the endpoint reported as rejected.
+            stored = dotenv_values(env_file) if env_file.exists() else {}
+            rollback = {key: stored.get(key) for key in values}
+            await asyncio.to_thread(_upsert_env_values, env_file, values)
+
+            if request.api_key is not None:
+                api_key = request.api_key.strip()
+                if api_key:
+                    mirrored = await asyncio.to_thread(write_credential, api_key)
+                    if not mirrored:
+                        # Dropping the stale credential leaves the save without
+                        # a backup but consistent; if even that fails, a stale
+                        # credential would resurrect the previous key after an
+                        # app-data reset, so roll the file back and fail.
+                        mirrored = await asyncio.to_thread(delete_credential)
+                else:
+                    mirrored = await asyncio.to_thread(delete_credential)
+                if not mirrored:
+                    try:
+                        await asyncio.to_thread(
+                            _upsert_env_values, env_file, rollback
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to roll back settings file after credential error"
+                        )
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Could not update the stored credential — the API key was not saved.",
+                    )
+
             for key, value in values.items():
                 if key == "OPENAI_API_KEY":
-                    continue  # process env already holds the plaintext key
-                if value is None:
+                    if request.api_key is not None and request.api_key.strip():
+                        os.environ[key] = request.api_key.strip()
+                    else:
+                        os.environ.pop(key, None)
+                elif value is None:
                     os.environ.pop(key, None)
                 else:
                     os.environ[key] = value
