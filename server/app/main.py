@@ -554,18 +554,18 @@ async def update_settings(request: SettingsUpdateRequest) -> SettingsResponse:
             # credential update then fails, restoring is a rename — it cannot
             # fail the way a second write could (e.g. a full disk).
             backup_file = None
-            if env_file.exists():
-                # mkstemp so the backup — which contains the stored key — is
-                # 0600 regardless of umask, unlike a bare copyfile target.
-                fd, backup_name = tempfile.mkstemp(
-                    dir=env_file.parent,
-                    prefix=env_file.name + ".rollback-",
-                    suffix=".tmp",
-                )
-                os.close(fd)
-                backup_file = Path(backup_name)
-                await asyncio.to_thread(shutil.copyfile, env_file, backup_file)
             try:
+                if env_file.exists():
+                    # mkstemp so the backup — which contains the stored key — is
+                    # 0600 regardless of umask, unlike a bare copyfile target.
+                    fd, backup_name = tempfile.mkstemp(
+                        dir=env_file.parent,
+                        prefix=env_file.name + ".rollback-",
+                        suffix=".tmp",
+                    )
+                    os.close(fd)
+                    backup_file = Path(backup_name)
+                    await asyncio.to_thread(shutil.copyfile, env_file, backup_file)
                 await asyncio.to_thread(_upsert_env_values, env_file, values)
 
                 if request.api_key is not None:
