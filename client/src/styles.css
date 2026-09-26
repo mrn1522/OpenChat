@@ -1630,8 +1630,8 @@ body {
   scrollbar-width: thin;
   scrollbar-color: var(--th-edge-15) transparent;
   /* Blend the log into the fixed composer: rows fade out near the edges.
-     The bottom band stays inside the scroll gap so resting text keeps
-     full contrast. */
+     Both bands stay inside the virtualizer's scroll gaps so resting text
+     keeps full contrast. */
   -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - 28px), transparent 100%);
   mask-image: linear-gradient(to bottom, transparent 0, #000 26px, #000 calc(100% - 28px), transparent 100%);
 }
