@@ -781,6 +781,9 @@ function App() {
   const directStreamControllerRef = useRef<AbortController | null>(null);
   const directRequestIdRef = useRef(0);
   const directTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // Counts composer onChange events so a send that cleared the draft can
+  // tell "composer untouched since" apart from "typed then erased".
+  const directComposerEditsRef = useRef(0);
   // Bumped whenever the direct session resets/hydrates so file reads started
   // against the old session cannot commit attachments into the new one.
   const directAttachmentGenerationRef = useRef(0);
@@ -2262,6 +2265,7 @@ function App() {
 
   const sendDirectMessage = async () => {
     const sendGeneration = directAttachmentGenerationRef.current;
+    const editsAtSend = directComposerEditsRef.current;
     if (directSendGenerationRef.current === sendGeneration) return;
     directSendGenerationRef.current = sendGeneration;
     try {
@@ -2304,13 +2308,16 @@ function App() {
       if (activePageRef.current !== "direct") return;
       const attachments = directAttachmentsRef.current;
       // A pasted image may have finished reading during the drain — same
-      // batch rejection. The draft was already consumed; hand it back
-      // unless the user has started typing the next message.
+      // batch rejection. The draft was already consumed; hand it back only
+      // when the composer went untouched since (typing anything — even
+      // erased — means the user moved on from this draft).
       if (
         directModel.endsWith(":batch") &&
         attachments.some(isImageAttachment)
       ) {
-        setDirectPrompt((current) => current || trimmedPrompt);
+        if (directComposerEditsRef.current === editsAtSend) {
+          setDirectPrompt(trimmedPrompt);
+        }
         setDirectError(
           "Batch endpoints only accept public image URLs, not uploaded images; pick the non-batch variant for image turns."
         );
@@ -3558,7 +3565,10 @@ function App() {
               <textarea
                 ref={directTextareaRef}
                 value={directPrompt}
-                onChange={(event) => setDirectPrompt(event.target.value)}
+                onChange={(event) => {
+                  directComposerEditsRef.current += 1;
+                  setDirectPrompt(event.target.value);
+                }}
                 onPaste={onDirectComposerPaste}
                 placeholder="Message your selected model..."
                 rows={1}
