@@ -1806,6 +1806,20 @@ body {
   font-size: 0.86rem;
 }
 
+.direct-chat-stopped-note {
+  margin: 0;
+  color: var(--th-bright-4);
+  font-size: 0.86rem;
+  font-style: italic;
+}
+
+.stop-icon {
+  inline-size: 11px;
+  block-size: 11px;
+  border-radius: 2px;
+  background: currentColor;
+}
+
 .history-head {
   display: flex;
   justify-content: space-between;
