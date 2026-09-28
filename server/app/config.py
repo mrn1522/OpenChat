@@ -11,7 +11,7 @@ from app.secrets_store import read_credential, unprotect_secret
 class Settings(BaseSettings):
     openai_api_key: str = Field(default="")
     openai_base_url: str = Field(default="https://openrouter.ai/api/v1")
-    openchat_timeout_seconds: float = Field(default=60.0)
+    openchat_timeout_seconds: float = Field(default=3600.0)
     openchat_max_parallel_sources: int = Field(default=6)
     app_env: str = Field(default="development")
     cors_allow_origins: str = Field(
