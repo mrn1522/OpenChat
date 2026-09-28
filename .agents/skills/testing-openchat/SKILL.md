@@ -45,6 +45,14 @@ description: Exercise first-run connection settings and isolated persistence thr
 - GET `/api/service-tiers/{model_id}` fetches `{base}/models/{id}/endpoints` UNAUTHENTICATED — tier discovery works with a fake key. Useful fixtures: `google/gemini-2.5-flash`→[flex,priority], `openai/gpt-5-mini`→[flex] only, `openai/gpt-5`/`anthropic/claude-sonnet-4.5`→[]. Unknown models 502.
 - No UI route returns from the direct-chat page to fusion without resetting state (`Start new chat` clears everything); restore via the history page or a saved workflow instead.
 
+## Testing `:batch` direct-chat models (OpenRouter Batches API)
+- Model ids ending in `:batch` (e.g. `openai/gpt-oss-20b:batch`) appear only in the Direct Chat picker; fusion/source pickers filter them out. Verified working live: `openai/gpt-oss-20b:batch` (~2.5 min turnaround for "reply with just: ok").
+- Batch turns take minutes by design (server polls `GET /batches/{id}` every 10s). Keep recording during the wait; annotate submit and arrival. The app logger's "Batch <id> finished" line may not reach uvicorn's stderr — the UI reply is the proof.
+- Sequencing: leaving the direct page while a direct run is in-flight aborts the stream, so do other UI checks before or after the wait — never during.
+- A failed image-bearing user turn stays in the transcript and its pixels re-embed on later sends, so batch image-validation rejects every subsequent batch turn too — run image negative tests AFTER the successful batch turn, or reset via the rail "Open direct chat" button (it calls resetDirectSession: wipes transcript AND model).
+- Expected upfront errors: web search → "Batch models cannot use OpenRouter-orchestrated web search; disable web search or pick the non-batch variant."; uploaded image → "Batch endpoints only accept public image URLs, not uploaded images; pick the non-batch variant for image turns."
+- Attaching an image on Linux: click the paperclip → GTK file chooser → Ctrl+L opens the location bar → type the absolute path → Enter.
+
 ## Clicking small UI targets
 - The desktop is typically 1600x1200 while the computer tool uses 1024x768 (1.5625 scale); screenshots show real pixels, so eyeballing icon positions can miss small targets like the 34px rail buttons by a few px.
 - For precise clicks, query `el.getBoundingClientRect()` via the browser console (returns viewport-relative CSS pixels), then convert: `tool_x = (window_x + real_cx * dpr) / scale`, `tool_y = (window_y + (window_height - innerHeight * dpr) + real_cy * dpr) / scale`, where `dpr` is `window.devicePixelRatio` (browser zoom/HiDPI changes it) and `scale` is the detected desktop→tool scale from `xrandr` (typically 1.5625, not hardcoded). Get window origin/size via `wmctrl -lG` or `xdotool getactivewindow getwindowgeometry`.
