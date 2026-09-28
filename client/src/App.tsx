@@ -2304,11 +2304,13 @@ function App() {
       if (activePageRef.current !== "direct") return;
       const attachments = directAttachmentsRef.current;
       // A pasted image may have finished reading during the drain — same
-      // batch rejection, with the draft already consumed.
+      // batch rejection. The draft was already consumed; hand it back
+      // unless the user has started typing the next message.
       if (
         directModel.endsWith(":batch") &&
         attachments.some(isImageAttachment)
       ) {
+        setDirectPrompt((current) => current || trimmedPrompt);
         setDirectError(
           "Batch endpoints only accept public image URLs, not uploaded images; pick the non-batch variant for image turns."
         );
