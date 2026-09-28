@@ -781,6 +781,9 @@ function App() {
   const directStreamControllerRef = useRef<AbortController | null>(null);
   const directRequestIdRef = useRef(0);
   const directTextareaRef = useRef<HTMLTextAreaElement | null>(null);
+  // Counts composer onChange events so a send that cleared the draft can
+  // tell "composer untouched since" apart from "typed then erased".
+  const directComposerEditsRef = useRef(0);
   // Bumped whenever the direct session resets/hydrates so file reads started
   // against the old session cannot commit attachments into the new one.
   const directAttachmentGenerationRef = useRef(0);
@@ -1100,9 +1103,14 @@ function App() {
 
   useEffect(() => {
     if (orderedModelIds.length === 0) return;
-    if (fusionModel && !orderedModelIds.includes(fusionModel)) setFusionModel("");
+    // ":batch" ids are catalog entries but only resolve on the direct-chat
+    // path — prune them from fusion/source state restored from saved
+    // workflows or history, same as models removed from the catalog.
+    const fusionEligible = (id: string) =>
+      orderedModelIds.includes(id) && !id.endsWith(":batch");
+    if (fusionModel && !fusionEligible(fusionModel)) setFusionModel("");
     setSourceModels((prev) => {
-      const next = prev.filter((id) => orderedModelIds.includes(id));
+      const next = prev.filter(fusionEligible);
       if (next.length === prev.length && next.every((id, index) => id === prev[index])) {
         return prev;
       }
@@ -1216,13 +1224,20 @@ function App() {
   );
 
   const filteredModels = useMemo(() => {
+    // ":batch" variants only resolve through the async batches endpoint —
+    // supported on the direct-chat path, so hide them from fusion pickers
+    // where they'd hit the synchronous endpoint and fail.
+    const eligible =
+      activePicker === "direct"
+        ? modelCatalog
+        : modelCatalog.filter((model) => !model.id.endsWith(":batch"));
     const term = pickerQuery.trim().toLowerCase();
-    if (!term) return modelCatalog;
-    return modelCatalog.filter((model) => {
+    if (!term) return eligible;
+    return eligible.filter((model) => {
       const haystack = `${model.name} ${model.id} ${model.provider}`.toLowerCase();
       return haystack.includes(term);
     });
-  }, [modelCatalog, pickerQuery]);
+  }, [activePicker, modelCatalog, pickerQuery]);
 
   const focusedModelId =
     hoveredModelId && filteredModels.some((model) => model.id === hoveredModelId)
@@ -2203,6 +2218,9 @@ function App() {
         pastedText +
         textarea.value.slice(textarea.selectionEnd);
       const caret = textarea.selectionStart + pastedText.length;
+      // Bypasses the textarea's onChange — count it as a user edit so a
+      // mid-drain batch rejection never restores an older draft over it.
+      directComposerEditsRef.current += 1;
       setDirectPrompt(nextValue);
       requestAnimationFrame(() => textarea.setSelectionRange(caret, caret));
     }
@@ -2250,12 +2268,30 @@ function App() {
 
   const sendDirectMessage = async () => {
     const sendGeneration = directAttachmentGenerationRef.current;
+    const editsAtSend = directComposerEditsRef.current;
     if (directSendGenerationRef.current === sendGeneration) return;
     directSendGenerationRef.current = sendGeneration;
     try {
+      const trimmedPrompt = directPrompt.trim();
+      // A `:batch` turn cannot carry web search or inline images — reject
+      // before the draft is consumed and the user turn committed, or the
+      // failed turn's pixels would re-embed and keep tripping later sends.
+      if (directModel.endsWith(":batch")) {
+        const batchRejection = directWebSearchEnabled
+          ? "Batch models cannot use OpenRouter-orchestrated web search; disable web search or pick the non-batch variant."
+          : directAttachmentsRef.current.some(isImageAttachment) ||
+              directMessages.some((message) =>
+                message.images?.some((image) => image.data_url || image.content)
+              )
+            ? "Batch endpoints only accept public image URLs, not uploaded images; pick the non-batch variant for image turns."
+            : null;
+        if (batchRejection) {
+          setDirectError(batchRejection);
+          return;
+        }
+      }
       // Consume the draft at click time: edits made while image reads settle
       // become the next message instead of being silently dropped.
-      const trimmedPrompt = directPrompt.trim();
       setDirectPrompt("");
       // A pasted image can still be reading when Send fires — wait for this
       // session's reads so the outgoing turn includes them, draining until no
@@ -2274,6 +2310,22 @@ function App() {
       if (sendGeneration !== directAttachmentGenerationRef.current) return;
       if (activePageRef.current !== "direct") return;
       const attachments = directAttachmentsRef.current;
+      // A pasted image may have finished reading during the drain — same
+      // batch rejection. The draft was already consumed; hand it back only
+      // when the composer went untouched since (typing anything — even
+      // erased — means the user moved on from this draft).
+      if (
+        directModel.endsWith(":batch") &&
+        attachments.some(isImageAttachment)
+      ) {
+        if (directComposerEditsRef.current === editsAtSend) {
+          setDirectPrompt(trimmedPrompt);
+        }
+        setDirectError(
+          "Batch endpoints only accept public image URLs, not uploaded images; pick the non-batch variant for image turns."
+        );
+        return;
+      }
       const promptText =
         trimmedPrompt || (attachments.some(isImageAttachment) ? "What's in this image?" : "");
       if (!promptText || !directModel || isDirectRunning) return;
@@ -3516,7 +3568,10 @@ function App() {
               <textarea
                 ref={directTextareaRef}
                 value={directPrompt}
-                onChange={(event) => setDirectPrompt(event.target.value)}
+                onChange={(event) => {
+                  directComposerEditsRef.current += 1;
+                  setDirectPrompt(event.target.value);
+                }}
                 onPaste={onDirectComposerPaste}
                 placeholder="Message your selected model..."
                 rows={1}

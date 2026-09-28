@@ -52,6 +52,17 @@ WEB_SEARCH_TOOLS = [
 OPENROUTER_TOKEN_LIMIT = 65000
 SOURCE_EMPTY_RETRY_COUNT = 2
 OPENROUTER_TOOL_LOOP_MAX_STEPS = 8
+
+# Direct-chat `:batch` model variants route through the asynchronous
+# Batches API (POST /batches, then poll GET /batches/{id}) instead of the
+# synchronous chat completions endpoint — roughly half-price tokens in
+# exchange for a minutes-long turnaround. The OpenAI SDK has no batch
+# surface, so these calls go through the shared httpx pool.
+BATCH_MODEL_SUFFIX = ":batch"
+# Terminal statuses in the OpenRouter batch lifecycle; `finalizing` and
+# `cancelling` collapse into `in_progress` in the stored job view.
+BATCH_TERMINAL_STATUSES = frozenset({"completed", "failed", "expired", "cancelled"})
+BATCH_POLL_INTERVAL_SECONDS = 10.0
 PROMPT_OPTIMIZER_MODEL = "openai/gpt-oss-20b"
 PERSONA_GENERATOR_MODEL = "qwen/qwen3.7-max"
 PERSONA_MIN_TEMPERATURE = 0.5
@@ -251,7 +262,7 @@ async def fetch_openrouter_models() -> OpenRouterModelsResponse:
         try:
             response = await _shared_http().get(
                 models_url,
-                timeout=settings.openchat_timeout_seconds,
+                timeout=settings.openchat_metadata_timeout_seconds,
             )
             response.raise_for_status()
             payload = response.json()
@@ -320,7 +331,7 @@ async def _fetch_service_tiers(
     try:
         response = await _shared_http().get(
             endpoints_url,
-            timeout=settings.openchat_timeout_seconds,
+            timeout=settings.openchat_metadata_timeout_seconds,
         )
         response.raise_for_status()
         payload = response.json()
@@ -862,6 +873,16 @@ async def _run_chat_completion_with_tool_loop(
     max_steps: int = OPENROUTER_TOOL_LOOP_MAX_STEPS,
     context: str = "Chat completion",
 ) -> str:
+    if model.endswith(BATCH_MODEL_SUFFIX):
+        # `:batch` variants only resolve through the asynchronous batches
+        # endpoint — they can arrive here via saved workflows/history or raw
+        # API calls into the fusion paths, which only speak synchronous
+        # completions.
+        raise CompletionFailure(
+            f"Model '{model}' is only supported in Direct Chat; batch "
+            "endpoints cannot serve synchronous calls."
+        )
+
     history: list[dict[str, Any]] = [dict(message) for message in messages]
 
     for _ in range(max_steps):
@@ -1159,6 +1180,17 @@ async def run_direct_chat_model(
         service_tier=service_tier,
     )
 
+    if model.endswith(BATCH_MODEL_SUFFIX):
+        return await _run_direct_chat_via_batch(
+            model=model,
+            temperature=temperature,
+            messages=normalized_messages,
+            request_messages=messages,
+            attachments=attachments,
+            web_search_enabled=web_search_enabled,
+            extra_body=extra_body,
+        )
+
     return await _with_transient_retry(
         lambda: _run_chat_completion_with_tool_loop(
             client=client,
@@ -1171,6 +1203,207 @@ async def run_direct_chat_model(
         context="Direct chat",
         model=model,
     )
+
+
+def _validate_batch_direct_chat(
+    *,
+    request_messages: list[DirectChatMessage],
+    attachments: list[AttachmentInput],
+    web_search_enabled: bool,
+) -> None:
+    """Reject options batch endpoints cannot serve before a 24h job is queued.
+
+    OpenRouter-orchestrated search is unavailable in batch, and every
+    provider rejects inline (``data:`` URI) image input — both the current
+    turn's attachments and pixels re-embedded from earlier turns. Failing
+    here beats a discovered-mid-batch rejection that surfaces minutes later.
+    """
+    if web_search_enabled:
+        raise CompletionFailure(
+            "Batch models cannot use OpenRouter-orchestrated web search; "
+            "disable web search or pick the non-batch variant."
+        )
+    if any(attachment.is_image for attachment in attachments) or any(
+        image.content for message in request_messages for image in message.images
+    ):
+        raise CompletionFailure(
+            "Batch endpoints only accept public image URLs, not uploaded "
+            "images; pick the non-batch variant for image turns."
+        )
+
+
+def _batch_error_message(response: httpx.Response) -> str:
+    """Pull OpenRouter's ``error.message`` out of a failed batch call."""
+    try:
+        payload = response.json()
+    except ValueError:
+        return f"HTTP {response.status_code}"
+    error = payload.get("error") if isinstance(payload, dict) else None
+    message = error.get("message") if isinstance(error, dict) else None
+    if isinstance(message, str) and message.strip():
+        return message.strip()
+    return f"HTTP {response.status_code}"
+
+
+def _extract_batch_result(payload: dict[str, Any], *, model: str) -> str:
+    """Unwrap the single request's completion from a terminal batch payload."""
+    batch_id = str(payload.get("id") or "unknown")
+    if payload.get("status") != "completed":
+        error = payload.get("error")
+        message = error.get("message") if isinstance(error, dict) else None
+        raise CompletionFailure(
+            f"Batch '{batch_id}' for model '{model}' ended with status "
+            f"'{payload.get('status')}'{f': {message}' if message else '.'}"
+        )
+
+    usage = payload.get("usage")
+    if isinstance(usage, dict):
+        logger.info("Batch %s finished: %s", batch_id, usage)
+
+    results = payload.get("results")
+    if not isinstance(results, list) or not results:
+        raise CompletionFailure(
+            f"Batch '{batch_id}' for model '{model}' completed without results.",
+            diagnostics={"batch_id": batch_id},
+        )
+    result = results[0] if isinstance(results[0], dict) else {}
+    error = result.get("error")
+    if isinstance(error, dict) and error:
+        message = error.get("message") or json.dumps(error)
+        raise CompletionFailure(f"Batch '{batch_id}' request failed: {message}")
+
+    response = result.get("response")
+    body = response.get("body") if isinstance(response, dict) else None
+    status_code = response.get("status_code") if isinstance(response, dict) else None
+    if status_code != 200 or not isinstance(body, dict):
+        error_body = body.get("error") if isinstance(body, dict) else None
+        message = error_body.get("message") if isinstance(error_body, dict) else None
+        raise CompletionFailure(
+            f"Batch '{batch_id}' request returned status {status_code}"
+            + (f": {message}" if message else ".")
+        )
+
+    choices = body.get("choices")
+    if not isinstance(choices, list) or not choices:
+        raise CompletionFailure(
+            f"Batch '{batch_id}' returned no choices.",
+            diagnostics={"batch_id": batch_id},
+        )
+    message_obj = choices[0].get("message") if isinstance(choices[0], dict) else None
+    if not isinstance(message_obj, dict):
+        raise CompletionFailure(f"Batch '{batch_id}' returned a choice without a message.")
+    if message_obj.get("tool_calls"):
+        raise CompletionFailure(
+            f"Batch '{batch_id}' returned tool calls, which batch mode cannot execute."
+        )
+    return _normalize_message_content(message_obj.get("content"))
+
+
+async def _run_direct_chat_via_batch(
+    *,
+    model: str,
+    temperature: float,
+    messages: list[dict[str, Any]],
+    request_messages: list[DirectChatMessage],
+    attachments: list[AttachmentInput],
+    web_search_enabled: bool,
+    extra_body: dict[str, Any],
+) -> str:
+    """Run one direct-chat turn through the OpenRouter Batches API.
+
+    Submit + poll instead of a synchronous completion: the provider executes
+    the job whenever it schedules it inside its 24h window (median a few
+    minutes) at roughly half the model's per-token price. The `:batch` model
+    id is sent verbatim — the API accepts it and reports the base slug back.
+    OpenRouter exposes no cancel endpoint, so a cancelled poll just leaves a
+    half-priced batch running harmlessly to completion upstream.
+    """
+    _validate_batch_direct_chat(
+        request_messages=request_messages,
+        attachments=attachments,
+        web_search_enabled=web_search_enabled,
+    )
+
+    base_url = settings.openai_base_url.rstrip("/")
+    headers = {"Authorization": f"Bearer {settings.openai_api_key}"}
+    http = _shared_http()
+
+    # Tier routing is meaningless inside batch (the whole point is the
+    # discounted lane) and `speed`/tool orchestration are banned there.
+    batch_body = dict(extra_body)
+    batch_body.pop("service_tier", None)
+    # Batch lanes can sit on a single provider endpoint, and mandatory-
+    # reasoning endpoints 400 any explicit disable — sending nothing lets
+    # the provider apply its default instead of failing the whole batch.
+    reasoning = batch_body.get("reasoning")
+    if isinstance(reasoning, dict) and (
+        reasoning.get("exclude") or reasoning.get("effort") == "none"
+    ):
+        batch_body.pop("reasoning")
+    request_body: dict[str, Any] = {
+        "messages": messages,
+        "temperature": temperature,
+        "max_tokens": OPENROUTER_TOKEN_LIMIT,
+        "max_completion_tokens": OPENROUTER_TOKEN_LIMIT,
+        **batch_body,
+    }
+    # `requests` must serialize after endpoint/model/provider — the API
+    # stream-parses the submit body and 400s when `requests` leads the order.
+    submit_payload = {
+        "endpoint": "/v1/chat/completions",
+        "model": model,
+        "requests": [{"custom_id": "direct-chat", "body": request_body}],
+    }
+    try:
+        submit_response = await http.post(
+            f"{base_url}/batches", headers=headers, json=submit_payload
+        )
+        submit_response.raise_for_status()
+        submit_body = submit_response.json()
+    except httpx.HTTPStatusError as exc:
+        raise CompletionFailure(
+            f"Batch submit for model '{model}' failed: "
+            f"{_batch_error_message(exc.response)}"
+        ) from exc
+    except (httpx.HTTPError, ValueError) as exc:
+        # httpx exception text can embed the request URL — keep it out of the
+        # client-facing error in case base_url carries credentials.
+        raise CompletionFailure(
+            f"Batch submit for model '{model}' failed ({type(exc).__name__})."
+        ) from exc
+
+    batch_id = submit_body.get("id") if isinstance(submit_body, dict) else None
+    if not isinstance(batch_id, str) or not batch_id:
+        raise CompletionFailure(f"Batch submit for model '{model}' returned no batch id.")
+
+    # The usual upstream-call budget doubles as the polling budget: a batch
+    # still running when it expires is abandoned, not cancelled.
+    deadline = time.monotonic() + settings.openchat_timeout_seconds
+    while True:
+        await asyncio.sleep(BATCH_POLL_INTERVAL_SECONDS)
+        try:
+            poll_response = await http.get(
+                f"{base_url}/batches/{batch_id}",
+                headers=headers,
+                timeout=settings.openchat_metadata_timeout_seconds,
+            )
+            poll_response.raise_for_status()
+            poll_body = poll_response.json()
+        except (httpx.HTTPError, ValueError):
+            # A dropped poll does not hurt the running job; retry next tick
+            # while the deadline holds.
+            logger.warning("Batch %s poll failed; retrying.", batch_id, exc_info=True)
+        else:
+            status = poll_body.get("status") if isinstance(poll_body, dict) else None
+            if isinstance(status, str) and status in BATCH_TERMINAL_STATUSES:
+                return _extract_batch_result(poll_body, model=model)
+
+        if time.monotonic() > deadline:
+            raise CompletionFailure(
+                f"Batch '{batch_id}' for model '{model}' did not finish within "
+                f"{settings.openchat_timeout_seconds:.0f}s; it may still "
+                "complete on OpenRouter."
+            )
 
 
 def _build_direct_chat_messages(
