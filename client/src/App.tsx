@@ -2218,6 +2218,9 @@ function App() {
         pastedText +
         textarea.value.slice(textarea.selectionEnd);
       const caret = textarea.selectionStart + pastedText.length;
+      // Bypasses the textarea's onChange — count it as a user edit so a
+      // mid-drain batch rejection never restores an older draft over it.
+      directComposerEditsRef.current += 1;
       setDirectPrompt(nextValue);
       requestAnimationFrame(() => textarea.setSelectionRange(caret, caret));
     }
