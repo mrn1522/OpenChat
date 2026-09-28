@@ -83,7 +83,7 @@ from app.prompting import (
     build_debate_markdown,
     build_debate_prompt,
     build_source_system_prompt,
-    build_system_prompt_with_current_aest,
+    build_system_prompt_with_local_time,
     build_synth_prompt,
 )
 
@@ -643,8 +643,8 @@ async def run_stream(request: RunRequest):
         debate_results: list[dict] = []
         persona_by_agent: dict[str, PersonaAssignment] = {}
         source_system_prompt_by_agent: dict[str, str] = {}
-        debate_system_prompt = build_system_prompt_with_current_aest(DEBATE_SYSTEM_PROMPT)
-        fusion_system_prompt = build_system_prompt_with_current_aest(FUSION_SYSTEM_PROMPT)
+        debate_system_prompt = build_system_prompt_with_local_time(DEBATE_SYSTEM_PROMPT)
+        fusion_system_prompt = build_system_prompt_with_local_time(FUSION_SYSTEM_PROMPT)
 
         yield sse("run_started", {"run_id": run_id})
         yield sse(
@@ -1325,7 +1325,7 @@ async def regenerate_fusion(request: FusionRegenerateRequest) -> SynthesisResult
     if not successful_source_results:
         raise HTTPException(status_code=422, detail="At least one successful source result is required.")
 
-    fusion_system_prompt = build_system_prompt_with_current_aest(FUSION_SYSTEM_PROMPT)
+    fusion_system_prompt = build_system_prompt_with_local_time(FUSION_SYSTEM_PROMPT)
     synth_prompt = build_synth_prompt(request.prompt, successful_source_results, request.critique_output)
 
     try:

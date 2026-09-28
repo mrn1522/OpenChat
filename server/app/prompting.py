@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone
 
 from app.models import PersonaAssignment, SourceAgentSpec, SourceResult
 
@@ -54,13 +54,10 @@ Rules:
 Return only the final answer in Markdown.
 """
 
-AEST_TIMEZONE = timezone(timedelta(hours=10), name="AEST")
-
-
-def build_system_prompt_with_current_aest(base_prompt: str | None = None) -> str:
-    now_utc = datetime.now(timezone.utc)
-    now_aest = now_utc.astimezone(AEST_TIMEZONE)
-    datetime_line = f"Current datetime (AEST, Australia/Hobart): {now_aest.isoformat(timespec='seconds')}"
+def build_system_prompt_with_local_time(base_prompt: str | None = None) -> str:
+    now_local = datetime.now(timezone.utc).astimezone()
+    zone_name = now_local.tzname() or "local time"
+    datetime_line = f"Current datetime ({zone_name}): {now_local.isoformat(timespec='seconds')}"
 
     if base_prompt and base_prompt.strip():
         return f"{base_prompt.strip()}\n\n{datetime_line}"
@@ -92,7 +89,7 @@ def build_source_system_prompt(persona: PersonaAssignment | None) -> str:
         "You are a helpful assistant."
         f"{persona_block}\n\n"
     )
-    return build_system_prompt_with_current_aest(base)
+    return build_system_prompt_with_local_time(base)
 
 
 def _response_body(result: SourceResult) -> str:
