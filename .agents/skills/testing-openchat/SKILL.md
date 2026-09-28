@@ -14,6 +14,7 @@ description: Exercise first-run connection settings and isolated persistence thr
 ## Local runtime
 - Reuse server/.venv-desktop and client/node_modules if available; otherwise create a Python venv from server/requirements.txt and run npm ci in client/. The venv may exist but be empty — if `python -m app` fails with ModuleNotFoundError, run `.venv-desktop/bin/pip install -r requirements-desktop.txt`.
 - Create a fresh writable temporary data directory. From server/, run the venv Python with `-m app --port 8765 --data-dir <absolute temporary directory>`.
+- Restarting the backend: `python -m app` spawns a child that owns the socket — `kill <launcher-pid>` leaves the child alive holding the port, so a relaunch fails with `[Errno 98] address already in use` and the OLD code silently keeps serving (client-side fixes still appear to work since Vite serves the working tree). Before relaunching, kill the actual listener: `ss -tlnp | grep 8765` for the pid, or `pkill -f "python -m app"`, then re-verify the listener pid changed.
 - Unset inherited OPENAI_API_KEY, OPENAI_BASE_URL, OPENCHAT_DATA_DIR, and OPENCHAT_HISTORY_DB_PATH, and set CORS_ALLOW_ORIGINS=http://localhost:5173 for the backend process to isolate first-run behavior.
 - From client/, run `VITE_OPENCHAT_API_BASE=http://127.0.0.1:8765 npm run dev -- --host 0.0.0.0 --port 5173 --strictPort`.
 - Navigate to http://localhost:5173, not http://127.0.0.1:5173: the default CORS configuration allows the localhost origin.
