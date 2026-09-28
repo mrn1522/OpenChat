@@ -931,6 +931,14 @@ async def _run_chat_completion_with_tool_loop(
                 diagnostics=diagnostics,
             )
 
+        if getattr(choices[0], "finish_reason", None) is None:
+            # EOF before the terminal chunk leaves a truncated completion;
+            # a non-streamed truncated body failed the same way.
+            raise CompletionFailure(
+                f"{context} for model '{model}' ended before a finish reason.",
+                diagnostics=_extract_response_diagnostics(response, headers),
+            )
+
         message = choices[0].message
         content = _normalize_message_content(getattr(message, "content", ""))
         raw_tool_calls = getattr(message, "tool_calls", None)

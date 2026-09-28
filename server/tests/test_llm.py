@@ -1295,6 +1295,26 @@ class TestDirectChatStreamedCompletion:
             "content": "search hits",
         }
 
+    def test_stream_ending_before_finish_chunk_raises(self):
+        """Content chunks then EOF = a truncated answer, not a completed one."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            return self._sse_response(
+                [
+                    self._chunk({"role": "assistant", "content": "Hello, the answer is"}),
+                ]
+            )
+
+        with pytest.raises(llm.CompletionFailure, match="finish reason"):
+            asyncio.run(
+                llm._run_chat_completion_with_tool_loop(
+                    client=self._sdk_client(handler),
+                    model="openai/a",
+                    temperature=0.2,
+                    messages=[{"role": "user", "content": "hi"}],
+                    extra_body={},
+                )
+            )
+
     def test_empty_stream_raises_completion_failure(self):
         def handler(request: httpx.Request) -> httpx.Response:
             return self._sse_response([])

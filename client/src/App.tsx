@@ -759,6 +759,7 @@ function App() {
   const [directConversationId, setDirectConversationId] = useState<string | null>(null);
   const [isDirectRunning, setIsDirectRunning] = useState(false);
   const [directStopped, setDirectStopped] = useState(false);
+  const [directRunIsBatch, setDirectRunIsBatch] = useState(false);
   const [directError, setDirectError] = useState<string | null>(null);
   const [directRunId, setDirectRunId] = useState<string | null>(null);
   const [directWebSearchEnabled, setDirectWebSearchEnabled] = useState(false);
@@ -1754,7 +1755,12 @@ function App() {
     setIsDirectSettingsOpen(false);
     setDirectError(null);
     setDirectRunId(chat.run_id);
+    directStreamControllerRef.current?.abort();
+    directStreamControllerRef.current = null;
+    directRequestIdRef.current += 1;
     setIsDirectRunning(false);
+    setDirectStopped(false);
+    setDirectRunIsBatch(false);
     setDirectConversationId(chat.chat_id);
 
     if (chat.messages && chat.messages.length > 0) {
@@ -2348,6 +2354,9 @@ function App() {
       directRequestIdRef.current = requestId;
       setDirectError(null);
       setDirectStopped(false);
+      // Gate the Stop button on the in-flight request, not the picker —
+      // the picker can change models while a run is in progress.
+      setDirectRunIsBatch(directModel.endsWith(":batch"));
       setIsDirectRunning(true);
       setDirectRunId(null);
 
@@ -3692,7 +3701,7 @@ function App() {
                 </div>
 
                 <div className="composer-right-actions">
-                  {isDirectRunning && !directModel.endsWith(":batch") ? (
+                  {isDirectRunning && !directRunIsBatch ? (
                     <button
                       className="send-btn stop-btn"
                       type="button"
