@@ -2265,9 +2265,26 @@ function App() {
     if (directSendGenerationRef.current === sendGeneration) return;
     directSendGenerationRef.current = sendGeneration;
     try {
+      const trimmedPrompt = directPrompt.trim();
+      // A `:batch` turn cannot carry web search or inline images — reject
+      // before the draft is consumed and the user turn committed, or the
+      // failed turn's pixels would re-embed and keep tripping later sends.
+      if (directModel.endsWith(":batch")) {
+        const batchRejection = directWebSearchEnabled
+          ? "Batch models cannot use OpenRouter-orchestrated web search; disable web search or pick the non-batch variant."
+          : directAttachmentsRef.current.some(isImageAttachment) ||
+              directMessages.some((message) =>
+                message.images?.some((image) => image.data_url || image.content)
+              )
+            ? "Batch endpoints only accept public image URLs, not uploaded images; pick the non-batch variant for image turns."
+            : null;
+        if (batchRejection) {
+          setDirectError(batchRejection);
+          return;
+        }
+      }
       // Consume the draft at click time: edits made while image reads settle
       // become the next message instead of being silently dropped.
-      const trimmedPrompt = directPrompt.trim();
       setDirectPrompt("");
       // A pasted image can still be reading when Send fires — wait for this
       // session's reads so the outgoing turn includes them, draining until no
@@ -2286,6 +2303,17 @@ function App() {
       if (sendGeneration !== directAttachmentGenerationRef.current) return;
       if (activePageRef.current !== "direct") return;
       const attachments = directAttachmentsRef.current;
+      // A pasted image may have finished reading during the drain — same
+      // batch rejection, with the draft already consumed.
+      if (
+        directModel.endsWith(":batch") &&
+        attachments.some(isImageAttachment)
+      ) {
+        setDirectError(
+          "Batch endpoints only accept public image URLs, not uploaded images; pick the non-batch variant for image turns."
+        );
+        return;
+      }
       const promptText =
         trimmedPrompt || (attachments.some(isImageAttachment) ? "What's in this image?" : "");
       if (!promptText || !directModel || isDirectRunning) return;
