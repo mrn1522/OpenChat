@@ -1,5 +1,7 @@
 import asyncio
+import base64
 import gzip
+import json
 
 import httpx
 import pytest
@@ -9,6 +11,7 @@ import app.main as main
 from app.config import settings
 from app.models import (
     AttachmentInput,
+    DirectChatImageMeta,
     DirectChatMessage,
     OpenRouterModelsResponse,
     SourceAgentSpec,
@@ -891,3 +894,278 @@ class TestServiceTierPlumbing:
             )
         )
         assert captured["extra_body"]["service_tier"] == "flex"
+
+
+class TestDirectChatBatch:
+    def _client(self, handler) -> httpx.AsyncClient:
+        return httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+    def _run(self, monkeypatch, handler, **overrides):
+        monkeypatch.setattr(settings, "openai_api_key", "k")
+        monkeypatch.setattr(settings, "openai_base_url", "https://openrouter.test/v1")
+        monkeypatch.setattr(llm, "BATCH_POLL_INTERVAL_SECONDS", 0)
+        monkeypatch.setattr(
+            llm, "_shared_http", lambda: self._client(handler)
+        )
+        kwargs = dict(
+            client=None,
+            model="openai/a:batch",
+            messages=[DirectChatMessage(role="user", content="hi")],
+            system_prompt="s",
+            temperature=0.2,
+            web_search_enabled=False,
+            reasoning_effort="medium",
+            reasoning_exclude=False,
+            attachments=[],
+        )
+        kwargs.update(overrides)
+        return asyncio.run(llm.run_direct_chat_model(**kwargs))
+
+    @staticmethod
+    def _completed_payload():
+        return {
+            "id": "batch_1",
+            "status": "completed",
+            "usage": {"cost": 0.001, "prompt_tokens": 3, "completion_tokens": 2},
+            "results": [
+                {
+                    "custom_id": "direct-chat",
+                    "response": {
+                        "status_code": 200,
+                        "body": {
+                            "choices": [
+                                {
+                                    "message": {
+                                        "role": "assistant",
+                                        "content": "batch answer",
+                                    }
+                                }
+                            ]
+                        },
+                    },
+                    "error": None,
+                }
+            ],
+        }
+
+    def test_submits_then_polls_until_completed(self, monkeypatch):
+        calls: list[httpx.Request] = []
+        polls = {"count": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            if request.method == "POST":
+                assert request.url.path == "/v1/batches"
+                payload = json.loads(request.content)
+                # `requests` must serialize after endpoint/model.
+                assert list(payload) == ["endpoint", "model", "requests"]
+                assert payload["endpoint"] == "/v1/chat/completions"
+                assert payload["model"] == "openai/a:batch"
+                item = payload["requests"][0]
+                body = item["body"]
+                assert body["messages"][0]["role"] == "system"
+                assert body["messages"][-1] == {"role": "user", "content": "hi"}
+                assert body["reasoning"]["effort"] == "medium"
+                assert "service_tier" not in body
+                assert "tools" not in body
+                assert "model" not in body
+                return httpx.Response(
+                    202, json={"id": "batch_1", "status": "validating"}
+                )
+            polls["count"] += 1
+            if polls["count"] == 1:
+                return httpx.Response(200, json={"id": "batch_1", "status": "in_progress"})
+            return httpx.Response(200, json=self._completed_payload())
+
+        content = self._run(monkeypatch, handler, service_tier="flex")
+        assert content == "batch answer"
+        assert [request.method for request in calls] == ["POST", "GET", "GET"]
+
+    def test_disabled_reasoning_omitted_for_batch(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                body = json.loads(request.content)["requests"][0]["body"]
+                assert "reasoning" not in body
+                return httpx.Response(202, json={"id": "batch_1"})
+            return httpx.Response(200, json=self._completed_payload())
+
+        assert (
+            self._run(monkeypatch, handler, reasoning_effort="none", reasoning_exclude=True)
+            == "batch answer"
+        )
+
+    def test_poll_transport_failure_retries_next_tick(self, monkeypatch):
+        polls = {"count": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"id": "batch_1"})
+            polls["count"] += 1
+            if polls["count"] == 1:
+                return httpx.Response(500)
+            return httpx.Response(200, json=self._completed_payload())
+
+        assert self._run(monkeypatch, handler) == "batch answer"
+        assert polls["count"] == 2
+
+    def test_malformed_poll_body_retries_next_tick(self, monkeypatch):
+        polls = {"count": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"id": "batch_1"})
+            polls["count"] += 1
+            if polls["count"] == 1:
+                return httpx.Response(200, content=b"{not json")
+            return httpx.Response(200, json=self._completed_payload())
+
+        assert self._run(monkeypatch, handler) == "batch answer"
+        assert polls["count"] == 2
+
+    def test_expired_batch_surfaces_status(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"id": "batch_1"})
+            return httpx.Response(200, json={"id": "batch_1", "status": "expired"})
+
+        with pytest.raises(llm.CompletionFailure, match="'expired'"):
+            self._run(monkeypatch, handler)
+
+    def test_completed_without_results_raises(self, monkeypatch):
+        payload = self._completed_payload()
+        payload["results"] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"id": "batch_1"})
+            return httpx.Response(200, json=payload)
+
+        with pytest.raises(llm.CompletionFailure, match="without results"):
+            self._run(monkeypatch, handler)
+
+    def test_batch_id_rejected_on_sync_path(self):
+        with pytest.raises(llm.CompletionFailure, match="only supported in Direct Chat"):
+            asyncio.run(
+                llm._run_chat_completion_with_tool_loop(
+                    client=None,
+                    model="openai/a:batch",
+                    temperature=0.2,
+                    messages=[{"role": "user", "content": "hi"}],
+                    extra_body={},
+                )
+            )
+
+    def test_web_search_rejected_before_submit(self, monkeypatch):
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(500)
+
+        with pytest.raises(llm.CompletionFailure, match="web search"):
+            self._run(monkeypatch, handler, web_search_enabled=True)
+        assert calls == []
+
+    def test_new_image_attachment_rejected(self, monkeypatch):
+        image = AttachmentInput(
+            name="x.png",
+            size=4,
+            content_type="image/png",
+            content=base64.b64encode(b"1234").decode(),
+        )
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(500)
+
+        with pytest.raises(llm.CompletionFailure, match="image"):
+            self._run(monkeypatch, handler, attachments=[image])
+        assert calls == []
+
+    def test_prior_turn_embedded_image_rejected(self, monkeypatch):
+        message = DirectChatMessage(
+            role="user",
+            content="hi",
+            images=[
+                DirectChatImageMeta(
+                    name="x.png",
+                    content_type="image/png",
+                    content=base64.b64encode(b"1234").decode(),
+                )
+            ],
+        )
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(500)
+
+        with pytest.raises(llm.CompletionFailure, match="image"):
+            self._run(monkeypatch, handler, messages=[message])
+        assert calls == []
+
+    def test_failed_batch_surfaces_error(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"id": "batch_1"})
+            return httpx.Response(
+                200,
+                json={
+                    "id": "batch_1",
+                    "status": "failed",
+                    "error": {"message": "request contained banned parameters"},
+                },
+            )
+
+        with pytest.raises(llm.CompletionFailure, match="banned parameters"):
+            self._run(monkeypatch, handler)
+
+    def test_submit_error_surfaces_upstream_message(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return httpx.Response(
+                400, json={"error": {"message": "model has no :batch endpoints"}}
+            )
+
+        with pytest.raises(llm.CompletionFailure, match="no :batch endpoints"):
+            self._run(monkeypatch, handler)
+
+    def test_non_200_result_raises(self, monkeypatch):
+        payload = self._completed_payload()
+        payload["results"][0]["response"]["status_code"] = 429
+        payload["results"][0]["response"]["body"] = {"error": {"message": "rate limited"}}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"id": "batch_1"})
+            return httpx.Response(200, json=payload)
+
+        with pytest.raises(llm.CompletionFailure, match="rate limited"):
+            self._run(monkeypatch, handler)
+
+    def test_tool_call_result_raises(self, monkeypatch):
+        payload = self._completed_payload()
+        payload["results"][0]["response"]["body"]["choices"][0]["message"] = {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [{"id": "call_1"}],
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"id": "batch_1"})
+            return httpx.Response(200, json=payload)
+
+        with pytest.raises(llm.CompletionFailure, match="tool calls"):
+            self._run(monkeypatch, handler)
+
+    def test_deadline_expiry_names_batch_id(self, monkeypatch):
+        monkeypatch.setattr(settings, "openchat_timeout_seconds", -1)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"id": "batch_1"})
+            return httpx.Response(200, json={"id": "batch_1", "status": "in_progress"})
+
+        with pytest.raises(llm.CompletionFailure, match="batch_1"):
+            self._run(monkeypatch, handler)
