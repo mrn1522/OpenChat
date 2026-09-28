@@ -1216,13 +1216,20 @@ function App() {
   );
 
   const filteredModels = useMemo(() => {
+    // ":batch" variants only resolve through the async batches endpoint —
+    // supported on the direct-chat path, so hide them from fusion pickers
+    // where they'd hit the synchronous endpoint and fail.
+    const eligible =
+      activePicker === "direct"
+        ? modelCatalog
+        : modelCatalog.filter((model) => !model.id.endsWith(":batch"));
     const term = pickerQuery.trim().toLowerCase();
-    if (!term) return modelCatalog;
-    return modelCatalog.filter((model) => {
+    if (!term) return eligible;
+    return eligible.filter((model) => {
       const haystack = `${model.name} ${model.id} ${model.provider}`.toLowerCase();
       return haystack.includes(term);
     });
-  }, [modelCatalog, pickerQuery]);
+  }, [activePicker, modelCatalog, pickerQuery]);
 
   const focusedModelId =
     hoveredModelId && filteredModels.some((model) => model.id === hoveredModelId)
