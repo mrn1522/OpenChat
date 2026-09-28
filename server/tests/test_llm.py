@@ -5,6 +5,7 @@ import json
 
 import httpx
 import pytest
+from openai import AsyncOpenAI
 
 import app.llm as llm
 import app.main as main
@@ -1169,3 +1170,142 @@ class TestDirectChatBatch:
 
         with pytest.raises(llm.CompletionFailure, match="batch_1"):
             self._run(monkeypatch, handler)
+
+
+class TestDirectChatStreamedCompletion:
+    """Synchronous completions run as `stream: true` upstream so client
+    disconnects abort generation on providers that support cancellation;
+    chunks are buffered into the same result the tool loop returns."""
+
+    def _sdk_client(self, handler) -> AsyncOpenAI:
+        return AsyncOpenAI(
+            api_key="k",
+            base_url="https://openrouter.test/v1",
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+    @staticmethod
+    def _sse_response(chunks: list[dict]) -> httpx.Response:
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+        body += "data: [DONE]\n\n"
+        return httpx.Response(
+            200, content=body.encode(), headers={"content-type": "text/event-stream"}
+        )
+
+    @staticmethod
+    def _chunk(delta: dict, finish: str | None = None) -> dict:
+        return {
+            "id": "cmpl-1",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "openai/a",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+
+    def test_accumulates_content_and_requests_stream(self):
+        requests: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(json.loads(request.content))
+            return self._sse_response(
+                [
+                    self._chunk({"role": "assistant", "content": "Hello"}),
+                    self._chunk({"content": " world"}),
+                    self._chunk({}, "stop"),
+                ]
+            )
+
+        result = asyncio.run(
+            llm.run_direct_chat_model(
+                client=self._sdk_client(handler),
+                model="openai/a",
+                messages=[DirectChatMessage(role="user", content="hi")],
+                system_prompt="s",
+                temperature=0.2,
+                web_search_enabled=False,
+                reasoning_effort="medium",
+                reasoning_exclude=False,
+                attachments=[],
+            )
+        )
+
+        assert result == "Hello world"
+        assert requests[0]["stream"] is True
+
+    def test_tool_calls_reassemble_across_delta_chunks(self):
+        calls = {"count": 0}
+        seen_messages: list[list[dict]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["count"] += 1
+            seen_messages.append(json.loads(request.content)["messages"])
+            if calls["count"] == 1:
+                return self._sse_response(
+                    [
+                        self._chunk(
+                            {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "web.search",
+                                            "arguments": '{"q":',
+                                        },
+                                        "result": "search hits",
+                                    }
+                                ],
+                            }
+                        ),
+                        self._chunk(
+                            {
+                                "tool_calls": [
+                                    {"index": 0, "function": {"arguments": '"x"}'}}
+                                ]
+                            }
+                        ),
+                        self._chunk({}, "tool_calls"),
+                    ]
+                )
+            return self._sse_response(
+                [
+                    self._chunk({"content": "final answer"}),
+                    self._chunk({}, "stop"),
+                ]
+            )
+
+        result = asyncio.run(
+            llm._run_chat_completion_with_tool_loop(
+                client=self._sdk_client(handler),
+                model="openai/a",
+                temperature=0.2,
+                messages=[{"role": "user", "content": "hi"}],
+                extra_body={},
+            )
+        )
+
+        assert result == "final answer"
+        assert calls["count"] == 2
+        assert seen_messages[1][-2]["tool_calls"][0]["function"]["arguments"] == '{"q":"x"}'
+        assert seen_messages[1][-1] == {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "search hits",
+        }
+
+    def test_empty_stream_raises_completion_failure(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return self._sse_response([])
+
+        with pytest.raises(llm.CompletionFailure, match="no choices"):
+            asyncio.run(
+                llm._run_chat_completion_with_tool_loop(
+                    client=self._sdk_client(handler),
+                    model="openai/a",
+                    temperature=0.2,
+                    messages=[{"role": "user", "content": "hi"}],
+                    extra_body={},
+                )
+            )

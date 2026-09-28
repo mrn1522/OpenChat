@@ -7,13 +7,14 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any, TypeVar
 
 import httpx
-from openai import AsyncOpenAI
 from openai import (
     APIConnectionError,
     APITimeoutError,
+    AsyncOpenAI,
     InternalServerError,
     RateLimitError,
 )
+from openai.lib.streaming.chat import ChatCompletionStreamState
 
 from app.config import settings
 from app.models import (
@@ -888,7 +889,10 @@ async def _run_chat_completion_with_tool_loop(
     for _ in range(max_steps):
         # Use with_raw_response so OpenRouter diagnostic headers (request id,
         # rate-limit state, provider error fields) remain inspectable when a
-        # parsed completion has no choices.
+        # parsed completion has no choices. The request is streamed because
+        # OpenRouter only stops generation and billing on client disconnect
+        # for streamed requests; chunks accumulate into the same completion
+        # the tool loop expects.
         raw = await client.chat.completions.with_raw_response.create(
             model=model,
             temperature=temperature,
@@ -896,9 +900,28 @@ async def _run_chat_completion_with_tool_loop(
             max_completion_tokens=OPENROUTER_TOKEN_LIMIT,
             messages=history,
             extra_body=extra_body,
+            stream=True,
         )
-        response = raw.parse()
         headers = getattr(raw, "headers", None)
+
+        stream = raw.parse()
+        stream_state = ChatCompletionStreamState()
+        saw_chunk = False
+        try:
+            async for chunk in stream:
+                stream_state.handle_chunk(chunk)
+                saw_chunk = True
+        finally:
+            # Explicit close aborts the HTTP connection when the task is
+            # cancelled mid-stream (client disconnected).
+            await stream.close()
+
+        if not saw_chunk:
+            raise CompletionFailure(
+                f"{context} for model '{model}' returned no choices.",
+                diagnostics=_extract_response_diagnostics(None, headers),
+            )
+        response = stream_state.get_final_completion()
 
         choices = getattr(response, "choices", None)
         if not isinstance(choices, list) or not choices:

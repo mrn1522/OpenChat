@@ -758,6 +758,7 @@ function App() {
   const [directMessages, setDirectMessages] = useState<DirectChatMessage[]>([]);
   const [directConversationId, setDirectConversationId] = useState<string | null>(null);
   const [isDirectRunning, setIsDirectRunning] = useState(false);
+  const [directStopped, setDirectStopped] = useState(false);
   const [directError, setDirectError] = useState<string | null>(null);
   const [directRunId, setDirectRunId] = useState<string | null>(null);
   const [directWebSearchEnabled, setDirectWebSearchEnabled] = useState(false);
@@ -1487,6 +1488,7 @@ function App() {
     directStreamControllerRef.current = null;
     directRequestIdRef.current += 1;
     setIsDirectRunning(false);
+    setDirectStopped(true);
   }, [activePage, isDirectRunning]);
 
   useLayoutEffect(() => {
@@ -1603,11 +1605,23 @@ function App() {
     }
   };
 
+  const stopDirectStream = () => {
+    // Aborting the fetch drops the SSE connection; the server then closes
+    // the streamed upstream request, which stops generation and billing on
+    // providers that honor stream cancellation.
+    directStreamControllerRef.current?.abort();
+    directStreamControllerRef.current = null;
+    directRequestIdRef.current += 1;
+    setIsDirectRunning(false);
+    setDirectStopped(true);
+  };
+
   const resetDirectSession = () => {
     directStreamControllerRef.current?.abort();
     directStreamControllerRef.current = null;
     directRequestIdRef.current += 1;
     setIsDirectRunning(false);
+    setDirectStopped(false);
     setDirectError(null);
     setDirectRunId(null);
     setDirectPrompt("");
@@ -2333,6 +2347,7 @@ function App() {
       const requestId = directRequestIdRef.current + 1;
       directRequestIdRef.current = requestId;
       setDirectError(null);
+      setDirectStopped(false);
       setIsDirectRunning(true);
       setDirectRunId(null);
 
@@ -3560,6 +3575,7 @@ function App() {
               <DirectChatTranscript
                 messages={directMessages}
                 isRunning={isDirectRunning}
+                wasStopped={directStopped}
                 onImageClick={enlargeImage}
               />
             </div>
@@ -3676,17 +3692,30 @@ function App() {
                 </div>
 
                 <div className="composer-right-actions">
-                  <button
-                    className="send-btn"
-                    type="button"
-                    onClick={() => {
-                      void sendDirectMessage();
-                    }}
-                    disabled={!canSendDirect}
-                  >
-                    <img src={sendIcon} alt="" aria-hidden="true" className="ui-icon" />
-                    {isDirectRunning ? "Running..." : "Send"}
-                  </button>
+                  {isDirectRunning && !directModel.endsWith(":batch") ? (
+                    <button
+                      className="send-btn stop-btn"
+                      type="button"
+                      onClick={stopDirectStream}
+                      title="Stop response"
+                      aria-label="Stop response"
+                    >
+                      <span className="stop-icon" aria-hidden="true" />
+                      Stop
+                    </button>
+                  ) : (
+                    <button
+                      className="send-btn"
+                      type="button"
+                      onClick={() => {
+                        void sendDirectMessage();
+                      }}
+                      disabled={!canSendDirect}
+                    >
+                      <img src={sendIcon} alt="" aria-hidden="true" className="ui-icon" />
+                      {isDirectRunning ? "Running..." : "Send"}
+                    </button>
+                  )}
                 </div>
               </div>
             </section>
