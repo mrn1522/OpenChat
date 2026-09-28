@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from app.models import PersonaAssignment, SourceAgentSpec, SourceResult
 from app.prompting import (
     build_debate_markdown,
@@ -5,7 +7,7 @@ from app.prompting import (
     build_persona_generation_prompt,
     build_source_system_prompt,
     build_synth_prompt,
-    build_system_prompt_with_current_aest,
+    build_system_prompt_with_local_time,
 )
 
 
@@ -16,19 +18,20 @@ def _result(model: str, content: str, status: str = "ok", agent_id: str = "") ->
 
 
 class TestSystemPrompt:
-    def test_includes_aest_datetime(self):
-        prompt = build_system_prompt_with_current_aest()
-        assert "Current datetime (AEST, Australia/Hobart):" in prompt
+    def test_includes_local_datetime(self):
+        prompt = build_system_prompt_with_local_time()
+        zone_name = datetime.now(timezone.utc).astimezone().tzname() or "local time"
+        assert f"Current datetime ({zone_name}):" in prompt
 
     def test_appends_datetime_to_base(self):
-        prompt = build_system_prompt_with_current_aest("You are helpful.")
+        prompt = build_system_prompt_with_local_time("You are helpful.")
         assert prompt.startswith("You are helpful.")
-        assert "Current datetime (AEST" in prompt
+        assert "Current datetime (" in prompt
 
     def test_blank_base_treated_as_none(self):
-        prompt = build_system_prompt_with_current_aest("   ")
+        prompt = build_system_prompt_with_local_time("   ")
         assert "You are helpful" not in prompt
-        assert "Current datetime (AEST" in prompt
+        assert "Current datetime (" in prompt
 
 
 class TestPersonaGenerationPrompt:
