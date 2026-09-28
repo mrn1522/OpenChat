@@ -1366,7 +1366,11 @@ async def _run_direct_chat_via_batch(
             f"{_batch_error_message(exc.response)}"
         ) from exc
     except (httpx.HTTPError, ValueError) as exc:
-        raise CompletionFailure(f"Batch submit for model '{model}' failed: {exc}") from exc
+        # httpx exception text can embed the request URL — keep it out of the
+        # client-facing error in case base_url carries credentials.
+        raise CompletionFailure(
+            f"Batch submit for model '{model}' failed ({type(exc).__name__})."
+        ) from exc
 
     batch_id = submit_body.get("id") if isinstance(submit_body, dict) else None
     if not isinstance(batch_id, str) or not batch_id:
