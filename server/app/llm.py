@@ -251,7 +251,7 @@ async def fetch_openrouter_models() -> OpenRouterModelsResponse:
         try:
             response = await _shared_http().get(
                 models_url,
-                timeout=settings.openchat_timeout_seconds,
+                timeout=settings.openchat_metadata_timeout_seconds,
             )
             response.raise_for_status()
             payload = response.json()
@@ -320,7 +320,7 @@ async def _fetch_service_tiers(
     try:
         response = await _shared_http().get(
             endpoints_url,
-            timeout=settings.openchat_timeout_seconds,
+            timeout=settings.openchat_metadata_timeout_seconds,
         )
         response.raise_for_status()
         payload = response.json()
