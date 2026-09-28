@@ -1008,6 +1008,53 @@ class TestDirectChatBatch:
         assert self._run(monkeypatch, handler) == "batch answer"
         assert polls["count"] == 2
 
+    def test_malformed_poll_body_retries_next_tick(self, monkeypatch):
+        polls = {"count": 0}
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"id": "batch_1"})
+            polls["count"] += 1
+            if polls["count"] == 1:
+                return httpx.Response(200, content=b"{not json")
+            return httpx.Response(200, json=self._completed_payload())
+
+        assert self._run(monkeypatch, handler) == "batch answer"
+        assert polls["count"] == 2
+
+    def test_expired_batch_surfaces_status(self, monkeypatch):
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"id": "batch_1"})
+            return httpx.Response(200, json={"id": "batch_1", "status": "expired"})
+
+        with pytest.raises(llm.CompletionFailure, match="'expired'"):
+            self._run(monkeypatch, handler)
+
+    def test_completed_without_results_raises(self, monkeypatch):
+        payload = self._completed_payload()
+        payload["results"] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.method == "POST":
+                return httpx.Response(202, json={"id": "batch_1"})
+            return httpx.Response(200, json=payload)
+
+        with pytest.raises(llm.CompletionFailure, match="without results"):
+            self._run(monkeypatch, handler)
+
+    def test_batch_id_rejected_on_sync_path(self):
+        with pytest.raises(llm.CompletionFailure, match="only supported in Direct Chat"):
+            asyncio.run(
+                llm._run_chat_completion_with_tool_loop(
+                    client=None,
+                    model="openai/a:batch",
+                    temperature=0.2,
+                    messages=[{"role": "user", "content": "hi"}],
+                    extra_body={},
+                )
+            )
+
     def test_web_search_rejected_before_submit(self, monkeypatch):
         calls: list[httpx.Request] = []
 

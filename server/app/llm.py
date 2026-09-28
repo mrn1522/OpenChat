@@ -873,6 +873,16 @@ async def _run_chat_completion_with_tool_loop(
     max_steps: int = OPENROUTER_TOOL_LOOP_MAX_STEPS,
     context: str = "Chat completion",
 ) -> str:
+    if model.endswith(BATCH_MODEL_SUFFIX):
+        # `:batch` variants only resolve through the asynchronous batches
+        # endpoint — they can arrive here via saved workflows/history or raw
+        # API calls into the fusion paths, which only speak synchronous
+        # completions.
+        raise CompletionFailure(
+            f"Model '{model}' is only supported in Direct Chat; batch "
+            "endpoints cannot serve synchronous calls."
+        )
+
     history: list[dict[str, Any]] = [dict(message) for message in messages]
 
     for _ in range(max_steps):
@@ -1375,7 +1385,7 @@ async def _run_direct_chat_via_batch(
             )
             poll_response.raise_for_status()
             poll_body = poll_response.json()
-        except httpx.HTTPError:
+        except (httpx.HTTPError, ValueError):
             # A dropped poll does not hurt the running job; retry next tick
             # while the deadline holds.
             logger.warning("Batch %s poll failed; retrying.", batch_id, exc_info=True)

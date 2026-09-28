@@ -1100,9 +1100,14 @@ function App() {
 
   useEffect(() => {
     if (orderedModelIds.length === 0) return;
-    if (fusionModel && !orderedModelIds.includes(fusionModel)) setFusionModel("");
+    // ":batch" ids are catalog entries but only resolve on the direct-chat
+    // path — prune them from fusion/source state restored from saved
+    // workflows or history, same as models removed from the catalog.
+    const fusionEligible = (id: string) =>
+      orderedModelIds.includes(id) && !id.endsWith(":batch");
+    if (fusionModel && !fusionEligible(fusionModel)) setFusionModel("");
     setSourceModels((prev) => {
-      const next = prev.filter((id) => orderedModelIds.includes(id));
+      const next = prev.filter(fusionEligible);
       if (next.length === prev.length && next.every((id, index) => id === prev[index])) {
         return prev;
       }
