@@ -1,3 +1,5 @@
+import base64
+
 import pytest
 from pydantic import ValidationError
 
@@ -330,6 +332,41 @@ class TestDirectChatRequest:
                     for i in range(3)
                 ],
             )
+
+    def test_raw_binary_bound_mirrors_latest_turn_exclusion(self):
+        # The last turn's embedded files are dropped upstream when matching
+        # attachments exist — the raw bound must not double-count them.
+        chunk = base64.b64encode(b"%PDF-1.7" + b"\x00" * 9_000_000).decode()
+        request = DirectChatRequest(
+            model="m",
+            messages=[
+                {
+                    "role": "user",
+                    "content": "compare",
+                    "files": [
+                        {
+                            "name": "a.pdf",
+                            "content_type": "application/pdf",
+                            "content": chunk,
+                        },
+                        {
+                            "name": "b.pdf",
+                            "content_type": "application/pdf",
+                            "content": chunk,
+                        },
+                    ],
+                }
+            ],
+            attachments=[
+                {
+                    "name": "c.pdf",
+                    "size": 9_000_010,
+                    "content_type": "application/pdf",
+                    "content": chunk,
+                }
+            ],
+        )
+        assert len(request.messages[0].files) == 2
 
     def test_rejects_system_role(self):
         with pytest.raises(ValidationError):

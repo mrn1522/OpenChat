@@ -259,17 +259,45 @@ class DirectChatRequest(BaseModel):
             value = item.get("content_type") if isinstance(item, dict) else getattr(item, "content_type", "")
             return value if isinstance(value, str) else ""
 
-        def is_binary(item: Any) -> bool:
-            return content_type(item).startswith("image/") or content_type(item) == "application/pdf"
+        def is_image(item: Any) -> bool:
+            return content_type(item).startswith("image/")
+
+        def is_pdf(item: Any) -> bool:
+            return content_type(item) == "application/pdf"
+
+        messages = data.get("messages") or []
+        attachments = data.get("attachments") or []
+        # Mirror _cap_total_binary_bytes: the last user turn's embedded content
+        # is dropped upstream when attachments of that kind exist, so it must
+        # not count here either — its per-item caps still bound the decode work.
+        last_user_index = next(
+            (
+                index
+                for index in range(len(messages) - 1, -1, -1)
+                if (
+                    messages[index].get("role")
+                    if isinstance(messages[index], dict)
+                    else getattr(messages[index], "role", None)
+                )
+                == "user"
+            ),
+            -1,
+        )
+        has_image_attachments = any(is_image(a) for a in attachments)
+        has_pdf_attachments = any(is_pdf(a) for a in attachments)
 
         total = 0
-        for message in data.get("messages") or []:
-            for key in ("images", "files"):
+        for index, message in enumerate(messages):
+            skip_images = index == last_user_index and has_image_attachments
+            skip_files = index == last_user_index and has_pdf_attachments
+            for key, skip in (("images", skip_images), ("files", skip_files)):
+                if skip:
+                    continue
                 metas = message.get(key) if isinstance(message, dict) else getattr(message, key, None)
                 for meta in metas or []:
                     total += content_len(meta)
-        for attachment in data.get("attachments") or []:
-            if is_binary(attachment):
+        for attachment in attachments:
+            if is_image(attachment) or is_pdf(attachment):
                 total += content_len(attachment)
         if total > MAX_TOTAL_BINARY_BASE64_CHARS:
             raise ValueError(

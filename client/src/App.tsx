@@ -557,8 +557,8 @@ const readPdfAttachmentFile = (file: File): Promise<ComposerAttachment | null> =
     reader.onload = () => {
       const result = typeof reader.result === "string" ? reader.result : "";
       const match = /^data:[^;]*;base64,(.+)$/.exec(result);
-      // "%PDF-" base64-encodes to "JVBERi" — the extension/MIME can lie.
-      if (!match || !match[1].startsWith("JVBERi")) {
+      // "%PDF-" base64-encodes to "JVBERi0" — the extension/MIME can lie.
+      if (!match || !match[1].startsWith("JVBERi0")) {
         resolve(null);
         return;
       }
