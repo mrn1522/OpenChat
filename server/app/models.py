@@ -15,13 +15,12 @@ MAX_TEXT_ATTACHMENT_CHARS = 100_000
 MAX_IMAGE_BASE64_CHARS = 7_000_000
 # ceil(10MiB / 3) * 4 base64 chars, with padding headroom.
 MAX_PDF_BASE64_CHARS = 14_000_000
-# Encoded-length bound on one request's total embedded binaries, applied
-# before nested models decode anything. A request that could still pass the
-# 20MiB decoded cap carries at most ~28M chars of upstream-bound content plus
-# up to 105M chars of latest-turn embedded content the cap may exclude (5
-# PDFs + 5 images at their per-item limits). Larger totals always fail the
-# decoded cap, so rejecting them only skips useless decode work.
-MAX_TOTAL_BINARY_BASE64_CHARS = 134_000_000
+# Encoded-length bound on the upstream-bound portion of a request's embedded
+# binaries, applied before nested models decode anything. The decoded cap can
+# exclude one latest-turn's embedded content when matching attachments exist,
+# so the effective bound grows by that turn's per-item headroom — see
+# _bound_raw_binary_chars.
+MAX_TOTAL_BINARY_BASE64_CHARS = 28_000_000
 # Formats every major vision provider accepts via OpenRouter data URLs.
 SUPPORTED_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 # Binary document formats routed to OpenRouter's file-parser plugin.
@@ -274,11 +273,17 @@ class DirectChatRequest(BaseModel):
             # the 422 instead of failing on raw indexing here.
             return data
 
-        # Count everything nested validation would decode — including the
-        # latest user turn's embedded content. The bound is sized for the
-        # largest payload the decoded cap could still accept (see the
-        # constant), so the exclusion only applies where bytes are measured:
-        # _cap_total_binary_bytes.
+        # Count everything nested validation would decode, but size the bound
+        # for the largest payload the decoded cap could still accept: the
+        # upstream-bound budget plus the latest user turn's per-item headroom
+        # — reachable only when attachments of that kind exclude its embedded
+        # content upstream (mirroring _cap_total_binary_bytes).
+        bound = MAX_TOTAL_BINARY_BASE64_CHARS
+        if any(is_pdf(attachment) for attachment in attachments):
+            bound += 5 * MAX_PDF_BASE64_CHARS
+        if any(is_image(attachment) for attachment in attachments):
+            bound += 5 * MAX_IMAGE_BASE64_CHARS
+
         total = 0
         for message in messages:
             for key in ("images", "files"):
@@ -290,7 +295,7 @@ class DirectChatRequest(BaseModel):
         for attachment in attachments:
             if is_image(attachment) or is_pdf(attachment):
                 total += content_len(attachment)
-        if total > MAX_TOTAL_BINARY_BASE64_CHARS:
+        if total > bound:
             raise ValueError(
                 f"total binary payload exceeds {MAX_TOTAL_BINARY_BYTES} bytes"
             )
