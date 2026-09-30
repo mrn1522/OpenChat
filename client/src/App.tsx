@@ -2375,8 +2375,8 @@ function App() {
       // The server bounds the combined binary payload of one request —
       // reject here before the turn is committed, or an over-budget send
       // strands the user message with its attachments already consumed.
-      const binaryBytes =
-        directAttachmentsRef.current
+      const binaryBytes = (items: ComposerAttachment[]) =>
+        items
           .filter((attachment) => isImageAttachment(attachment) || isPdfAttachment(attachment))
           .reduce((sum, attachment) => sum + attachment.size, 0) +
         directMessages.reduce(
@@ -2392,7 +2392,7 @@ function App() {
             ),
           0
         );
-      if (binaryBytes > MAX_TOTAL_BINARY_BYTES) {
+      if (binaryBytes(directAttachmentsRef.current) > MAX_TOTAL_BINARY_BYTES) {
         setDirectError(
           "Total image/PDF payload exceeds 20MB — remove a file or start a new chat."
         );
@@ -2431,6 +2431,17 @@ function App() {
         }
         setDirectError(
           "Batch endpoints only accept public file URLs, not uploaded images or PDFs; pick the non-batch variant for media turns."
+        );
+        return;
+      }
+      // A file still reading at Send lands in `attachments` only now —
+      // recheck the budget against the post-drain set.
+      if (binaryBytes(attachments) > MAX_TOTAL_BINARY_BYTES) {
+        if (directComposerEditsRef.current === editsAtSend) {
+          setDirectPrompt(trimmedPrompt);
+        }
+        setDirectError(
+          "Total image/PDF payload exceeds 20MB — remove a file or start a new chat."
         );
         return;
       }
