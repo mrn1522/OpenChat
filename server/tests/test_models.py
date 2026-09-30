@@ -368,6 +368,13 @@ class TestDirectChatRequest:
         )
         assert len(request.messages[0].files) == 2
 
+    def test_raw_binary_bound_ignores_malformed_shapes(self):
+        # Non-list payloads are field errors (422), not raw-bound crashes.
+        with pytest.raises(ValidationError):
+            DirectChatRequest(model="m", messages=5)
+        with pytest.raises(ValidationError):
+            DirectChatRequest(model="m", messages={"role": "user"})
+
     def test_rejects_system_role(self):
         with pytest.raises(ValidationError):
             DirectChatMessage(role="system", content="behave")

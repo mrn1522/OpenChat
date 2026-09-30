@@ -265,8 +265,12 @@ class DirectChatRequest(BaseModel):
         def is_pdf(item: Any) -> bool:
             return content_type(item) == "application/pdf"
 
-        messages = data.get("messages") or []
+        messages = data.get("messages")
         attachments = data.get("attachments") or []
+        if not isinstance(messages, list) or not isinstance(attachments, list):
+            # Malformed payloads belong to field validation — let it report
+            # the 422 instead of failing on raw indexing here.
+            return data
         # Mirror _cap_total_binary_bytes: the last user turn's embedded content
         # is dropped upstream when attachments of that kind exist, so it must
         # not count here either — its per-item caps still bound the decode work.
