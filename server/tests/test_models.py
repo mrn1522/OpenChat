@@ -1,12 +1,17 @@
+import base64
+
 import pytest
 from pydantic import ValidationError
 
 from app.models import (
     MAX_IMAGE_ATTACHMENT_BYTES,
     MAX_IMAGE_BASE64_CHARS,
+    MAX_PDF_ATTACHMENT_BYTES,
+    MAX_PDF_BASE64_CHARS,
     MAX_TEXT_ATTACHMENT_BYTES,
     MAX_TEXT_ATTACHMENT_CHARS,
     AttachmentInput,
+    DirectChatFileMeta,
     DirectChatMessage,
     DirectChatRequest,
     PersonaAssignment,
@@ -73,6 +78,21 @@ class TestRunRequest:
                             "size": 10,
                             "content_type": "image/png",
                             "content": "QUJD",
+                        }
+                    ]
+                )
+            )
+
+    def test_rejects_pdf_attachments(self):
+        with pytest.raises(ValidationError):
+            RunRequest(
+                **_run_payload(
+                    attachments=[
+                        {
+                            "name": "doc.pdf",
+                            "size": 10,
+                            "content_type": "application/pdf",
+                            "content": "JVBERi0xLjc=",
                         }
                     ]
                 )
@@ -158,6 +178,43 @@ class TestAttachmentInput:
                 content="a" * MAX_IMAGE_BASE64_CHARS,
             )
 
+    def test_pdf_attachment_valid(self):
+        attachment = AttachmentInput(
+            name="doc.pdf",
+            size=10,
+            content_type="application/pdf",
+            content="JVBERi0xLjc=",  # b"%PDF-1.7"
+        )
+        assert attachment.is_pdf
+        assert not attachment.is_text
+
+    def test_pdf_attachment_rejects_invalid_base64(self):
+        with pytest.raises(ValidationError):
+            AttachmentInput(
+                name="doc.pdf",
+                size=10,
+                content_type="application/pdf",
+                content="not base64!!!",
+            )
+
+    def test_pdf_attachment_rejects_oversize_file(self):
+        with pytest.raises(ValidationError):
+            AttachmentInput(
+                name="big.pdf",
+                size=MAX_PDF_ATTACHMENT_BYTES + 1,
+                content_type="application/pdf",
+                content="JVBERi0xLjc=",
+            )
+
+    def test_pdf_attachment_rejects_non_pdf_bytes(self):
+        with pytest.raises(ValidationError):
+            AttachmentInput(
+                name="doc.pdf",
+                size=10,
+                content_type="application/pdf",
+                content="QUJD",  # b"ABC" — valid base64, wrong magic
+            )
+
     def test_text_attachment_rejects_oversize_file(self):
         with pytest.raises(ValidationError):
             AttachmentInput(
@@ -197,14 +254,14 @@ class TestDirectChatRequest:
         )
         assert request.messages[0].role == "user"
 
-    def test_total_image_cap_boundary_counts_decoded_bytes(self):
-        # 4 x 5 MiB images decode to exactly MAX_TOTAL_IMAGE_BYTES: the cap
+    def test_total_binary_cap_boundary_counts_decoded_bytes(self):
+        # 4 x 5 MiB images decode to exactly MAX_TOTAL_BINARY_BYTES: the cap
         # must account for base64 padding per string, not len() * 3 // 4.
         import base64
 
-        from app.models import MAX_TOTAL_IMAGE_BYTES, base64_decoded_len
+        from app.models import MAX_TOTAL_BINARY_BYTES, base64_decoded_len
 
-        each = MAX_TOTAL_IMAGE_BYTES // 4
+        each = MAX_TOTAL_BINARY_BYTES // 4
         chunk = base64.b64encode(b"\0" * each).decode()
         assert base64_decoded_len(chunk) == each
 
@@ -229,6 +286,104 @@ class TestDirectChatRequest:
                 attachments=[image(), image(), image(), image(), image()],
             )
 
+    def test_total_binary_cap_counts_pdf_bytes(self):
+        import base64
+
+        chunk = base64.b64encode(
+            b"%PDF-1.7" + b"\0" * (MAX_PDF_ATTACHMENT_BYTES - 8)
+        ).decode()
+
+        def pdf() -> AttachmentInput:
+            return AttachmentInput(
+                name="d.pdf",
+                size=MAX_PDF_ATTACHMENT_BYTES,
+                content_type="application/pdf",
+                content=chunk,
+            )
+
+        ok = DirectChatRequest(
+            model="m",
+            messages=[{"role": "user", "content": "read"}],
+            attachments=[pdf(), pdf()],
+        )
+        assert len(ok.attachments) == 2
+        with pytest.raises(ValidationError):
+            DirectChatRequest(
+                model="m",
+                messages=[{"role": "user", "content": "read"}],
+                attachments=[pdf(), pdf(), pdf()],
+            )
+
+    def test_raw_binary_bound_rejects_before_nested_decode(self):
+        # Encoded input that can never satisfy the decoded cap is rejected
+        # up front instead of after base64-decoding every payload.
+        oversized = "a" * MAX_PDF_BASE64_CHARS
+        with pytest.raises(ValidationError, match="binary payload"):
+            DirectChatRequest(
+                model="m",
+                messages=[
+                    {
+                        "role": "user",
+                        "content": "x",
+                        "files": [
+                            {
+                                "name": "d.pdf",
+                                "content_type": "application/pdf",
+                                "content": oversized,
+                            }
+                        ],
+                    }
+                    for _ in range(10)
+                ],
+            )
+
+    def test_raw_binary_bound_allows_excludable_latest_turn_content(self):
+        # Embedded content the decoded cap excludes still counts toward the
+        # raw bound — the bound's headroom is what keeps it accepted here.
+        chunk = base64.b64encode(b"%PDF-1.7" + b"\x00" * 9_000_000).decode()
+        request = DirectChatRequest(
+            model="m",
+            messages=[
+                {
+                    "role": "user",
+                    "content": "compare",
+                    "files": [
+                        {
+                            "name": "a.pdf",
+                            "content_type": "application/pdf",
+                            "content": chunk,
+                        },
+                        {
+                            "name": "b.pdf",
+                            "content_type": "application/pdf",
+                            "content": chunk,
+                        },
+                    ],
+                }
+            ],
+            attachments=[
+                {
+                    "name": "c.pdf",
+                    "size": 9_000_010,
+                    "content_type": "application/pdf",
+                    "content": chunk,
+                }
+            ],
+        )
+        assert len(request.messages[0].files) == 2
+
+    def test_raw_binary_bound_ignores_malformed_shapes(self):
+        # Non-list payloads are field errors (422), not raw-bound crashes.
+        with pytest.raises(ValidationError):
+            DirectChatRequest(model="m", messages=5)
+        with pytest.raises(ValidationError):
+            DirectChatRequest(model="m", messages={"role": "user"})
+        with pytest.raises(ValidationError):
+            DirectChatRequest(
+                model="m",
+                messages=[{"role": "user", "content": "x", "files": 5}],
+            )
+
     def test_rejects_system_role(self):
         with pytest.raises(ValidationError):
             DirectChatMessage(role="system", content="behave")
@@ -241,6 +396,42 @@ class TestDirectChatRequest:
         messages = [{"role": "user", "content": "x"}] * 201
         with pytest.raises(ValidationError):
             DirectChatRequest(model="m", messages=messages)
+
+
+class TestDirectChatFileMeta:
+    def test_metadata_only_valid(self):
+        meta = DirectChatFileMeta(name="doc.pdf", content_type="application/pdf")
+        assert meta.content is None
+
+    def test_rejects_unsupported_type(self):
+        with pytest.raises(ValidationError):
+            DirectChatFileMeta(name="doc.docx", content_type="application/msword")
+
+    def test_rejects_invalid_base64(self):
+        with pytest.raises(ValidationError):
+            DirectChatFileMeta(
+                name="doc.pdf",
+                content_type="application/pdf",
+                content="not base64!!!",
+            )
+
+    def test_rejects_non_pdf_bytes(self):
+        with pytest.raises(ValidationError):
+            DirectChatFileMeta(
+                name="doc.pdf",
+                content_type="application/pdf",
+                content="QUJD",
+            )
+
+    def test_message_accepts_files(self):
+        message = DirectChatMessage.model_validate(
+            {
+                "role": "user",
+                "content": "hi",
+                "files": [{"name": "doc.pdf", "content_type": "application/pdf"}],
+            }
+        )
+        assert message.files[0].name == "doc.pdf"
 
 
 class TestPersonaAssignment:

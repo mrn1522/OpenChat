@@ -6,14 +6,25 @@ from pydantic import BaseModel, Field, model_validator
 
 MAX_TEXT_ATTACHMENT_BYTES = 262_144
 MAX_IMAGE_ATTACHMENT_BYTES = 5 * 1024 * 1024
-# Bound on the total decoded image payload one direct-chat request can carry
-# (current attachments plus prior-turn re-embedded pixels).
-MAX_TOTAL_IMAGE_BYTES = 20 * 1024 * 1024
+MAX_PDF_ATTACHMENT_BYTES = 10 * 1024 * 1024
+# Bound on the total decoded binary payload one direct-chat request can carry
+# (current attachments plus prior-turn re-embedded pixels/documents).
+MAX_TOTAL_BINARY_BYTES = 20 * 1024 * 1024
 MAX_TEXT_ATTACHMENT_CHARS = 100_000
 # ceil(5MiB / 3) * 4 base64 chars, with padding headroom.
 MAX_IMAGE_BASE64_CHARS = 7_000_000
+# ceil(10MiB / 3) * 4 base64 chars, with padding headroom.
+MAX_PDF_BASE64_CHARS = 14_000_000
+# Encoded-length bound on the upstream-bound portion of a request's embedded
+# binaries, applied before nested models decode anything. The decoded cap can
+# exclude one latest-turn's embedded content when matching attachments exist,
+# so the effective bound grows by that turn's per-item headroom — see
+# _bound_raw_binary_chars.
+MAX_TOTAL_BINARY_BASE64_CHARS = 28_000_000
 # Formats every major vision provider accepts via OpenRouter data URLs.
 SUPPORTED_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
+# Binary document formats routed to OpenRouter's file-parser plugin.
+SUPPORTED_FILE_TYPES = frozenset({"application/pdf"})
 
 
 def base64_decoded_len(content: str) -> int:
@@ -42,10 +53,11 @@ class SettingsUpdateRequest(BaseModel):
 
 
 class AttachmentInput(BaseModel):
-    """A composer attachment: either an inlined text file or an image.
+    """A composer attachment: an inlined text file, an image, or a PDF.
 
-    Image attachments carry raw base64 in ``content`` (no ``data:`` prefix)
-    and are rendered as ``image_url`` parts in direct chat requests.
+    Image/PDF attachments carry raw base64 in ``content`` (no ``data:``
+    prefix); they render as ``image_url``/``file`` parts in direct chat
+    requests. Text attachments are folded into the prompt.
     """
 
     name: str = Field(min_length=1, max_length=256)
@@ -57,9 +69,34 @@ class AttachmentInput(BaseModel):
     def is_image(self) -> bool:
         return self.content_type.startswith("image/")
 
+    @property
+    def is_pdf(self) -> bool:
+        return self.content_type == "application/pdf"
+
+    @property
+    def is_text(self) -> bool:
+        return not (self.is_image or self.is_pdf)
+
     @model_validator(mode="after")
     def _validate_payload_size(self) -> "AttachmentInput":
-        if self.is_image:
+        if self.is_pdf:
+            if self.size > MAX_PDF_ATTACHMENT_BYTES:
+                raise ValueError(
+                    f"pdf attachment exceeds {MAX_PDF_ATTACHMENT_BYTES} bytes"
+                )
+            if len(self.content) > MAX_PDF_BASE64_CHARS:
+                raise ValueError("pdf attachment exceeds maximum base64 length")
+            try:
+                decoded = base64.b64decode(self.content, validate=True)
+            except (binascii.Error, ValueError) as exc:
+                raise ValueError("pdf attachment content is not valid base64") from exc
+            if len(decoded) > MAX_PDF_ATTACHMENT_BYTES:
+                raise ValueError(
+                    f"pdf attachment exceeds {MAX_PDF_ATTACHMENT_BYTES} bytes"
+                )
+            if not decoded.startswith(b"%PDF-"):
+                raise ValueError("pdf attachment content is not a pdf document")
+        elif self.is_image:
             if self.content_type not in SUPPORTED_IMAGE_TYPES:
                 raise ValueError(f"unsupported image type: {self.content_type}")
             if self.size > MAX_IMAGE_ATTACHMENT_BYTES:
@@ -119,11 +156,11 @@ class RunRequest(BaseModel):
     service_tiers: dict[str, ServiceTier] = Field(default_factory=dict)
 
     @model_validator(mode="after")
-    def _reject_image_attachments(self) -> "RunRequest":
-        # Source/fusion/debate prompts are text-only; images dropped silently
-        # is worse than a clear rejection — direct chat is the image path.
-        if any(attachment.is_image for attachment in self.attachments):
-            raise ValueError("image attachments are only supported in direct chat")
+    def _reject_binary_attachments(self) -> "RunRequest":
+        # Source/fusion/debate prompts are text-only; binaries dropped silently
+        # is worse than a clear rejection — direct chat is the binary path.
+        if any(not attachment.is_text for attachment in self.attachments):
+            raise ValueError("image and pdf attachments are only supported in direct chat")
         return self
 
 
@@ -157,10 +194,43 @@ class DirectChatImageMeta(BaseModel):
         return self
 
 
+class DirectChatFileMeta(BaseModel):
+    """Provenance for a document attached to a direct-chat turn.
+
+    The current turn's bytes travel in ``DirectChatRequest.attachments``;
+    prior turns re-embed them here as base64 ``content`` so follow-up
+    requests still carry earlier documents. History persists only name and
+    content_type — never the payload.
+    """
+
+    name: str = Field(min_length=1, max_length=256)
+    content_type: str = Field(default="application/pdf", max_length=128)
+    content: str | None = Field(default=None, max_length=MAX_PDF_BASE64_CHARS)
+
+    @model_validator(mode="after")
+    def _validate_content(self) -> "DirectChatFileMeta":
+        if self.content_type not in SUPPORTED_FILE_TYPES:
+            raise ValueError(f"unsupported file type: {self.content_type}")
+        if self.content is None:
+            return self
+        try:
+            decoded = base64.b64decode(self.content, validate=True)
+        except (binascii.Error, ValueError) as exc:
+            raise ValueError("file content is not valid base64") from exc
+        if len(decoded) > MAX_PDF_ATTACHMENT_BYTES:
+            raise ValueError(
+                f"file content exceeds {MAX_PDF_ATTACHMENT_BYTES} bytes"
+            )
+        if not decoded.startswith(b"%PDF-"):
+            raise ValueError("file content is not a pdf document")
+        return self
+
+
 class DirectChatMessage(BaseModel):
     role: Literal["user", "assistant"]
     content: str = Field(min_length=1, max_length=100000)
     images: list[DirectChatImageMeta] = Field(default_factory=list, max_length=5)
+    files: list[DirectChatFileMeta] = Field(default_factory=list, max_length=5)
 
 
 class DirectChatRequest(BaseModel):
@@ -174,13 +244,70 @@ class DirectChatRequest(BaseModel):
     attachments: list[AttachmentInput] = Field(default_factory=list, max_length=5)
     service_tier: ServiceTier | None = None
 
+    @model_validator(mode="before")
+    @classmethod
+    def _bound_raw_binary_chars(cls, data: Any) -> Any:
+        """Reject requests whose embedded binaries can never satisfy the
+        decoded cap — before nested models base64-decode every payload."""
+        if not isinstance(data, dict):
+            return data
+
+        def content_len(item: Any) -> int:
+            value = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
+            return len(value) if isinstance(value, str) else 0
+
+        def content_type(item: Any) -> str:
+            value = item.get("content_type") if isinstance(item, dict) else getattr(item, "content_type", "")
+            return value if isinstance(value, str) else ""
+
+        def is_image(item: Any) -> bool:
+            return content_type(item).startswith("image/")
+
+        def is_pdf(item: Any) -> bool:
+            return content_type(item) == "application/pdf"
+
+        messages = data.get("messages")
+        attachments = data.get("attachments") or []
+        if not isinstance(messages, list) or not isinstance(attachments, list):
+            # Malformed payloads belong to field validation — let it report
+            # the 422 instead of failing on raw indexing here.
+            return data
+
+        # Count everything nested validation would decode, but size the bound
+        # for the largest payload the decoded cap could still accept: the
+        # upstream-bound budget plus the latest user turn's per-item headroom
+        # — reachable only when attachments of that kind exclude its embedded
+        # content upstream (mirroring _cap_total_binary_bytes).
+        bound = MAX_TOTAL_BINARY_BASE64_CHARS
+        if any(is_pdf(attachment) for attachment in attachments):
+            bound += 5 * MAX_PDF_BASE64_CHARS
+        if any(is_image(attachment) for attachment in attachments):
+            bound += 5 * MAX_IMAGE_BASE64_CHARS
+
+        total = 0
+        for message in messages:
+            for key in ("images", "files"):
+                metas = message.get(key) if isinstance(message, dict) else getattr(message, key, None)
+                if not isinstance(metas, list):
+                    continue
+                for meta in metas:
+                    total += content_len(meta)
+        for attachment in attachments:
+            if is_image(attachment) or is_pdf(attachment):
+                total += content_len(attachment)
+        if total > bound:
+            raise ValueError(
+                f"total binary payload exceeds {MAX_TOTAL_BINARY_BYTES} bytes"
+            )
+        return data
+
     @model_validator(mode="after")
-    def _cap_total_image_bytes(self) -> "DirectChatRequest":
-        # Per-image caps alone let 200 messages x 5 images exceed what a
+    def _cap_total_binary_bytes(self) -> "DirectChatRequest":
+        # Per-file caps alone let 200 messages x 5 binaries exceed what a
         # single upstream call should carry — bound the cumulative payload.
-        # Mirrors _build_direct_chat_messages: when image attachments exist,
-        # the latest user turn's embedded pixels are dropped upstream, so
-        # they must not be counted here either.
+        # Mirrors _build_direct_chat_messages: when image/pdf attachments
+        # exist, the latest user turn's embedded bytes are dropped upstream,
+        # so they must not be counted here either.
         last_user_index = next(
             (
                 index
@@ -192,6 +319,9 @@ class DirectChatRequest(BaseModel):
         has_image_attachments = any(
             attachment.is_image for attachment in self.attachments
         )
+        has_pdf_attachments = any(
+            attachment.is_pdf for attachment in self.attachments
+        )
         total_bytes = sum(
             base64_decoded_len(image.content)
             for index, message in enumerate(self.messages)
@@ -199,13 +329,19 @@ class DirectChatRequest(BaseModel):
             for image in message.images
             if image.content
         ) + sum(
+            base64_decoded_len(file.content)
+            for index, message in enumerate(self.messages)
+            if not (index == last_user_index and has_pdf_attachments)
+            for file in message.files
+            if file.content
+        ) + sum(
             base64_decoded_len(attachment.content)
             for attachment in self.attachments
-            if attachment.is_image
+            if not attachment.is_text
         )
-        if total_bytes > MAX_TOTAL_IMAGE_BYTES:
+        if total_bytes > MAX_TOTAL_BINARY_BYTES:
             raise ValueError(
-                f"total image payload exceeds {MAX_TOTAL_IMAGE_BYTES} bytes"
+                f"total binary payload exceeds {MAX_TOTAL_BINARY_BYTES} bytes"
             )
         return self
 

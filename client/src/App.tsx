@@ -318,7 +318,14 @@ const MAX_ATTACHMENT_SIZE_BYTES = 262_144;
 const MAX_ATTACHMENT_CONTENT_CHARS = 100_000;
 // 5MB — the tightest image cap across common vision providers (Anthropic).
 const MAX_IMAGE_ATTACHMENT_SIZE_BYTES = 5_242_880;
+// 10MB — OpenRouter file-parser uploads are capped well above this, so the
+// bound is about base64 request size, not the parser.
+const MAX_PDF_ATTACHMENT_SIZE_BYTES = 10_485_760;
+// Matches the server's DirectChatRequest cap: combined images + PDFs of one
+// request (current attachments + prior-turn re-embeds) must stay under 20MB.
+const MAX_TOTAL_BINARY_BYTES = 20_971_520;
 const IMAGE_CONTENT_TYPE_PREFIX = "image/";
+const PDF_CONTENT_TYPE = "application/pdf";
 const DIRECT_TEXTAREA_MAX_HEIGHT_PX = 220;
 // Formats every major vision provider accepts via OpenRouter data URLs.
 const SUPPORTED_IMAGE_TYPES = new Set(["image/png", "image/jpeg", "image/gif", "image/webp"]);
@@ -486,6 +493,12 @@ const isImageFile = (file: File): boolean => file.type.startsWith(IMAGE_CONTENT_
 const isImageAttachment = (attachment: Pick<AttachmentInput, "content_type">): boolean =>
   attachment.content_type.startsWith(IMAGE_CONTENT_TYPE_PREFIX);
 
+const isPdfFile = (file: File): boolean =>
+  file.type === PDF_CONTENT_TYPE || file.name.toLowerCase().endsWith(".pdf");
+
+const isPdfAttachment = (attachment: Pick<AttachmentInput, "content_type">): boolean =>
+  attachment.content_type === PDF_CONTENT_TYPE;
+
 const readAttachmentFile = async (file: File): Promise<ComposerAttachment | null> => {
   const extension = file.name.includes(".") ? file.name.split(".").pop()?.toLowerCase() ?? "" : "";
   const looksLikeText = file.type.startsWith("text/") || SUPPORTED_ATTACHMENT_TYPES.has(extension);
@@ -527,6 +540,36 @@ const readImageAttachmentFile = (file: File): Promise<ComposerAttachment | null>
         size: file.size,
         content_type: contentType,
         content: base64,
+        thumb_url: URL.createObjectURL(file),
+      });
+    };
+    reader.readAsDataURL(file);
+  });
+
+const readPdfAttachmentFile = (file: File): Promise<ComposerAttachment | null> =>
+  new Promise((resolve) => {
+    if (!isPdfFile(file) || file.size === 0) {
+      resolve(null);
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => resolve(null);
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : "";
+      const match = /^data:[^;]*;base64,(.+)$/.exec(result);
+      // "%PDF-" base64-encodes to "JVBERi0" — the extension/MIME can lie.
+      if (!match || !match[1].startsWith("JVBERi0")) {
+        resolve(null);
+        return;
+      }
+      resolve({
+        id: `pdf-${crypto.randomUUID()}`,
+        name: file.name || "document.pdf",
+        size: file.size,
+        content_type: PDF_CONTENT_TYPE,
+        content: match[1],
+        // The object URL is a display-agnostic blob handle — transcript file
+        // refs reuse it for re-encoding on follow-ups, like image thumbs.
         thumb_url: URL.createObjectURL(file),
       });
     };
@@ -1399,7 +1442,10 @@ function App() {
 
   const canSendDirect = useMemo(
     () =>
-      (directPrompt.trim().length > 0 || directAttachments.some(isImageAttachment)) &&
+      (directPrompt.trim().length > 0 ||
+        directAttachments.some(
+          (attachment) => isImageAttachment(attachment) || isPdfAttachment(attachment)
+        )) &&
       directModel.length > 0 &&
       !isDirectRunning,
     [directAttachments, directModel.length, directPrompt, isDirectRunning]
@@ -2115,18 +2161,28 @@ function App() {
     }
 
     const nextFiles = files.slice(0, slotsRemaining);
-    const oversize = nextFiles.find(
-      (file) => file.size > (isImageFile(file) ? MAX_IMAGE_ATTACHMENT_SIZE_BYTES : MAX_ATTACHMENT_SIZE_BYTES)
-    );
+    const sizeLimit = (file: File) =>
+      isImageFile(file)
+        ? MAX_IMAGE_ATTACHMENT_SIZE_BYTES
+        : isPdfFile(file)
+          ? MAX_PDF_ATTACHMENT_SIZE_BYTES
+          : MAX_ATTACHMENT_SIZE_BYTES;
+    const oversize = nextFiles.find((file) => file.size > sizeLimit(file));
     if (oversize) {
-      const limitLabel = isImageFile(oversize) ? "5MB" : "256KB";
+      const limitLabel = isImageFile(oversize) ? "5MB" : isPdfFile(oversize) ? "10MB" : "256KB";
       setDirectError(`Attachment ${oversize.name} exceeds ${limitLabel} and cannot be added.`);
       return;
     }
 
     const generation = directAttachmentGenerationRef.current;
     const parsed = await Promise.all(
-      nextFiles.map((file) => (isImageFile(file) ? readImageAttachmentFile(file) : readAttachmentFile(file)))
+      nextFiles.map((file) =>
+        isImageFile(file)
+          ? readImageAttachmentFile(file)
+          : isPdfFile(file)
+            ? readPdfAttachmentFile(file)
+            : readAttachmentFile(file)
+      )
     );
     if (generation !== directAttachmentGenerationRef.current || directUnmountedRef.current) {
       // Session moved on or the app unmounted while reading — release
@@ -2140,7 +2196,7 @@ function App() {
     const accepted = parsed.filter((item): item is ComposerAttachment => item !== null);
 
     if (accepted.length === 0) {
-      setDirectError("No supported attachments found. Use text files like .txt, .md, .json, .csv, or images.");
+      setDirectError("No supported attachments found. Use text files like .txt, .md, .json, .csv, images, or PDFs.");
       return;
     }
 
@@ -2259,8 +2315,10 @@ function App() {
     setDirectAttachments(next);
     if (
       removed?.thumb_url &&
-      !directMessages.some((message) =>
-        message.images?.some((image) => image.data_url === removed.thumb_url)
+      !directMessages.some(
+        (message) =>
+          message.images?.some((image) => image.data_url === removed.thumb_url) ||
+          message.files?.some((file) => file.data_url === removed.thumb_url)
       )
     ) {
       releaseDirectThumbs([removed.thumb_url]);
@@ -2293,22 +2351,52 @@ function App() {
     directSendGenerationRef.current = sendGeneration;
     try {
       const trimmedPrompt = directPrompt.trim();
-      // A `:batch` turn cannot carry web search or inline images — reject
+      // A `:batch` turn cannot carry web search or inline binaries — reject
       // before the draft is consumed and the user turn committed, or the
-      // failed turn's pixels would re-embed and keep tripping later sends.
+      // failed turn's payload would re-embed and keep tripping later sends.
       if (directModel.endsWith(":batch")) {
         const batchRejection = directWebSearchEnabled
           ? "Batch models cannot use OpenRouter-orchestrated web search; disable web search or pick the non-batch variant."
-          : directAttachmentsRef.current.some(isImageAttachment) ||
-              directMessages.some((message) =>
-                message.images?.some((image) => image.data_url || image.content)
+          : directAttachmentsRef.current.some(
+                (attachment) => isImageAttachment(attachment) || isPdfAttachment(attachment)
+              ) ||
+              directMessages.some(
+                (message) =>
+                  message.images?.some((image) => image.data_url || image.content) ||
+                  message.files?.some((file) => file.data_url || file.content)
               )
-            ? "Batch endpoints only accept public image URLs, not uploaded images; pick the non-batch variant for image turns."
+            ? "Batch endpoints only accept public file URLs, not uploaded images or PDFs; pick the non-batch variant for media turns."
             : null;
         if (batchRejection) {
           setDirectError(batchRejection);
           return;
         }
+      }
+      // The server bounds the combined binary payload of one request —
+      // reject here before the turn is committed, or an over-budget send
+      // strands the user message with its attachments already consumed.
+      const binaryBytes = (items: ComposerAttachment[]) =>
+        items
+          .filter((attachment) => isImageAttachment(attachment) || isPdfAttachment(attachment))
+          .reduce((sum, attachment) => sum + attachment.size, 0) +
+        directMessages.reduce(
+          (sum, message) =>
+            sum +
+            (message.images ?? []).reduce(
+              (part, image) => part + (image.data_url ? (image.size ?? 0) : 0),
+              0
+            ) +
+            (message.files ?? []).reduce(
+              (part, file) => part + (file.data_url ? (file.size ?? 0) : 0),
+              0
+            ),
+          0
+        );
+      if (binaryBytes(directAttachmentsRef.current) > MAX_TOTAL_BINARY_BYTES) {
+        setDirectError(
+          "Total image/PDF payload exceeds 20MB — remove a file or start a new chat."
+        );
+        return;
       }
       // Consume the draft at click time: edits made while image reads settle
       // become the next message instead of being silently dropped.
@@ -2330,24 +2418,40 @@ function App() {
       if (sendGeneration !== directAttachmentGenerationRef.current) return;
       if (activePageRef.current !== "direct") return;
       const attachments = directAttachmentsRef.current;
-      // A pasted image may have finished reading during the drain — same
+      // A pasted binary may have finished reading during the drain — same
       // batch rejection. The draft was already consumed; hand it back only
       // when the composer went untouched since (typing anything — even
       // erased — means the user moved on from this draft).
       if (
         directModel.endsWith(":batch") &&
-        attachments.some(isImageAttachment)
+        attachments.some((attachment) => isImageAttachment(attachment) || isPdfAttachment(attachment))
       ) {
         if (directComposerEditsRef.current === editsAtSend) {
           setDirectPrompt(trimmedPrompt);
         }
         setDirectError(
-          "Batch endpoints only accept public image URLs, not uploaded images; pick the non-batch variant for image turns."
+          "Batch endpoints only accept public file URLs, not uploaded images or PDFs; pick the non-batch variant for media turns."
+        );
+        return;
+      }
+      // A file still reading at Send lands in `attachments` only now —
+      // recheck the budget against the post-drain set.
+      if (binaryBytes(attachments) > MAX_TOTAL_BINARY_BYTES) {
+        if (directComposerEditsRef.current === editsAtSend) {
+          setDirectPrompt(trimmedPrompt);
+        }
+        setDirectError(
+          "Total image/PDF payload exceeds 20MB — remove a file or start a new chat."
         );
         return;
       }
       const promptText =
-        trimmedPrompt || (attachments.some(isImageAttachment) ? "What's in this image?" : "");
+        trimmedPrompt ||
+        (attachments.some(isImageAttachment)
+          ? "What's in this image?"
+          : attachments.some(isPdfAttachment)
+            ? "What's in this document?"
+            : "");
       if (!promptText || !directModel || isDirectRunning) return;
 
       const requestId = directRequestIdRef.current + 1;
@@ -2363,6 +2467,7 @@ function App() {
       const conversationId = directConversationId ?? crypto.randomUUID();
       setDirectConversationId(conversationId);
       const imageAttachments = attachments.filter(isImageAttachment);
+      const pdfAttachments = attachments.filter(isPdfAttachment);
       const nextMessages: DirectChatMessage[] = [
         ...directMessages,
         {
@@ -2374,18 +2479,29 @@ function App() {
                   name: attachment.name,
                   content_type: attachment.content_type,
                   data_url: attachment.thumb_url,
+                  size: attachment.size,
+                })),
+              }
+            : {}),
+          ...(pdfAttachments.length > 0
+            ? {
+                files: pdfAttachments.map((attachment) => ({
+                  name: attachment.name,
+                  content_type: attachment.content_type,
+                  data_url: attachment.thumb_url,
+                  size: attachment.size,
                 })),
               }
             : {}),
         },
       ];
       setDirectMessages(nextMessages);
-      // Sent images now live on the transcript turn — drop them from the
+      // Sent binaries now live on the transcript turn — drop them from the
       // composer so follow-ups don't re-attach them. Keep their blob URLs:
       // the transcript thumbnail and follow-up re-encoding both use them.
-      if (imageAttachments.length > 0) {
+      if (imageAttachments.length > 0 || pdfAttachments.length > 0) {
         const remainingAttachments = directAttachmentsRef.current.filter(
-          (attachment) => !isImageAttachment(attachment)
+          (attachment) => !isImageAttachment(attachment) && !isPdfAttachment(attachment)
         );
         directAttachmentsRef.current = remainingAttachments;
         setDirectAttachments(remainingAttachments);
@@ -2400,20 +2516,30 @@ function App() {
             model: directModel,
             messages: await Promise.all(
               nextMessages.map(async (message, index) => {
-                if (!message.images?.length) return message;
-                // The latest user turn's pixels travel via `attachments`; for
-                // earlier image turns we re-encode the blob thumbnail so the
-                // model still sees them on follow-ups. data_url is stripped
+                if (!message.images?.length && !message.files?.length) return message;
+                // The latest user turn's binaries travel via `attachments`;
+                // for earlier turns we re-encode the blob handle so the model
+                // still sees them on follow-ups. data_url is stripped
                 // regardless — it is display-only.
                 const isLatestMessage = index === nextMessages.length - 1;
-                const images = await Promise.all(
-                  message.images.map(async ({ name, content_type, data_url }) => {
-                    const content =
-                      !isLatestMessage && data_url ? await blobUrlToBase64(data_url) : null;
-                    return content ? { name, content_type, content } : { name, content_type };
-                  })
-                );
-                return { role: message.role, content: message.content, images };
+                const encodeRefs = async (
+                  refs: { name: string; content_type: string; data_url?: string; size?: number }[]
+                ) =>
+                  Promise.all(
+                    refs.map(async ({ name, content_type, data_url }) => {
+                      const content =
+                        !isLatestMessage && data_url ? await blobUrlToBase64(data_url) : null;
+                      return content ? { name, content_type, content } : { name, content_type };
+                    })
+                  );
+                const images = message.images?.length ? await encodeRefs(message.images) : undefined;
+                const files = message.files?.length ? await encodeRefs(message.files) : undefined;
+                return {
+                  role: message.role,
+                  content: message.content,
+                  ...(images ? { images } : {}),
+                  ...(files ? { files } : {}),
+                };
               })
             ),
             conversation_id: conversationId,
@@ -3608,7 +3734,7 @@ function App() {
                 className="composer-file-input"
                 onChange={onDirectAttachmentChange}
                 multiple
-                accept=".txt,.md,.json,.csv,.py,.js,.ts,.tsx,.jsx,.html,.css,.yaml,.yml,.xml,.log,text/*,image/*"
+                accept=".txt,.md,.json,.csv,.py,.js,.ts,.tsx,.jsx,.html,.css,.yaml,.yml,.xml,.log,.pdf,text/*,image/*,application/pdf"
               />
 
               {directAttachments.length > 0 && (
@@ -3629,6 +3755,9 @@ function App() {
                           <img src={attachment.thumb_url} alt={`Attached image ${attachment.name}`} />
                         </button>
                       )}
+                      {isPdfAttachment(attachment) && (
+                        <span className="attachment-file-badge">PDF</span>
+                      )}
                       <span>{attachment.name}</span>
                       <button type="button" onClick={() => removeDirectAttachment(attachment.id)} aria-label={`Remove ${attachment.name}`}>
                         ×
@@ -3644,7 +3773,7 @@ function App() {
                     className="composer-icon-btn"
                     type="button"
                     aria-label="Add attachment"
-                    title="Attach text files or images, or paste an image with Ctrl+V"
+                    title="Attach text files, images, or PDFs, or paste an image with Ctrl+V"
                     onClick={triggerDirectAttachmentPicker}
                   >
                     <img src={paperclipIcon} alt="" aria-hidden="true" className="ui-icon" />

@@ -984,13 +984,18 @@ async def run_stream(request: RunRequest):
 
 
 def _history_attachment_payload(attachment: AttachmentInput) -> dict[str, Any]:
-    """Attachment shape persisted in history: image payloads are replaced
+    """Attachment shape persisted in history: binary payloads are replaced
     with a placeholder since multi-MB base64 is never needed to rehydrate
     a chat record. The placeholder is itself valid base64 so the stored
     record still passes ``AttachmentInput`` validation on read."""
     payload = attachment.model_dump()
     if attachment.is_image:
         marker = f"[image data omitted: {attachment.size} bytes]"
+        payload["content"] = base64.b64encode(marker.encode()).decode()
+    elif attachment.is_pdf:
+        # The %PDF- prefix keeps the placeholder a valid-enough document for
+        # AttachmentInput's magic-byte check on read.
+        marker = f"%PDF-1.7 [pdf data omitted: {attachment.size} bytes]"
         payload["content"] = base64.b64encode(marker.encode()).decode()
     return payload
 
@@ -1064,9 +1069,13 @@ async def direct_chat_stream(request: DirectChatRequest):
                         "images": [
                             image.model_dump(exclude={"content"})
                             for image in message.images
-                        ]
+                        ],
+                        "files": [
+                            file.model_dump(exclude={"content"})
+                            for file in message.files
+                        ],
                     }
-                    if message.images
+                    if message.images or message.files
                     else {}
                 ),
             }
