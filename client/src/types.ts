@@ -79,10 +79,23 @@ export type DirectChatImageRef = {
   content?: string;
 };
 
+export type DirectChatFileRef = {
+  name: string;
+  content_type: string;
+  // In-session document source only (object URL) — stripped before
+  // transport and never persisted in history.
+  data_url?: string;
+  // Base64 bytes, populated on the wire for PRIOR file turns so follow-up
+  // requests still carry earlier documents (the current turn's bytes travel
+  // in `attachments`). Never populated client-side in stored state.
+  content?: string;
+};
+
 export type DirectChatMessage = {
   role: DirectChatRole;
   content: string;
   images?: DirectChatImageRef[];
+  files?: DirectChatFileRef[];
 };
 
 export type StreamEvent =

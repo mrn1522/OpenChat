@@ -12,6 +12,7 @@ import app.main as main
 from app.config import settings
 from app.models import (
     AttachmentInput,
+    DirectChatFileMeta,
     DirectChatImageMeta,
     DirectChatMessage,
     OpenRouterModelsResponse,
@@ -314,6 +315,14 @@ class TestBuildDirectChatMessages:
             content="QUJD",
         )
 
+    def _pdf(self) -> AttachmentInput:
+        return AttachmentInput(
+            name="doc.pdf",
+            size=10,
+            content_type="application/pdf",
+            content="QUJD",
+        )
+
     def test_no_attachments_keeps_string_content(self):
         built = llm._build_direct_chat_messages(
             messages=self._messages,
@@ -481,6 +490,95 @@ class TestBuildDirectChatMessages:
             "image_url": {"url": "data:image/png;base64,QUJD"},
         }
 
+    def test_pdf_attachments_build_file_parts(self):
+        built = llm._build_direct_chat_messages(
+            messages=self._messages,
+            attachments=[self._pdf()],
+            system_prompt="sys",
+        )
+        last = built[-1]["content"]
+        assert isinstance(last, list)
+        assert last[0] == {"type": "text", "text": "describe this"}
+        assert last[1] == {
+            "type": "file",
+            "file": {
+                "filename": "doc.pdf",
+                "file_data": "data:application/pdf;base64,QUJD",
+            },
+        }
+
+    def test_prior_turn_embedded_files_build_file_parts(self):
+        messages = [
+            DirectChatMessage.model_validate(
+                {
+                    "role": "user",
+                    "content": "first document",
+                    "files": [
+                        {
+                            "name": "one.pdf",
+                            "content_type": "application/pdf",
+                            "content": "QUJD",
+                        }
+                    ],
+                }
+            ),
+            DirectChatMessage(role="assistant", content="seen"),
+            DirectChatMessage(role="user", content="compare to this"),
+        ]
+        built = llm._build_direct_chat_messages(
+            messages=messages,
+            attachments=[self._pdf()],
+            system_prompt="sys",
+        )
+        first = built[1]["content"]
+        assert isinstance(first, list)
+        assert first[0] == {"type": "text", "text": "first document"}
+        assert first[1] == {
+            "type": "file",
+            "file": {
+                "filename": "one.pdf",
+                "file_data": "data:application/pdf;base64,QUJD",
+            },
+        }
+
+    def test_last_turn_embedded_files_dropped_when_pdf_attachments(self):
+        # The latest turn's bytes arrive via `attachments` — re-embedding
+        # the message's own file would send the same document twice.
+        messages = [
+            DirectChatMessage.model_validate(
+                {
+                    "role": "user",
+                    "content": "describe",
+                    "files": [
+                        {
+                            "name": "a.pdf",
+                            "content_type": "application/pdf",
+                            "content": "QUJD",
+                        }
+                    ],
+                }
+            ),
+        ]
+        built = llm._build_direct_chat_messages(
+            messages=messages, attachments=[self._pdf()], system_prompt="sys"
+        )
+        last = built[-1]["content"]
+        assert isinstance(last, list)
+        file_parts = [part for part in last if part.get("type") == "file"]
+        assert file_parts == [
+            {
+                "type": "file",
+                "file": {
+                    "filename": "doc.pdf",
+                    "file_data": "data:application/pdf;base64,QUJD",
+                },
+            }
+        ]
+
+    def test_prompt_with_attachments_skips_pdfs(self):
+        prompt = llm._build_prompt_with_attachments("hello", [self._pdf()])
+        assert prompt == "hello"
+
     def test_prior_turn_metadata_only_stays_string_content(self):
         messages = [
             DirectChatMessage.model_validate(
@@ -525,6 +623,23 @@ class TestHistoryAttachmentPayload:
         )
         payload = main._history_attachment_payload(text)
         assert payload["content"] == "hello"
+
+    def test_pdf_payload_replaced_with_base64_placeholder(self):
+        import base64
+
+        pdf = AttachmentInput(
+            name="doc.pdf",
+            size=10,
+            content_type="application/pdf",
+            content="QUJD",
+        )
+        payload = main._history_attachment_payload(pdf)
+        assert payload["name"] == "doc.pdf"
+        assert payload["content"] != "QUJD"
+        decoded = base64.b64decode(payload["content"], validate=True)
+        assert decoded.decode() == "[pdf data omitted: 10 bytes]"
+        # The persisted record must still pass strict pdf validation on read.
+        AttachmentInput.model_validate(payload)
 
 
 class TestDebateJobConcurrency:
@@ -896,6 +1011,48 @@ class TestServiceTierPlumbing:
         )
         assert captured["extra_body"]["service_tier"] == "flex"
 
+    def test_extra_body_adds_file_parser_plugin_only_for_pdf(self):
+        base = dict(
+            web_search_enabled=False, reasoning_effort="medium", reasoning_exclude=False
+        )
+        assert "plugins" not in llm._build_openrouter_extra_body(**base)
+        body = llm._build_openrouter_extra_body(**base, pdf_parser=True)
+        assert body["plugins"] == [
+            {"id": "file-parser", "pdf": {"engine": "cloudflare-ai"}}
+        ]
+
+    def test_run_direct_chat_model_enables_file_parser_for_pdf(self, monkeypatch):
+        captured = {}
+
+        async def fake_completion(**kwargs) -> str:
+            captured.update(kwargs)
+            return "ok"
+
+        monkeypatch.setattr(llm, "_run_chat_completion_with_tool_loop", fake_completion)
+
+        pdf = AttachmentInput(
+            name="doc.pdf",
+            size=10,
+            content_type="application/pdf",
+            content="QUJD",
+        )
+        asyncio.run(
+            llm.run_direct_chat_model(
+                client=None,
+                model="openai/a",
+                messages=[DirectChatMessage(role="user", content="hi")],
+                system_prompt="s",
+                temperature=0.2,
+                web_search_enabled=False,
+                reasoning_effort="medium",
+                reasoning_exclude=False,
+                attachments=[pdf],
+            )
+        )
+        assert captured["extra_body"]["plugins"] == [
+            {"id": "file-parser", "pdf": {"engine": "cloudflare-ai"}}
+        ]
+
 
 class TestDirectChatBatch:
     def _client(self, handler) -> httpx.AsyncClient:
@@ -1082,6 +1239,45 @@ class TestDirectChatBatch:
 
         with pytest.raises(llm.CompletionFailure, match="image"):
             self._run(monkeypatch, handler, attachments=[image])
+        assert calls == []
+
+    def test_new_pdf_attachment_rejected(self, monkeypatch):
+        pdf = AttachmentInput(
+            name="x.pdf",
+            size=4,
+            content_type="application/pdf",
+            content=base64.b64encode(b"1234").decode(),
+        )
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(500)
+
+        with pytest.raises(llm.CompletionFailure, match="PDF"):
+            self._run(monkeypatch, handler, attachments=[pdf])
+        assert calls == []
+
+    def test_prior_turn_embedded_file_rejected(self, monkeypatch):
+        message = DirectChatMessage(
+            role="user",
+            content="hi",
+            files=[
+                DirectChatFileMeta(
+                    name="x.pdf",
+                    content_type="application/pdf",
+                    content=base64.b64encode(b"1234").decode(),
+                )
+            ],
+        )
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(500)
+
+        with pytest.raises(llm.CompletionFailure, match="PDF"):
+            self._run(monkeypatch, handler, messages=[message])
         assert calls == []
 
     def test_prior_turn_embedded_image_rejected(self, monkeypatch):

@@ -55,6 +55,15 @@ const DirectChatMessageBubble = memo(function DirectChatMessageBubble({
           )}
         </div>
       )}
+      {message.files && message.files.length > 0 && (
+        <div className="direct-chat-image-row">
+          {message.files.map((file, index) => (
+            <span key={`${file.name}-${index}`} className="direct-chat-image-chip">
+              {file.name}
+            </span>
+          ))}
+        </div>
+      )}
       <div className="markdown-body">
         <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
       </div>

@@ -22,7 +22,7 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 DEFAULT_HISTORY_LIMIT = 500
 _TITLE_MAX_CHARS = 500
 
@@ -56,6 +56,7 @@ _SCHEMA_STATEMENTS = (
         model TEXT NOT NULL DEFAULT '',
         content TEXT NOT NULL,
         images_json TEXT,
+        files_json TEXT,
         created_at TEXT NOT NULL,
         UNIQUE(conversation_id, seq)
     )
@@ -174,6 +175,13 @@ def _apply_migrations(connection: sqlite3.Connection) -> None:
     ):
         connection.execute(
             "ALTER TABLE conversation_messages ADD COLUMN images_json TEXT"
+        )
+    # v4 adds files_json (direct-chat document provenance) the same way.
+    if version < 4 and not _column_exists(
+        connection, "conversation_messages", "files_json"
+    ):
+        connection.execute(
+            "ALTER TABLE conversation_messages ADD COLUMN files_json TEXT"
         )
     if version < 2:
         _migrate_legacy_chats(connection)
@@ -299,9 +307,10 @@ def _insert_messages(
     connection.executemany(
         """
         INSERT INTO conversation_messages (
-            conversation_id, seq, role, model, content, images_json, created_at
+            conversation_id, seq, role, model, content, images_json, files_json,
+            created_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
         """,
         [
             (
@@ -311,6 +320,7 @@ def _insert_messages(
                 str(message.get("model") or ""),
                 str(message.get("content", "")),
                 json.dumps(message["images"]) if message.get("images") else None,
+                json.dumps(message["files"]) if message.get("files") else None,
                 created_at,
             )
             for seq, message in enumerate(messages)
@@ -527,7 +537,7 @@ def _fetch_messages(
 ) -> list[dict[str, Any]]:
     rows = connection.execute(
         """
-        SELECT role, content, images_json
+        SELECT role, content, images_json, files_json
         FROM conversation_messages
         WHERE conversation_id = ?
         ORDER BY seq ASC
@@ -544,6 +554,13 @@ def _fetch_messages(
                 images = None
             if isinstance(images, list) and images:
                 message["images"] = images
+        if row["files_json"]:
+            try:
+                files = json.loads(row["files_json"])
+            except json.JSONDecodeError:
+                files = None
+            if isinstance(files, list) and files:
+                message["files"] = files
         messages.append(message)
     return messages
 

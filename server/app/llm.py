@@ -392,7 +392,7 @@ async def fetch_model_service_tiers(model_id: str) -> list[str]:
 
 
 def _build_prompt_with_attachments(prompt: str, attachments: list[AttachmentInput]) -> str:
-    text_attachments = [attachment for attachment in attachments if not attachment.is_image]
+    text_attachments = [attachment for attachment in attachments if attachment.is_text]
     if not text_attachments:
         return prompt
 
@@ -410,6 +410,7 @@ def _build_openrouter_extra_body(
     reasoning_exclude: bool,
     allow_tools: bool = True,
     service_tier: str | None = None,
+    pdf_parser: bool = False,
 ) -> dict[str, Any]:
     extra_body: dict[str, Any] = {
         "reasoning": {
@@ -422,6 +423,13 @@ def _build_openrouter_extra_body(
     # way, so only named tiers are sent upstream.
     if service_tier and service_tier != "default":
         extra_body["service_tier"] = service_tier
+
+    if pdf_parser:
+        # File parts need a parser engine on models without native file
+        # input; cloudflare-ai is OpenRouter's free engine.
+        extra_body["plugins"] = [
+            {"id": "file-parser", "pdf": {"engine": "cloudflare-ai"}}
+        ]
 
     # Only attach tool-control parameters when an actual tools array is
     # present. Sending `max_tool_calls`/`parallel_tool_calls` without a
@@ -1209,6 +1217,8 @@ async def run_direct_chat_model(
         reasoning_effort=reasoning_effort,
         reasoning_exclude=reasoning_exclude,
         service_tier=service_tier,
+        pdf_parser=any(attachment.is_pdf for attachment in attachments)
+        or any(file.content for message in messages for file in message.files),
     )
 
     if model.endswith(BATCH_MODEL_SUFFIX):
@@ -1260,6 +1270,14 @@ def _validate_batch_direct_chat(
         raise CompletionFailure(
             "Batch endpoints only accept public image URLs, not uploaded "
             "images; pick the non-batch variant for image turns."
+        )
+    # Batch file parts are likewise URL-only upstream.
+    if any(attachment.is_pdf for attachment in attachments) or any(
+        file.content for message in request_messages for file in message.files
+    ):
+        raise CompletionFailure(
+            "Batch endpoints only accept public file URLs, not uploaded "
+            "PDFs; pick the non-batch variant for document turns."
         )
 
 
@@ -1447,6 +1465,7 @@ def _build_direct_chat_messages(
 
     normalized_messages: list[dict[str, Any]] = [{"role": "system", "content": resolved_system_prompt}]
     has_image_attachments = any(attachment.is_image for attachment in attachments)
+    has_pdf_attachments = any(attachment.is_pdf for attachment in attachments)
     last_user_message_index = next(
         (
             index
@@ -1457,12 +1476,12 @@ def _build_direct_chat_messages(
     )
     last_user_index = -1
     for index, message in enumerate(messages):
-        # Prior image turns re-embed their pixels in the message so follow-up
-        # requests keep earlier images in context. The latest turn's pixels
-        # normally arrive separately in `attachments` (handled below) —
-        # skipping them here avoids sending the same image twice; callers that
-        # embed pixels only in the message keep them instead.
-        embedded_image_parts = (
+        # Prior image/pdf turns re-embed their payloads in the message so
+        # follow-up requests keep earlier binaries in context. The latest
+        # turn's payloads normally arrive separately in `attachments`
+        # (handled below) — skipping them here avoids sending the same bytes
+        # twice; callers that embed them only in the message keep them.
+        embedded_parts = (
             [
                 {
                     "type": "image_url",
@@ -1475,13 +1494,27 @@ def _build_direct_chat_messages(
             ]
             if index != last_user_message_index or not has_image_attachments
             else []
+        ) + (
+            [
+                {
+                    "type": "file",
+                    "file": {
+                        "filename": file.name,
+                        "file_data": f"data:{file.content_type};base64,{file.content}"
+                    },
+                }
+                for file in message.files
+                if file.content
+            ]
+            if index != last_user_message_index or not has_pdf_attachments
+            else []
         )
         normalized_messages.append(
             {
                 "role": message.role,
                 "content": (
-                    [{"type": "text", "text": message.content}, *embedded_image_parts]
-                    if embedded_image_parts
+                    [{"type": "text", "text": message.content}, *embedded_parts]
+                    if embedded_parts
                     else message.content
                 ),
             }
@@ -1491,10 +1524,11 @@ def _build_direct_chat_messages(
 
     if attachments and last_user_index >= 0:
         existing = normalized_messages[last_user_index]["content"]
-        text_attachments = [attachment for attachment in attachments if not attachment.is_image]
+        text_attachments = [attachment for attachment in attachments if attachment.is_text]
         image_attachments = [attachment for attachment in attachments if attachment.is_image]
+        pdf_attachments = [attachment for attachment in attachments if attachment.is_pdf]
         if isinstance(existing, list):
-            # The message already carries embedded image parts — merge text
+            # The message already carries embedded binary parts — merge text
             # attachments into its text part rather than stringifying the
             # whole multipart list into the prompt.
             original = "\n".join(
@@ -1511,8 +1545,9 @@ def _build_direct_chat_messages(
             original = str(existing)
             embedded_parts = []
         composed = _build_prompt_with_attachments(original, text_attachments)
-        # OpenRouter multi-part content: text first, then image_url data URLs.
-        image_parts = [
+        # OpenRouter multi-part content: text first, then image_url data URLs
+        # and file parts.
+        binary_parts = [
             {
                 "type": "image_url",
                 "image_url": {
@@ -1520,10 +1555,19 @@ def _build_direct_chat_messages(
                 },
             }
             for attachment in image_attachments
+        ] + [
+            {
+                "type": "file",
+                "file": {
+                    "filename": attachment.name,
+                    "file_data": f"data:{attachment.content_type};base64,{attachment.content}"
+                },
+            }
+            for attachment in pdf_attachments
         ]
         normalized_messages[last_user_index]["content"] = (
-            [{"type": "text", "text": composed}, *embedded_parts, *image_parts]
-            if embedded_parts or image_parts
+            [{"type": "text", "text": composed}, *embedded_parts, *binary_parts]
+            if embedded_parts or binary_parts
             else composed
         )
 

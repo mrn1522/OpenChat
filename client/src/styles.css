@@ -1127,6 +1127,16 @@ body {
   display: block;
 }
 
+.attachment-chip .attachment-file-badge {
+  font-size: 0.62rem;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  color: var(--th-chroma-27);
+  border: 1px solid var(--th-edge-21);
+  border-radius: 4px;
+  padding: 1px 4px;
+}
+
 .composer-bottom-row {
   margin-top: 10px;
   display: flex;
