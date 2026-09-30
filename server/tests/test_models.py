@@ -321,21 +321,25 @@ class TestDirectChatRequest:
         with pytest.raises(ValidationError, match="binary payload"):
             DirectChatRequest(
                 model="m",
-                messages=[{"role": "user", "content": "x"}],
-                attachments=[
+                messages=[
                     {
-                        "name": f"d{i}.pdf",
-                        "size": 1,
-                        "content_type": "application/pdf",
-                        "content": oversized,
+                        "role": "user",
+                        "content": "x",
+                        "files": [
+                            {
+                                "name": "d.pdf",
+                                "content_type": "application/pdf",
+                                "content": oversized,
+                            }
+                        ],
                     }
-                    for i in range(3)
+                    for _ in range(10)
                 ],
             )
 
-    def test_raw_binary_bound_mirrors_latest_turn_exclusion(self):
-        # The last turn's embedded files are dropped upstream when matching
-        # attachments exist — the raw bound must not double-count them.
+    def test_raw_binary_bound_allows_excludable_latest_turn_content(self):
+        # Embedded content the decoded cap excludes still counts toward the
+        # raw bound — the bound's headroom is what keeps it accepted here.
         chunk = base64.b64encode(b"%PDF-1.7" + b"\x00" * 9_000_000).decode()
         request = DirectChatRequest(
             model="m",
@@ -374,6 +378,11 @@ class TestDirectChatRequest:
             DirectChatRequest(model="m", messages=5)
         with pytest.raises(ValidationError):
             DirectChatRequest(model="m", messages={"role": "user"})
+        with pytest.raises(ValidationError):
+            DirectChatRequest(
+                model="m",
+                messages=[{"role": "user", "content": "x", "files": 5}],
+            )
 
     def test_rejects_system_role(self):
         with pytest.raises(ValidationError):

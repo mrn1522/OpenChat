@@ -15,11 +15,13 @@ MAX_TEXT_ATTACHMENT_CHARS = 100_000
 MAX_IMAGE_BASE64_CHARS = 7_000_000
 # ceil(10MiB / 3) * 4 base64 chars, with padding headroom.
 MAX_PDF_BASE64_CHARS = 14_000_000
-# Encoded-length bound on one request's total embedded binaries: any request
-# that could pass the 20MiB decoded cap encodes to under 28M base64 chars, so
-# rejecting beyond this never turns away a valid payload — it just skips
-# decoding what the decoded cap would reject anyway.
-MAX_TOTAL_BINARY_BASE64_CHARS = 28_000_000
+# Encoded-length bound on one request's total embedded binaries, applied
+# before nested models decode anything. A request that could still pass the
+# 20MiB decoded cap carries at most ~28M chars of upstream-bound content plus
+# up to 105M chars of latest-turn embedded content the cap may exclude (5
+# PDFs + 5 images at their per-item limits). Larger totals always fail the
+# decoded cap, so rejecting them only skips useless decode work.
+MAX_TOTAL_BINARY_BASE64_CHARS = 134_000_000
 # Formats every major vision provider accepts via OpenRouter data URLs.
 SUPPORTED_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 # Binary document formats routed to OpenRouter's file-parser plugin.
@@ -271,34 +273,19 @@ class DirectChatRequest(BaseModel):
             # Malformed payloads belong to field validation — let it report
             # the 422 instead of failing on raw indexing here.
             return data
-        # Mirror _cap_total_binary_bytes: the last user turn's embedded content
-        # is dropped upstream when attachments of that kind exist, so it must
-        # not count here either — its per-item caps still bound the decode work.
-        last_user_index = next(
-            (
-                index
-                for index in range(len(messages) - 1, -1, -1)
-                if (
-                    messages[index].get("role")
-                    if isinstance(messages[index], dict)
-                    else getattr(messages[index], "role", None)
-                )
-                == "user"
-            ),
-            -1,
-        )
-        has_image_attachments = any(is_image(a) for a in attachments)
-        has_pdf_attachments = any(is_pdf(a) for a in attachments)
 
+        # Count everything nested validation would decode — including the
+        # latest user turn's embedded content. The bound is sized for the
+        # largest payload the decoded cap could still accept (see the
+        # constant), so the exclusion only applies where bytes are measured:
+        # _cap_total_binary_bytes.
         total = 0
-        for index, message in enumerate(messages):
-            skip_images = index == last_user_index and has_image_attachments
-            skip_files = index == last_user_index and has_pdf_attachments
-            for key, skip in (("images", skip_images), ("files", skip_files)):
-                if skip:
-                    continue
+        for message in messages:
+            for key in ("images", "files"):
                 metas = message.get(key) if isinstance(message, dict) else getattr(message, key, None)
-                for meta in metas or []:
+                if not isinstance(metas, list):
+                    continue
+                for meta in metas:
                     total += content_len(meta)
         for attachment in attachments:
             if is_image(attachment) or is_pdf(attachment):
