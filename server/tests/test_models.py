@@ -89,7 +89,7 @@ class TestRunRequest:
                             "name": "doc.pdf",
                             "size": 10,
                             "content_type": "application/pdf",
-                            "content": "QUJD",
+                            "content": "JVBERi0xLjc=",
                         }
                     ]
                 )
@@ -180,7 +180,7 @@ class TestAttachmentInput:
             name="doc.pdf",
             size=10,
             content_type="application/pdf",
-            content="QUJD",
+            content="JVBERi0xLjc=",  # b"%PDF-1.7"
         )
         assert attachment.is_pdf
         assert not attachment.is_text
@@ -200,7 +200,16 @@ class TestAttachmentInput:
                 name="big.pdf",
                 size=MAX_PDF_ATTACHMENT_BYTES + 1,
                 content_type="application/pdf",
-                content="QUJD",
+                content="JVBERi0xLjc=",
+            )
+
+    def test_pdf_attachment_rejects_non_pdf_bytes(self):
+        with pytest.raises(ValidationError):
+            AttachmentInput(
+                name="doc.pdf",
+                size=10,
+                content_type="application/pdf",
+                content="QUJD",  # b"ABC" — valid base64, wrong magic
             )
 
     def test_text_attachment_rejects_oversize_file(self):
@@ -277,7 +286,9 @@ class TestDirectChatRequest:
     def test_total_binary_cap_counts_pdf_bytes(self):
         import base64
 
-        chunk = base64.b64encode(b"\0" * MAX_PDF_ATTACHMENT_BYTES).decode()
+        chunk = base64.b64encode(
+            b"%PDF-1.7" + b"\0" * (MAX_PDF_ATTACHMENT_BYTES - 8)
+        ).decode()
 
         def pdf() -> AttachmentInput:
             return AttachmentInput(
@@ -329,6 +340,14 @@ class TestDirectChatFileMeta:
                 name="doc.pdf",
                 content_type="application/pdf",
                 content="not base64!!!",
+            )
+
+    def test_rejects_non_pdf_bytes(self):
+        with pytest.raises(ValidationError):
+            DirectChatFileMeta(
+                name="doc.pdf",
+                content_type="application/pdf",
+                content="QUJD",
             )
 
     def test_message_accepts_files(self):

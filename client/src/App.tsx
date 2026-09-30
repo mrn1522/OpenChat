@@ -321,6 +321,9 @@ const MAX_IMAGE_ATTACHMENT_SIZE_BYTES = 5_242_880;
 // 10MB — OpenRouter file-parser uploads are capped well above this, so the
 // bound is about base64 request size, not the parser.
 const MAX_PDF_ATTACHMENT_SIZE_BYTES = 10_485_760;
+// Matches the server's DirectChatRequest cap: combined images + PDFs of one
+// request (current attachments + prior-turn re-embeds) must stay under 20MB.
+const MAX_TOTAL_BINARY_BYTES = 20_971_520;
 const IMAGE_CONTENT_TYPE_PREFIX = "image/";
 const PDF_CONTENT_TYPE = "application/pdf";
 const DIRECT_TEXTAREA_MAX_HEIGHT_PX = 220;
@@ -554,7 +557,8 @@ const readPdfAttachmentFile = (file: File): Promise<ComposerAttachment | null> =
     reader.onload = () => {
       const result = typeof reader.result === "string" ? reader.result : "";
       const match = /^data:[^;]*;base64,(.+)$/.exec(result);
-      if (!match) {
+      // "%PDF-" base64-encodes to "JVBERi" — the extension/MIME can lie.
+      if (!match || !match[1].startsWith("JVBERi")) {
         resolve(null);
         return;
       }
@@ -2368,6 +2372,32 @@ function App() {
           return;
         }
       }
+      // The server bounds the combined binary payload of one request —
+      // reject here before the turn is committed, or an over-budget send
+      // strands the user message with its attachments already consumed.
+      const binaryBytes =
+        directAttachmentsRef.current
+          .filter((attachment) => isImageAttachment(attachment) || isPdfAttachment(attachment))
+          .reduce((sum, attachment) => sum + attachment.size, 0) +
+        directMessages.reduce(
+          (sum, message) =>
+            sum +
+            (message.images ?? []).reduce(
+              (part, image) => part + (image.data_url ? (image.size ?? 0) : 0),
+              0
+            ) +
+            (message.files ?? []).reduce(
+              (part, file) => part + (file.data_url ? (file.size ?? 0) : 0),
+              0
+            ),
+          0
+        );
+      if (binaryBytes > MAX_TOTAL_BINARY_BYTES) {
+        setDirectError(
+          "Total image/PDF payload exceeds 20MB — remove a file or start a new chat."
+        );
+        return;
+      }
       // Consume the draft at click time: edits made while image reads settle
       // become the next message instead of being silently dropped.
       setDirectPrompt("");
@@ -2438,6 +2468,7 @@ function App() {
                   name: attachment.name,
                   content_type: attachment.content_type,
                   data_url: attachment.thumb_url,
+                  size: attachment.size,
                 })),
               }
             : {}),
@@ -2447,6 +2478,7 @@ function App() {
                   name: attachment.name,
                   content_type: attachment.content_type,
                   data_url: attachment.thumb_url,
+                  size: attachment.size,
                 })),
               }
             : {}),
@@ -2480,7 +2512,7 @@ function App() {
                 // regardless — it is display-only.
                 const isLatestMessage = index === nextMessages.length - 1;
                 const encodeRefs = async (
-                  refs: { name: string; content_type: string; data_url?: string }[]
+                  refs: { name: string; content_type: string; data_url?: string; size?: number }[]
                 ) =>
                   Promise.all(
                     refs.map(async ({ name, content_type, data_url }) => {

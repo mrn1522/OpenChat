@@ -989,9 +989,13 @@ def _history_attachment_payload(attachment: AttachmentInput) -> dict[str, Any]:
     a chat record. The placeholder is itself valid base64 so the stored
     record still passes ``AttachmentInput`` validation on read."""
     payload = attachment.model_dump()
-    if attachment.is_image or attachment.is_pdf:
-        kind = "image" if attachment.is_image else "pdf"
-        marker = f"[{kind} data omitted: {attachment.size} bytes]"
+    if attachment.is_image:
+        marker = f"[image data omitted: {attachment.size} bytes]"
+        payload["content"] = base64.b64encode(marker.encode()).decode()
+    elif attachment.is_pdf:
+        # The %PDF- prefix keeps the placeholder a valid-enough document for
+        # AttachmentInput's magic-byte check on read.
+        marker = f"%PDF-1.7 [pdf data omitted: {attachment.size} bytes]"
         payload["content"] = base64.b64encode(marker.encode()).decode()
     return payload
 

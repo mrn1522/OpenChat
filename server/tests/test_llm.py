@@ -320,7 +320,7 @@ class TestBuildDirectChatMessages:
             name="doc.pdf",
             size=10,
             content_type="application/pdf",
-            content="QUJD",
+            content=base64.b64encode(b"%PDF-1.7 doc").decode(),
         )
 
     def test_no_attachments_keeps_string_content(self):
@@ -491,9 +491,10 @@ class TestBuildDirectChatMessages:
         }
 
     def test_pdf_attachments_build_file_parts(self):
+        pdf = self._pdf()
         built = llm._build_direct_chat_messages(
             messages=self._messages,
-            attachments=[self._pdf()],
+            attachments=[pdf],
             system_prompt="sys",
         )
         last = built[-1]["content"]
@@ -503,7 +504,7 @@ class TestBuildDirectChatMessages:
             "type": "file",
             "file": {
                 "filename": "doc.pdf",
-                "file_data": "data:application/pdf;base64,QUJD",
+                "file_data": f"data:application/pdf;base64,{pdf.content}",
             },
         }
 
@@ -517,7 +518,7 @@ class TestBuildDirectChatMessages:
                         {
                             "name": "one.pdf",
                             "content_type": "application/pdf",
-                            "content": "QUJD",
+                            "content": base64.b64encode(b"%PDF-1.7 one").decode(),
                         }
                     ],
                 }
@@ -537,7 +538,8 @@ class TestBuildDirectChatMessages:
             "type": "file",
             "file": {
                 "filename": "one.pdf",
-                "file_data": "data:application/pdf;base64,QUJD",
+                "file_data": "data:application/pdf;base64,"
+                + base64.b64encode(b"%PDF-1.7 one").decode(),
             },
         }
 
@@ -553,7 +555,7 @@ class TestBuildDirectChatMessages:
                         {
                             "name": "a.pdf",
                             "content_type": "application/pdf",
-                            "content": "QUJD",
+                            "content": base64.b64encode(b"%PDF-1.7 a").decode(),
                         }
                     ],
                 }
@@ -570,7 +572,8 @@ class TestBuildDirectChatMessages:
                 "type": "file",
                 "file": {
                     "filename": "doc.pdf",
-                    "file_data": "data:application/pdf;base64,QUJD",
+                    "file_data": "data:application/pdf;base64,"
+                    + base64.b64encode(b"%PDF-1.7 doc").decode(),
                 },
             }
         ]
@@ -631,13 +634,12 @@ class TestHistoryAttachmentPayload:
             name="doc.pdf",
             size=10,
             content_type="application/pdf",
-            content="QUJD",
+            content=base64.b64encode(b"%PDF-1.7 doc").decode(),
         )
         payload = main._history_attachment_payload(pdf)
         assert payload["name"] == "doc.pdf"
-        assert payload["content"] != "QUJD"
         decoded = base64.b64decode(payload["content"], validate=True)
-        assert decoded.decode() == "[pdf data omitted: 10 bytes]"
+        assert decoded.decode() == "%PDF-1.7 [pdf data omitted: 10 bytes]"
         # The persisted record must still pass strict pdf validation on read.
         AttachmentInput.model_validate(payload)
 
@@ -1034,7 +1036,7 @@ class TestServiceTierPlumbing:
             name="doc.pdf",
             size=10,
             content_type="application/pdf",
-            content="QUJD",
+            content=base64.b64encode(b"%PDF-1.7 doc").decode(),
         )
         asyncio.run(
             llm.run_direct_chat_model(
@@ -1246,7 +1248,7 @@ class TestDirectChatBatch:
             name="x.pdf",
             size=4,
             content_type="application/pdf",
-            content=base64.b64encode(b"1234").decode(),
+            content=base64.b64encode(b"%PDF-1.7 x").decode(),
         )
         calls: list[httpx.Request] = []
 
@@ -1266,7 +1268,7 @@ class TestDirectChatBatch:
                 DirectChatFileMeta(
                     name="x.pdf",
                     content_type="application/pdf",
-                    content=base64.b64encode(b"1234").decode(),
+                    content=base64.b64encode(b"%PDF-1.7 x").decode(),
                 )
             ],
         )

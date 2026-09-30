@@ -73,6 +73,9 @@ export type DirectChatImageRef = {
   // In-session thumbnail source only — stripped before transport and never
   // persisted in history.
   data_url?: string;
+  // Decoded byte size — in-session only, used for the shared binary budget
+  // check; stripped before transport.
+  size?: number;
   // Base64 pixels, populated on the wire for PRIOR image turns so follow-up
   // requests still carry earlier images (the current turn's pixels travel in
   // `attachments`). Never populated client-side in stored state.
@@ -85,6 +88,9 @@ export type DirectChatFileRef = {
   // In-session document source only (object URL) — stripped before
   // transport and never persisted in history.
   data_url?: string;
+  // Decoded byte size — in-session only, used for the shared binary budget
+  // check; stripped before transport.
+  size?: number;
   // Base64 bytes, populated on the wire for PRIOR file turns so follow-up
   // requests still carry earlier documents (the current turn's bytes travel
   // in `attachments`). Never populated client-side in stored state.

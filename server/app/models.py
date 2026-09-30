@@ -88,6 +88,8 @@ class AttachmentInput(BaseModel):
                 raise ValueError(
                     f"pdf attachment exceeds {MAX_PDF_ATTACHMENT_BYTES} bytes"
                 )
+            if not decoded.startswith(b"%PDF-"):
+                raise ValueError("pdf attachment content is not a pdf document")
         elif self.is_image:
             if self.content_type not in SUPPORTED_IMAGE_TYPES:
                 raise ValueError(f"unsupported image type: {self.content_type}")
@@ -213,6 +215,8 @@ class DirectChatFileMeta(BaseModel):
             raise ValueError(
                 f"file content exceeds {MAX_PDF_ATTACHMENT_BYTES} bytes"
             )
+        if not decoded.startswith(b"%PDF-"):
+            raise ValueError("file content is not a pdf document")
         return self
 
 
