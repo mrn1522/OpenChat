@@ -15,6 +15,11 @@ MAX_TEXT_ATTACHMENT_CHARS = 100_000
 MAX_IMAGE_BASE64_CHARS = 7_000_000
 # ceil(10MiB / 3) * 4 base64 chars, with padding headroom.
 MAX_PDF_BASE64_CHARS = 14_000_000
+# Encoded-length bound on one request's total embedded binaries: any request
+# that could pass the 20MiB decoded cap encodes to under 28M base64 chars, so
+# rejecting beyond this never turns away a valid payload — it just skips
+# decoding what the decoded cap would reject anyway.
+MAX_TOTAL_BINARY_BASE64_CHARS = 28_000_000
 # Formats every major vision provider accepts via OpenRouter data URLs.
 SUPPORTED_IMAGE_TYPES = frozenset({"image/png", "image/jpeg", "image/gif", "image/webp"})
 # Binary document formats routed to OpenRouter's file-parser plugin.
@@ -237,6 +242,40 @@ class DirectChatRequest(BaseModel):
     reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
     attachments: list[AttachmentInput] = Field(default_factory=list, max_length=5)
     service_tier: ServiceTier | None = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def _bound_raw_binary_chars(cls, data: Any) -> Any:
+        """Reject requests whose embedded binaries can never satisfy the
+        decoded cap — before nested models base64-decode every payload."""
+        if not isinstance(data, dict):
+            return data
+
+        def content_len(item: Any) -> int:
+            value = item.get("content") if isinstance(item, dict) else getattr(item, "content", None)
+            return len(value) if isinstance(value, str) else 0
+
+        def content_type(item: Any) -> str:
+            value = item.get("content_type") if isinstance(item, dict) else getattr(item, "content_type", "")
+            return value if isinstance(value, str) else ""
+
+        def is_binary(item: Any) -> bool:
+            return content_type(item).startswith("image/") or content_type(item) == "application/pdf"
+
+        total = 0
+        for message in data.get("messages") or []:
+            for key in ("images", "files"):
+                metas = message.get(key) if isinstance(message, dict) else getattr(message, key, None)
+                for meta in metas or []:
+                    total += content_len(meta)
+        for attachment in data.get("attachments") or []:
+            if is_binary(attachment):
+                total += content_len(attachment)
+        if total > MAX_TOTAL_BINARY_BASE64_CHARS:
+            raise ValueError(
+                f"total binary payload exceeds {MAX_TOTAL_BINARY_BYTES} bytes"
+            )
+        return data
 
     @model_validator(mode="after")
     def _cap_total_binary_bytes(self) -> "DirectChatRequest":

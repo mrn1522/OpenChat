@@ -5,6 +5,7 @@ from app.models import (
     MAX_IMAGE_ATTACHMENT_BYTES,
     MAX_IMAGE_BASE64_CHARS,
     MAX_PDF_ATTACHMENT_BYTES,
+    MAX_PDF_BASE64_CHARS,
     MAX_TEXT_ATTACHMENT_BYTES,
     MAX_TEXT_ATTACHMENT_CHARS,
     AttachmentInput,
@@ -309,6 +310,25 @@ class TestDirectChatRequest:
                 model="m",
                 messages=[{"role": "user", "content": "read"}],
                 attachments=[pdf(), pdf(), pdf()],
+            )
+
+    def test_raw_binary_bound_rejects_before_nested_decode(self):
+        # Encoded input that can never satisfy the decoded cap is rejected
+        # up front instead of after base64-decoding every payload.
+        oversized = "a" * MAX_PDF_BASE64_CHARS
+        with pytest.raises(ValidationError, match="binary payload"):
+            DirectChatRequest(
+                model="m",
+                messages=[{"role": "user", "content": "x"}],
+                attachments=[
+                    {
+                        "name": f"d{i}.pdf",
+                        "size": 1,
+                        "content_type": "application/pdf",
+                        "content": oversized,
+                    }
+                    for i in range(3)
+                ],
             )
 
     def test_rejects_system_role(self):
