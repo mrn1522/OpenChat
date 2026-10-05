@@ -87,3 +87,53 @@ class TestMissingApiKey:
         )
         assert response.status_code == 500
         assert "OPENAI_API_KEY" in response.json()["detail"]
+
+
+class TestDirectChatHistoryReopen:
+    def test_binary_attachment_chat_reopens(self, client):
+        import base64
+
+        from app import main
+        from app.chat_store import save_chat_record
+        from app.config import settings
+        from app.models import AttachmentInput
+
+        attachments = [
+            AttachmentInput(
+                name="shot.png", size=4, content_type="image/png", content="QUJD"
+            ),
+            AttachmentInput(
+                name="report.pdf",
+                size=12,
+                content_type="application/pdf",
+                content=base64.b64encode(b"%PDF-1.7 doc").decode(),
+            ),
+        ]
+        save_chat_record(
+            settings.openchat_history_db_path,
+            chat_id="direct-binary",
+            run_id="run-1",
+            status="direct_completed",
+            elapsed_ms=5,
+            kind="direct",
+            request_payload={
+                "prompt": "Summarize this",
+                "source_models": ["m"],
+                "fusion_model": "m",
+                "debate_mode": "off",
+                "attachments": [main._history_attachment_payload(a) for a in attachments],
+            },
+            source_results=[],
+            debate_results=[],
+            critique_output="",
+            fusion_output="done",
+            messages=[
+                {"role": "user", "content": "Summarize this"},
+                {"role": "assistant", "content": "done", "model": "m"},
+            ],
+        )
+
+        response = client.get("/api/chats/direct-binary")
+        assert response.status_code == 200
+        names = [a["name"] for a in response.json()["request"]["attachments"]]
+        assert names == ["shot.png", "report.pdf"]
