@@ -467,7 +467,7 @@ fn stop_sidecar(
         *slot = Some((child, terminated));
         return Err("Sidecar state is unavailable.".to_string());
     }
-    let kill_failed = child.kill().is_err();
+    let kill_failed = kill_sidecar_tree(child);
     // The drain task flips `terminated` on every Terminated — including an
     // exit that already happened, where kill() can still succeed but no event
     // is left to fire the receiver. When the flag is set there is nothing to
@@ -496,6 +496,59 @@ fn stop_sidecar(
         return Ok(Some((rx, false)));
     }
     Ok(Some((rx, true)))
+}
+
+// Kills the sidecar process and returns whether no kill could be confirmed
+// issued (same contract as CommandChild::kill). On Windows the PyInstaller
+// onefile sidecar is two processes: the bootloader Tauri spawned and a child
+// doing the real work that inherits our stdout/stderr pipes. CommandChild::kill()
+// ends only the bootloader — the surviving child keeps openchat-server.exe
+// locked for the installer, and keeps the pipes open so the child's Terminated
+// event cannot fire (it is emitted only after the pipe readers hit EOF).
+// taskkill /T /F ends the whole tree; it must run while the bootloader is
+// still alive, since an orphaned grandchild can no longer be reached by /T.
+#[cfg(windows)]
+fn kill_sidecar_tree(child: CommandChild) -> bool {
+    let pid = child.pid().to_string();
+    let tree_killed = std::process::Command::new("taskkill")
+        .args(["/PID", pid.as_str(), "/T", "/F"])
+        .output()
+        .map(|out| out.status.success())
+        .unwrap_or(false);
+    let kill_failed = child.kill().is_err();
+    if !tree_killed {
+        // The worker may already be orphaned — e.g. the bootloader died
+        // before we ran — which puts it out of /T's reach. Sweep it so the
+        // pipes can EOF and openchat-server.exe unlocks for the installer.
+        sweep_orphaned_workers();
+    }
+    !tree_killed && kill_failed
+}
+
+// Stops any openchat-server process whose command line carries this app's
+// --parent-pid marker: a onefile worker survives the bootloader that spawned
+// it because its watchdog watches this app, not the bootloader. The Name
+// filter stays loose because the bundled exe is openchat-server.exe while a
+// `tauri dev` sidecar keeps its target-triple suffix. Best-effort — an
+// orphaned worker missed here degrades to the same wait/restore paths as
+// before. Win32_Process.CommandLine is matched with a digit boundary so a
+// --parent-pid belonging to a different process id cannot collide.
+#[cfg(windows)]
+fn sweep_orphaned_workers() {
+    let script = format!(
+        "Get-CimInstance Win32_Process -Filter \"Name LIKE 'openchat-server%'\" \
+         | Where-Object {{ $_.CommandLine -match '--parent-pid\\s+{}\\b' }} \
+         | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}",
+        std::process::id()
+    );
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
+        .output();
+}
+
+#[cfg(not(windows))]
+fn kill_sidecar_tree(child: CommandChild) -> bool {
+    child.kill().is_err()
 }
 
 fn kill_sidecar(state: &SidecarState) {
