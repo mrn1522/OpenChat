@@ -18,6 +18,7 @@ from app.models import (
     OpenRouterModelsResponse,
     SourceAgentSpec,
     SourceResult,
+    WebSearchLimits,
 )
 
 
@@ -1056,6 +1057,134 @@ class TestServiceTierPlumbing:
         ]
 
 
+class TestWebSearchLimits:
+    base = dict(web_search_enabled=True, reasoning_effort="medium", reasoning_exclude=False)
+
+    def test_default_tools_unchanged_without_limits(self):
+        body = llm._build_openrouter_extra_body(**self.base)
+        assert body["tools"] == llm.WEB_SEARCH_TOOLS
+        assert "max_uses" not in body["tools"][0]["parameters"]
+        assert body["max_tool_calls"] == llm.OPENROUTER_MAX_TOOL_CALLS
+
+    def test_limits_set_search_quota_and_total(self):
+        body = llm._build_openrouter_extra_body(
+            **self.base, web_search_limits=WebSearchLimits(max_uses=4, max_results=3)
+        )
+        search, fetch = body["tools"]
+        assert search["type"] == "openrouter:web_search"
+        assert search["parameters"]["max_uses"] == 4
+        assert search["parameters"]["max_results"] == 3
+        assert search["parameters"]["max_total_results"] == 12
+        assert search["parameters"]["engine"] == "auto"
+        assert fetch == llm.WEB_SEARCH_TOOLS[1]
+        # Shared default list must not be mutated.
+        assert "max_uses" not in llm.WEB_SEARCH_TOOLS[0]["parameters"]
+
+    def test_limits_ignored_when_search_disabled(self):
+        body = llm._build_openrouter_extra_body(
+            **{**self.base, "web_search_enabled": False},
+            web_search_limits=WebSearchLimits(max_uses=4),
+        )
+        assert "tools" not in body
+
+    @staticmethod
+    def _calls(*names: str) -> list[dict]:
+        return [
+            {"id": f"c{i}", "type": "function", "function": {"name": name, "arguments": "{}"}}
+            for i, name in enumerate(names)
+        ]
+
+    def test_tool_budget_carries_across_loop_steps(self):
+        body = llm._build_openrouter_extra_body(
+            **self.base, web_search_limits=WebSearchLimits(max_uses=3, max_results=4)
+        )
+        nxt = llm._consume_tool_budget(body, self._calls("web_search", "web_fetch"))
+        search = nxt["tools"][0]["parameters"]
+        assert search["max_uses"] == 2
+        assert search["max_total_results"] == 8
+        assert nxt["max_tool_calls"] == llm.OPENROUTER_MAX_TOOL_CALLS - 2
+        assert body["tools"][0]["parameters"]["max_uses"] == 3
+
+    def test_spent_search_quota_drops_search_tool(self):
+        body = llm._build_openrouter_extra_body(
+            **self.base, web_search_limits=WebSearchLimits(max_uses=1)
+        )
+        nxt = llm._consume_tool_budget(body, self._calls("web_search"))
+        assert [tool["type"] for tool in nxt["tools"]] == ["openrouter:web_fetch"]
+
+    def test_spent_tool_calls_disable_tools(self):
+        body = llm._build_openrouter_extra_body(**self.base)
+        nxt = llm._consume_tool_budget(
+            body, self._calls(*["web_fetch"] * llm.OPENROUTER_MAX_TOOL_CALLS)
+        )
+        assert nxt["tools"] == []
+        assert nxt["max_tool_calls"] == 0
+
+    def test_defaults_match_previous_total(self):
+        limits = WebSearchLimits()
+        assert limits.max_uses * limits.max_results == 10
+
+    def test_extended_boosts_fetch_and_tool_budget(self):
+        body = llm._build_openrouter_extra_body(
+            **self.base,
+            web_search_limits=WebSearchLimits(max_uses=20, max_results=10, extended=True),
+        )
+        search, fetch = body["tools"]
+        assert search["parameters"]["max_uses"] == 20
+        assert search["parameters"]["max_total_results"] == 200
+        assert fetch["parameters"]["max_content_tokens"] == llm.EXTENDED_WEB_FETCH_MAX_CONTENT_TOKENS
+        assert body["max_tool_calls"] == llm.EXTENDED_MAX_TOOL_CALLS
+        assert llm.WEB_SEARCH_TOOLS[1]["parameters"]["max_content_tokens"] == 10000
+
+    def test_standard_limits_keep_fetch_and_tool_budget(self):
+        body = llm._build_openrouter_extra_body(
+            **self.base, web_search_limits=WebSearchLimits()
+        )
+        assert body["tools"][1] == llm.WEB_SEARCH_TOOLS[1]
+        assert body["max_tool_calls"] == llm.OPENROUTER_MAX_TOOL_CALLS
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"max_uses": 0},
+            {"max_uses": 11},
+            {"max_uses": 21, "extended": True},
+            {"max_results": 0},
+            {"max_results": 26},
+        ],
+    )
+    def test_limits_bounds(self, kwargs):
+        with pytest.raises(ValueError):
+            WebSearchLimits(**kwargs)
+
+    def test_run_direct_chat_model_forwards_limits(self, monkeypatch):
+        captured = {}
+
+        async def fake_completion(**kwargs) -> str:
+            captured.update(kwargs)
+            return "ok"
+
+        monkeypatch.setattr(llm, "_run_chat_completion_with_tool_loop", fake_completion)
+
+        asyncio.run(
+            llm.run_direct_chat_model(
+                client=None,
+                model="openai/a",
+                messages=[DirectChatMessage(role="user", content="hi")],
+                system_prompt="s",
+                temperature=0.2,
+                web_search_enabled=True,
+                reasoning_effort="medium",
+                reasoning_exclude=False,
+                attachments=[],
+                web_search_limits=WebSearchLimits(max_uses=7, max_results=2),
+            )
+        )
+        params = captured["extra_body"]["tools"][0]["parameters"]
+        assert params["max_uses"] == 7
+        assert params["max_total_results"] == 14
+
+
 class TestDirectChatBatch:
     def _client(self, handler) -> httpx.AsyncClient:
         return httpx.AsyncClient(transport=httpx.MockTransport(handler))
@@ -1429,6 +1558,33 @@ class TestDirectChatStreamedCompletion:
 
         assert result == "Hello world"
         assert requests[0]["stream"] is True
+
+    def test_unindexed_annotation_deltas_are_ignored(self):
+        citation = {
+            "type": "url_citation",
+            "url_citation": {"url": "https://x.test", "title": "x", "start_index": 0, "end_index": 0},
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return self._sse_response(
+                [
+                    self._chunk({"role": "assistant", "content": "A", "annotations": [citation]}),
+                    self._chunk({"content": "B", "annotations": [citation]}),
+                    self._chunk({}, "stop"),
+                ]
+            )
+
+        result = asyncio.run(
+            llm._run_chat_completion_with_tool_loop(
+                client=self._sdk_client(handler),
+                model="openai/a",
+                temperature=0.2,
+                messages=[{"role": "user", "content": "hi"}],
+                extra_body={},
+            )
+        )
+
+        assert result == "AB"
 
     def test_tool_calls_reassemble_across_delta_chunks(self):
         calls = {"count": 0}

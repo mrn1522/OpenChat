@@ -145,6 +145,12 @@ export type RunRequest = {
   service_tiers?: Record<string, ServiceTier>;
 };
 
+export type WebSearchLimits = {
+  max_uses: number;
+  max_results: number;
+  extended?: boolean;
+};
+
 export type DirectChatRequest = {
   model: string;
   messages: DirectChatMessage[];
@@ -152,6 +158,7 @@ export type DirectChatRequest = {
   temperature?: number;
   max_output_tokens?: number;
   web_search_enabled?: boolean;
+  web_search_limits?: WebSearchLimits;
   reasoning?: ReasoningConfig;
   attachments?: AttachmentInput[];
   service_tier?: ServiceTier;

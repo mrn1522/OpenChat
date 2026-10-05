@@ -41,6 +41,27 @@ class ReasoningConfig(BaseModel):
     exclude: bool = False
 
 
+WEB_SEARCH_MAX_USES_STANDARD = 10
+WEB_SEARCH_MAX_USES_EXTENDED = 20
+
+
+class WebSearchLimits(BaseModel):
+    # Searches the model may run per reply (OpenRouter `max_uses`).
+    max_uses: int = Field(default=2, ge=1, le=WEB_SEARCH_MAX_USES_EXTENDED)
+    # Results returned per search call (OpenRouter `max_results`, 1-25).
+    max_results: int = Field(default=5, ge=1, le=25)
+    # Raises the fetch/tool-call budgets and the search ceiling.
+    extended: bool = False
+
+    @model_validator(mode="after")
+    def _cap_standard_uses(self) -> "WebSearchLimits":
+        if not self.extended and self.max_uses > WEB_SEARCH_MAX_USES_STANDARD:
+            raise ValueError(
+                f"max_uses above {WEB_SEARCH_MAX_USES_STANDARD} requires extended mode"
+            )
+        return self
+
+
 class SettingsResponse(BaseModel):
     api_key_configured: bool
     api_key_hint: str | None
@@ -240,6 +261,7 @@ class DirectChatRequest(BaseModel):
     temperature: float = Field(default=0.2, ge=0, le=2)
     max_output_tokens: int = Field(default=1000, ge=128, le=10000)
     web_search_enabled: bool = False
+    web_search_limits: WebSearchLimits = Field(default_factory=WebSearchLimits)
     reasoning: ReasoningConfig = Field(default_factory=ReasoningConfig)
     attachments: list[AttachmentInput] = Field(default_factory=list, max_length=5)
     service_tier: ServiceTier | None = None
