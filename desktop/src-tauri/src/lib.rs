@@ -516,7 +516,32 @@ fn kill_sidecar_tree(child: CommandChild) -> bool {
         .map(|out| out.status.success())
         .unwrap_or(false);
     let kill_failed = child.kill().is_err();
+    if !tree_killed {
+        // The worker may already be orphaned — e.g. the bootloader died
+        // before we ran — which puts it out of /T's reach. Sweep it so the
+        // pipes can EOF and openchat-server.exe unlocks for the installer.
+        sweep_orphaned_workers();
+    }
     !tree_killed && kill_failed
+}
+
+// Stops any openchat-server.exe whose command line carries this app's
+// --parent-pid marker: a onefile worker survives the bootloader that spawned
+// it because its watchdog watches this app, not the bootloader. Best-effort —
+// an orphaned worker missed here degrades to the same wait/restore paths as
+// before. Win32_Process.CommandLine is matched with a digit boundary so a
+// --parent-pid belonging to a different process id cannot collide.
+#[cfg(windows)]
+fn sweep_orphaned_workers() {
+    let script = format!(
+        "Get-CimInstance Win32_Process -Filter \"Name='openchat-server.exe'\" \
+         | Where-Object {{ $_.CommandLine -match '--parent-pid\\s+{}\\b' }} \
+         | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}",
+        std::process::id()
+    );
+    let _ = std::process::Command::new("powershell")
+        .args(["-NoProfile", "-NonInteractive", "-Command", script.as_str()])
+        .output();
 }
 
 #[cfg(not(windows))]
