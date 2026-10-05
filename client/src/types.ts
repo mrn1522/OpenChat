@@ -73,9 +73,27 @@ export type DirectChatImageRef = {
   // In-session thumbnail source only — stripped before transport and never
   // persisted in history.
   data_url?: string;
+  // Decoded byte size — in-session only, used for the shared binary budget
+  // check; stripped before transport.
+  size?: number;
   // Base64 pixels, populated on the wire for PRIOR image turns so follow-up
   // requests still carry earlier images (the current turn's pixels travel in
   // `attachments`). Never populated client-side in stored state.
+  content?: string;
+};
+
+export type DirectChatFileRef = {
+  name: string;
+  content_type: string;
+  // In-session document source only (object URL) — stripped before
+  // transport and never persisted in history.
+  data_url?: string;
+  // Decoded byte size — in-session only, used for the shared binary budget
+  // check; stripped before transport.
+  size?: number;
+  // Base64 bytes, populated on the wire for PRIOR file turns so follow-up
+  // requests still carry earlier documents (the current turn's bytes travel
+  // in `attachments`). Never populated client-side in stored state.
   content?: string;
 };
 
@@ -83,6 +101,7 @@ export type DirectChatMessage = {
   role: DirectChatRole;
   content: string;
   images?: DirectChatImageRef[];
+  files?: DirectChatFileRef[];
 };
 
 export type StreamEvent =
@@ -126,6 +145,12 @@ export type RunRequest = {
   service_tiers?: Record<string, ServiceTier>;
 };
 
+export type WebSearchLimits = {
+  max_uses: number;
+  max_results: number;
+  extended?: boolean;
+};
+
 export type DirectChatRequest = {
   model: string;
   messages: DirectChatMessage[];
@@ -133,6 +158,7 @@ export type DirectChatRequest = {
   temperature?: number;
   max_output_tokens?: number;
   web_search_enabled?: boolean;
+  web_search_limits?: WebSearchLimits;
   reasoning?: ReasoningConfig;
   attachments?: AttachmentInput[];
   service_tier?: ServiceTier;

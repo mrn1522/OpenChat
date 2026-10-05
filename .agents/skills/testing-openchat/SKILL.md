@@ -45,6 +45,13 @@ description: Exercise first-run connection settings and isolated persistence thr
 - GET `/api/service-tiers/{model_id}` fetches `{base}/models/{id}/endpoints` UNAUTHENTICATED — tier discovery works with a fake key. Useful fixtures: `google/gemini-2.5-flash`→[flex,priority], `openai/gpt-5-mini`→[flex] only, `openai/gpt-5`/`anthropic/claude-sonnet-4.5`→[]. Unknown models 502.
 - No UI route returns from the direct-chat page to fusion without resetting state (`Start new chat` clears everything); restore via the history page or a saved workflow instead.
 
+## Live Direct Chat web-search testing
+- Open Direct Chat with the left message icon and select `openai/gpt-oss-20b`. Enable the composer globe before changing web-search limits in the sliders popover (controls are disabled while it is off). Reload resets the page to Fusion and the in-memory quota settings.
+- A sourced-looking reply alone does not prove web search ran. Observe incoming `url_citation` annotations in the OpenRouter stream (the server strips these unindexed delta lists before SDK accumulation).
+- To verify upstream tool budgets (`max_uses`, `max_total_results`, `max_content_tokens`, `max_tool_calls`) against the real upstream, use a temporary diagnostic launcher outside the checkout that wraps `httpx.AsyncClient.send` and logs only the model, tools, max_tool_calls, and stream fields of chat-completion requests. Never log authorization headers; pass original calls through unchanged.
+- Capture raw frontend `web_search_limits` with browser network tools; the saved direct-chat history payload is reconstructed and may omit these controls.
+- Verify stream completion in the visible UI and the absence of error banners, then restore the ordinary backend.
+
 ## Testing `:batch` direct-chat models (OpenRouter Batches API)
 - Model ids ending in `:batch` (e.g. `openai/gpt-oss-20b:batch`) appear only in the Direct Chat picker; fusion/source pickers filter them out. Verified working live: `openai/gpt-oss-20b:batch` (~2.5 min turnaround for "reply with just: ok").
 - Batch turns take minutes by design (server polls `GET /batches/{id}` every 10s). Keep recording during the wait; annotate submit and arrival. The app logger's "Batch <id> finished" line may not reach uvicorn's stderr — the UI reply is the proof.

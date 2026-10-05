@@ -13,11 +13,13 @@ const BOTTOM_SCROLL_GAP_PX = 40;
 
 type TranscriptRow =
   | { kind: "message"; key: string; message: DirectChatMessage; index: number }
-  | { kind: "pending"; key: string };
+  | { kind: "pending"; key: string }
+  | { kind: "stopped"; key: string };
 
 type DirectChatTranscriptProps = {
   messages: DirectChatMessage[];
   isRunning: boolean;
+  wasStopped?: boolean;
   onImageClick?: (src: string, alt: string) => void;
 };
 
@@ -53,6 +55,15 @@ const DirectChatMessageBubble = memo(function DirectChatMessageBubble({
           )}
         </div>
       )}
+      {message.files && message.files.length > 0 && (
+        <div className="direct-chat-image-row">
+          {message.files.map((file, index) => (
+            <span key={`${file.name}-${index}`} className="direct-chat-image-chip">
+              {file.name}
+            </span>
+          ))}
+        </div>
+      )}
       <div className="markdown-body">
         <ReactMarkdown remarkPlugins={[remarkGfm]}>{message.content}</ReactMarkdown>
       </div>
@@ -72,7 +83,16 @@ const DirectChatPendingBubble = memo(function DirectChatPendingBubble() {
   );
 });
 
-function DirectChatTranscript({ messages, isRunning, onImageClick }: DirectChatTranscriptProps) {
+const DirectChatStoppedBubble = memo(function DirectChatStoppedBubble() {
+  return (
+    <article className="direct-chat-bubble assistant stopped" aria-label="Response stopped">
+      <p className="direct-chat-role">Assistant</p>
+      <p className="direct-chat-stopped-note">Stopped</p>
+    </article>
+  );
+});
+
+function DirectChatTranscript({ messages, isRunning, wasStopped, onImageClick }: DirectChatTranscriptProps) {
   const parentRef = useRef<HTMLDivElement | null>(null);
   const stickToBottomRef = useRef(true);
   const previousCountRef = useRef(0);
@@ -88,16 +108,18 @@ function DirectChatTranscript({ messages, isRunning, onImageClick }: DirectChatT
 
     if (isRunning) {
       next.push({ kind: "pending", key: "pending-assistant" });
+    } else if (wasStopped) {
+      next.push({ kind: "stopped", key: "stopped-assistant" });
     }
 
     return next;
-  }, [isRunning, messages]);
+  }, [isRunning, wasStopped, messages]);
 
   const estimateSize = useCallback(
     (index: number) => {
       const row = rows[index];
       if (!row) return ESTIMATED_MESSAGE_HEIGHT_PX;
-      if (row.kind === "pending") return ESTIMATED_PENDING_HEIGHT_PX;
+      if (row.kind === "pending" || row.kind === "stopped") return ESTIMATED_PENDING_HEIGHT_PX;
       const contentLength = row.message.content.length;
       const estimatedBody = Math.min(720, Math.max(64, Math.ceil(contentLength / 90) * 22));
       return estimatedBody + 48;
@@ -237,8 +259,10 @@ function DirectChatTranscript({ messages, isRunning, onImageClick }: DirectChatT
             >
               {row.kind === "message" ? (
                 <DirectChatMessageBubble message={row.message} onImageClick={onImageClick} />
-              ) : (
+              ) : row.kind === "pending" ? (
                 <DirectChatPendingBubble />
+              ) : (
+                <DirectChatStoppedBubble />
               )}
             </div>
           );

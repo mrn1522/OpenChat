@@ -5,17 +5,20 @@ import json
 
 import httpx
 import pytest
+from openai import AsyncOpenAI
 
 import app.llm as llm
 import app.main as main
 from app.config import settings
 from app.models import (
     AttachmentInput,
+    DirectChatFileMeta,
     DirectChatImageMeta,
     DirectChatMessage,
     OpenRouterModelsResponse,
     SourceAgentSpec,
     SourceResult,
+    WebSearchLimits,
 )
 
 
@@ -313,6 +316,14 @@ class TestBuildDirectChatMessages:
             content="QUJD",
         )
 
+    def _pdf(self) -> AttachmentInput:
+        return AttachmentInput(
+            name="doc.pdf",
+            size=10,
+            content_type="application/pdf",
+            content=base64.b64encode(b"%PDF-1.7 doc").decode(),
+        )
+
     def test_no_attachments_keeps_string_content(self):
         built = llm._build_direct_chat_messages(
             messages=self._messages,
@@ -480,6 +491,98 @@ class TestBuildDirectChatMessages:
             "image_url": {"url": "data:image/png;base64,QUJD"},
         }
 
+    def test_pdf_attachments_build_file_parts(self):
+        pdf = self._pdf()
+        built = llm._build_direct_chat_messages(
+            messages=self._messages,
+            attachments=[pdf],
+            system_prompt="sys",
+        )
+        last = built[-1]["content"]
+        assert isinstance(last, list)
+        assert last[0] == {"type": "text", "text": "describe this"}
+        assert last[1] == {
+            "type": "file",
+            "file": {
+                "filename": "doc.pdf",
+                "file_data": f"data:application/pdf;base64,{pdf.content}",
+            },
+        }
+
+    def test_prior_turn_embedded_files_build_file_parts(self):
+        messages = [
+            DirectChatMessage.model_validate(
+                {
+                    "role": "user",
+                    "content": "first document",
+                    "files": [
+                        {
+                            "name": "one.pdf",
+                            "content_type": "application/pdf",
+                            "content": base64.b64encode(b"%PDF-1.7 one").decode(),
+                        }
+                    ],
+                }
+            ),
+            DirectChatMessage(role="assistant", content="seen"),
+            DirectChatMessage(role="user", content="compare to this"),
+        ]
+        built = llm._build_direct_chat_messages(
+            messages=messages,
+            attachments=[self._pdf()],
+            system_prompt="sys",
+        )
+        first = built[1]["content"]
+        assert isinstance(first, list)
+        assert first[0] == {"type": "text", "text": "first document"}
+        assert first[1] == {
+            "type": "file",
+            "file": {
+                "filename": "one.pdf",
+                "file_data": "data:application/pdf;base64,"
+                + base64.b64encode(b"%PDF-1.7 one").decode(),
+            },
+        }
+
+    def test_last_turn_embedded_files_dropped_when_pdf_attachments(self):
+        # The latest turn's bytes arrive via `attachments` — re-embedding
+        # the message's own file would send the same document twice.
+        messages = [
+            DirectChatMessage.model_validate(
+                {
+                    "role": "user",
+                    "content": "describe",
+                    "files": [
+                        {
+                            "name": "a.pdf",
+                            "content_type": "application/pdf",
+                            "content": base64.b64encode(b"%PDF-1.7 a").decode(),
+                        }
+                    ],
+                }
+            ),
+        ]
+        built = llm._build_direct_chat_messages(
+            messages=messages, attachments=[self._pdf()], system_prompt="sys"
+        )
+        last = built[-1]["content"]
+        assert isinstance(last, list)
+        file_parts = [part for part in last if part.get("type") == "file"]
+        assert file_parts == [
+            {
+                "type": "file",
+                "file": {
+                    "filename": "doc.pdf",
+                    "file_data": "data:application/pdf;base64,"
+                    + base64.b64encode(b"%PDF-1.7 doc").decode(),
+                },
+            }
+        ]
+
+    def test_prompt_with_attachments_skips_pdfs(self):
+        prompt = llm._build_prompt_with_attachments("hello", [self._pdf()])
+        assert prompt == "hello"
+
     def test_prior_turn_metadata_only_stays_string_content(self):
         messages = [
             DirectChatMessage.model_validate(
@@ -524,6 +627,22 @@ class TestHistoryAttachmentPayload:
         )
         payload = main._history_attachment_payload(text)
         assert payload["content"] == "hello"
+
+    def test_pdf_payload_replaced_with_base64_placeholder(self):
+        import base64
+
+        pdf = AttachmentInput(
+            name="doc.pdf",
+            size=10,
+            content_type="application/pdf",
+            content=base64.b64encode(b"%PDF-1.7 doc").decode(),
+        )
+        payload = main._history_attachment_payload(pdf)
+        assert payload["name"] == "doc.pdf"
+        decoded = base64.b64decode(payload["content"], validate=True)
+        assert decoded.decode() == "%PDF-1.7 [pdf data omitted: 10 bytes]"
+        # The persisted record must still pass strict pdf validation on read.
+        AttachmentInput.model_validate(payload)
 
 
 class TestDebateJobConcurrency:
@@ -895,6 +1014,176 @@ class TestServiceTierPlumbing:
         )
         assert captured["extra_body"]["service_tier"] == "flex"
 
+    def test_extra_body_adds_file_parser_plugin_only_for_pdf(self):
+        base = dict(
+            web_search_enabled=False, reasoning_effort="medium", reasoning_exclude=False
+        )
+        assert "plugins" not in llm._build_openrouter_extra_body(**base)
+        body = llm._build_openrouter_extra_body(**base, pdf_parser=True)
+        assert body["plugins"] == [
+            {"id": "file-parser", "pdf": {"engine": "cloudflare-ai"}}
+        ]
+
+    def test_run_direct_chat_model_enables_file_parser_for_pdf(self, monkeypatch):
+        captured = {}
+
+        async def fake_completion(**kwargs) -> str:
+            captured.update(kwargs)
+            return "ok"
+
+        monkeypatch.setattr(llm, "_run_chat_completion_with_tool_loop", fake_completion)
+
+        pdf = AttachmentInput(
+            name="doc.pdf",
+            size=10,
+            content_type="application/pdf",
+            content=base64.b64encode(b"%PDF-1.7 doc").decode(),
+        )
+        asyncio.run(
+            llm.run_direct_chat_model(
+                client=None,
+                model="openai/a",
+                messages=[DirectChatMessage(role="user", content="hi")],
+                system_prompt="s",
+                temperature=0.2,
+                web_search_enabled=False,
+                reasoning_effort="medium",
+                reasoning_exclude=False,
+                attachments=[pdf],
+            )
+        )
+        assert captured["extra_body"]["plugins"] == [
+            {"id": "file-parser", "pdf": {"engine": "cloudflare-ai"}}
+        ]
+
+
+class TestWebSearchLimits:
+    base = dict(web_search_enabled=True, reasoning_effort="medium", reasoning_exclude=False)
+
+    def test_default_tools_unchanged_without_limits(self):
+        body = llm._build_openrouter_extra_body(**self.base)
+        assert body["tools"] == llm.WEB_SEARCH_TOOLS
+        assert "max_uses" not in body["tools"][0]["parameters"]
+        assert body["max_tool_calls"] == llm.OPENROUTER_MAX_TOOL_CALLS
+
+    def test_limits_set_search_quota_and_total(self):
+        body = llm._build_openrouter_extra_body(
+            **self.base, web_search_limits=WebSearchLimits(max_uses=4, max_results=3)
+        )
+        search, fetch = body["tools"]
+        assert search["type"] == "openrouter:web_search"
+        assert search["parameters"]["max_uses"] == 4
+        assert search["parameters"]["max_results"] == 3
+        assert search["parameters"]["max_total_results"] == 12
+        assert search["parameters"]["engine"] == "auto"
+        assert fetch == llm.WEB_SEARCH_TOOLS[1]
+        # Shared default list must not be mutated.
+        assert "max_uses" not in llm.WEB_SEARCH_TOOLS[0]["parameters"]
+
+    def test_limits_ignored_when_search_disabled(self):
+        body = llm._build_openrouter_extra_body(
+            **{**self.base, "web_search_enabled": False},
+            web_search_limits=WebSearchLimits(max_uses=4),
+        )
+        assert "tools" not in body
+
+    @staticmethod
+    def _calls(*names: str) -> list[dict]:
+        return [
+            {"id": f"c{i}", "type": "function", "function": {"name": name, "arguments": "{}"}}
+            for i, name in enumerate(names)
+        ]
+
+    def test_tool_budget_carries_across_loop_steps(self):
+        body = llm._build_openrouter_extra_body(
+            **self.base, web_search_limits=WebSearchLimits(max_uses=3, max_results=4)
+        )
+        nxt = llm._consume_tool_budget(body, self._calls("web_search", "web_fetch"))
+        search = nxt["tools"][0]["parameters"]
+        assert search["max_uses"] == 2
+        assert search["max_total_results"] == 8
+        assert nxt["max_tool_calls"] == llm.OPENROUTER_MAX_TOOL_CALLS - 2
+        assert body["tools"][0]["parameters"]["max_uses"] == 3
+
+    def test_spent_search_quota_drops_search_tool(self):
+        body = llm._build_openrouter_extra_body(
+            **self.base, web_search_limits=WebSearchLimits(max_uses=1)
+        )
+        nxt = llm._consume_tool_budget(body, self._calls("web_search"))
+        assert [tool["type"] for tool in nxt["tools"]] == ["openrouter:web_fetch"]
+
+    def test_spent_tool_calls_disable_tools(self):
+        body = llm._build_openrouter_extra_body(**self.base)
+        nxt = llm._consume_tool_budget(
+            body, self._calls(*["web_fetch"] * llm.OPENROUTER_MAX_TOOL_CALLS)
+        )
+        assert nxt["tools"] == []
+        assert nxt["max_tool_calls"] == 0
+
+    def test_defaults_match_previous_total(self):
+        limits = WebSearchLimits()
+        assert limits.max_uses * limits.max_results == 10
+
+    def test_extended_boosts_fetch_and_tool_budget(self):
+        body = llm._build_openrouter_extra_body(
+            **self.base,
+            web_search_limits=WebSearchLimits(max_uses=20, max_results=10, extended=True),
+        )
+        search, fetch = body["tools"]
+        assert search["parameters"]["max_uses"] == 20
+        assert search["parameters"]["max_total_results"] == 200
+        assert fetch["parameters"]["max_content_tokens"] == llm.EXTENDED_WEB_FETCH_MAX_CONTENT_TOKENS
+        assert body["max_tool_calls"] == llm.EXTENDED_MAX_TOOL_CALLS
+        assert llm.WEB_SEARCH_TOOLS[1]["parameters"]["max_content_tokens"] == 10000
+
+    def test_standard_limits_keep_fetch_and_tool_budget(self):
+        body = llm._build_openrouter_extra_body(
+            **self.base, web_search_limits=WebSearchLimits()
+        )
+        assert body["tools"][1] == llm.WEB_SEARCH_TOOLS[1]
+        assert body["max_tool_calls"] == llm.OPENROUTER_MAX_TOOL_CALLS
+
+    @pytest.mark.parametrize(
+        "kwargs",
+        [
+            {"max_uses": 0},
+            {"max_uses": 11},
+            {"max_uses": 21, "extended": True},
+            {"max_results": 0},
+            {"max_results": 26},
+        ],
+    )
+    def test_limits_bounds(self, kwargs):
+        with pytest.raises(ValueError):
+            WebSearchLimits(**kwargs)
+
+    def test_run_direct_chat_model_forwards_limits(self, monkeypatch):
+        captured = {}
+
+        async def fake_completion(**kwargs) -> str:
+            captured.update(kwargs)
+            return "ok"
+
+        monkeypatch.setattr(llm, "_run_chat_completion_with_tool_loop", fake_completion)
+
+        asyncio.run(
+            llm.run_direct_chat_model(
+                client=None,
+                model="openai/a",
+                messages=[DirectChatMessage(role="user", content="hi")],
+                system_prompt="s",
+                temperature=0.2,
+                web_search_enabled=True,
+                reasoning_effort="medium",
+                reasoning_exclude=False,
+                attachments=[],
+                web_search_limits=WebSearchLimits(max_uses=7, max_results=2),
+            )
+        )
+        params = captured["extra_body"]["tools"][0]["parameters"]
+        assert params["max_uses"] == 7
+        assert params["max_total_results"] == 14
+
 
 class TestDirectChatBatch:
     def _client(self, handler) -> httpx.AsyncClient:
@@ -1083,6 +1372,45 @@ class TestDirectChatBatch:
             self._run(monkeypatch, handler, attachments=[image])
         assert calls == []
 
+    def test_new_pdf_attachment_rejected(self, monkeypatch):
+        pdf = AttachmentInput(
+            name="x.pdf",
+            size=4,
+            content_type="application/pdf",
+            content=base64.b64encode(b"%PDF-1.7 x").decode(),
+        )
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(500)
+
+        with pytest.raises(llm.CompletionFailure, match="PDF"):
+            self._run(monkeypatch, handler, attachments=[pdf])
+        assert calls == []
+
+    def test_prior_turn_embedded_file_rejected(self, monkeypatch):
+        message = DirectChatMessage(
+            role="user",
+            content="hi",
+            files=[
+                DirectChatFileMeta(
+                    name="x.pdf",
+                    content_type="application/pdf",
+                    content=base64.b64encode(b"%PDF-1.7 x").decode(),
+                )
+            ],
+        )
+        calls: list[httpx.Request] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls.append(request)
+            return httpx.Response(500)
+
+        with pytest.raises(llm.CompletionFailure, match="PDF"):
+            self._run(monkeypatch, handler, messages=[message])
+        assert calls == []
+
     def test_prior_turn_embedded_image_rejected(self, monkeypatch):
         message = DirectChatMessage(
             role="user",
@@ -1169,3 +1497,189 @@ class TestDirectChatBatch:
 
         with pytest.raises(llm.CompletionFailure, match="batch_1"):
             self._run(monkeypatch, handler)
+
+
+class TestDirectChatStreamedCompletion:
+    """Synchronous completions run as `stream: true` upstream so client
+    disconnects abort generation on providers that support cancellation;
+    chunks are buffered into the same result the tool loop returns."""
+
+    def _sdk_client(self, handler) -> AsyncOpenAI:
+        return AsyncOpenAI(
+            api_key="k",
+            base_url="https://openrouter.test/v1",
+            http_client=httpx.AsyncClient(transport=httpx.MockTransport(handler)),
+        )
+
+    @staticmethod
+    def _sse_response(chunks: list[dict]) -> httpx.Response:
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks)
+        body += "data: [DONE]\n\n"
+        return httpx.Response(
+            200, content=body.encode(), headers={"content-type": "text/event-stream"}
+        )
+
+    @staticmethod
+    def _chunk(delta: dict, finish: str | None = None) -> dict:
+        return {
+            "id": "cmpl-1",
+            "object": "chat.completion.chunk",
+            "created": 1,
+            "model": "openai/a",
+            "choices": [{"index": 0, "delta": delta, "finish_reason": finish}],
+        }
+
+    def test_accumulates_content_and_requests_stream(self):
+        requests: list[dict] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            requests.append(json.loads(request.content))
+            return self._sse_response(
+                [
+                    self._chunk({"role": "assistant", "content": "Hello"}),
+                    self._chunk({"content": " world"}),
+                    self._chunk({}, "stop"),
+                ]
+            )
+
+        result = asyncio.run(
+            llm.run_direct_chat_model(
+                client=self._sdk_client(handler),
+                model="openai/a",
+                messages=[DirectChatMessage(role="user", content="hi")],
+                system_prompt="s",
+                temperature=0.2,
+                web_search_enabled=False,
+                reasoning_effort="medium",
+                reasoning_exclude=False,
+                attachments=[],
+            )
+        )
+
+        assert result == "Hello world"
+        assert requests[0]["stream"] is True
+
+    def test_unindexed_annotation_deltas_are_ignored(self):
+        citation = {
+            "type": "url_citation",
+            "url_citation": {"url": "https://x.test", "title": "x", "start_index": 0, "end_index": 0},
+        }
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return self._sse_response(
+                [
+                    self._chunk({"role": "assistant", "content": "A", "annotations": [citation]}),
+                    self._chunk({"content": "B", "annotations": [citation]}),
+                    self._chunk({}, "stop"),
+                ]
+            )
+
+        result = asyncio.run(
+            llm._run_chat_completion_with_tool_loop(
+                client=self._sdk_client(handler),
+                model="openai/a",
+                temperature=0.2,
+                messages=[{"role": "user", "content": "hi"}],
+                extra_body={},
+            )
+        )
+
+        assert result == "AB"
+
+    def test_tool_calls_reassemble_across_delta_chunks(self):
+        calls = {"count": 0}
+        seen_messages: list[list[dict]] = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            calls["count"] += 1
+            seen_messages.append(json.loads(request.content)["messages"])
+            if calls["count"] == 1:
+                return self._sse_response(
+                    [
+                        self._chunk(
+                            {
+                                "role": "assistant",
+                                "tool_calls": [
+                                    {
+                                        "index": 0,
+                                        "id": "call_1",
+                                        "type": "function",
+                                        "function": {
+                                            "name": "web.search",
+                                            "arguments": '{"q":',
+                                        },
+                                        "result": "search hits",
+                                    }
+                                ],
+                            }
+                        ),
+                        self._chunk(
+                            {
+                                "tool_calls": [
+                                    {"index": 0, "function": {"arguments": '"x"}'}}
+                                ]
+                            }
+                        ),
+                        self._chunk({}, "tool_calls"),
+                    ]
+                )
+            return self._sse_response(
+                [
+                    self._chunk({"content": "final answer"}),
+                    self._chunk({}, "stop"),
+                ]
+            )
+
+        result = asyncio.run(
+            llm._run_chat_completion_with_tool_loop(
+                client=self._sdk_client(handler),
+                model="openai/a",
+                temperature=0.2,
+                messages=[{"role": "user", "content": "hi"}],
+                extra_body={},
+            )
+        )
+
+        assert result == "final answer"
+        assert calls["count"] == 2
+        assert seen_messages[1][-2]["tool_calls"][0]["function"]["arguments"] == '{"q":"x"}'
+        assert seen_messages[1][-1] == {
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "content": "search hits",
+        }
+
+    def test_stream_ending_before_finish_chunk_raises(self):
+        """Content chunks then EOF = a truncated answer, not a completed one."""
+        def handler(request: httpx.Request) -> httpx.Response:
+            return self._sse_response(
+                [
+                    self._chunk({"role": "assistant", "content": "Hello, the answer is"}),
+                ]
+            )
+
+        with pytest.raises(llm.CompletionFailure, match="finish reason"):
+            asyncio.run(
+                llm._run_chat_completion_with_tool_loop(
+                    client=self._sdk_client(handler),
+                    model="openai/a",
+                    temperature=0.2,
+                    messages=[{"role": "user", "content": "hi"}],
+                    extra_body={},
+                )
+            )
+
+    def test_empty_stream_raises_completion_failure(self):
+        def handler(request: httpx.Request) -> httpx.Response:
+            return self._sse_response([])
+
+        with pytest.raises(llm.CompletionFailure, match="no choices"):
+            asyncio.run(
+                llm._run_chat_completion_with_tool_loop(
+                    client=self._sdk_client(handler),
+                    model="openai/a",
+                    temperature=0.2,
+                    messages=[{"role": "user", "content": "hi"}],
+                    extra_body={},
+                )
+            )

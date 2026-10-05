@@ -7,13 +7,14 @@ from collections.abc import AsyncGenerator, Awaitable, Callable
 from typing import Any, TypeVar
 
 import httpx
-from openai import AsyncOpenAI
 from openai import (
     APIConnectionError,
     APITimeoutError,
+    AsyncOpenAI,
     InternalServerError,
     RateLimitError,
 )
+from openai.lib.streaming.chat import ChatCompletionStreamState
 
 from app.config import settings
 from app.models import (
@@ -24,6 +25,7 @@ from app.models import (
     PersonaAssignment,
     SourceAgentSpec,
     SourceResult,
+    WebSearchLimits,
 )
 from app.prompting import (
     build_persona_generation_prompt,
@@ -48,6 +50,39 @@ WEB_SEARCH_TOOLS = [
         },
     },
 ]
+
+OPENROUTER_MAX_TOOL_CALLS = 10
+# Extended direct-chat web search: bigger fetch pages and enough tool calls
+# for 20 searches plus follow-up fetches.
+EXTENDED_WEB_FETCH_MAX_CONTENT_TOKENS = 40000
+EXTENDED_MAX_TOOL_CALLS = 25
+
+
+def _build_web_search_tools(limits: WebSearchLimits | None) -> list[dict[str, Any]]:
+    """Fusion keeps the static defaults; Direct Chat passes per-request limits.
+
+    `max_total_results` follows `max_uses * max_results` so the total cap
+    never starves searches the model is allowed to run.
+    """
+    if limits is None:
+        return WEB_SEARCH_TOOLS
+    search_tool, fetch_tool = WEB_SEARCH_TOOLS
+    fetch_parameters = dict(fetch_tool["parameters"])
+    if limits.extended:
+        fetch_parameters["max_content_tokens"] = EXTENDED_WEB_FETCH_MAX_CONTENT_TOKENS
+    return [
+        {
+            **search_tool,
+            "parameters": {
+                **search_tool["parameters"],
+                "max_uses": limits.max_uses,
+                "max_results": limits.max_results,
+                "max_total_results": limits.max_uses * limits.max_results,
+            },
+        },
+        {**fetch_tool, "parameters": fetch_parameters},
+    ]
+
 
 OPENROUTER_TOKEN_LIMIT = 65000
 SOURCE_EMPTY_RETRY_COUNT = 2
@@ -391,7 +426,7 @@ async def fetch_model_service_tiers(model_id: str) -> list[str]:
 
 
 def _build_prompt_with_attachments(prompt: str, attachments: list[AttachmentInput]) -> str:
-    text_attachments = [attachment for attachment in attachments if not attachment.is_image]
+    text_attachments = [attachment for attachment in attachments if attachment.is_text]
     if not text_attachments:
         return prompt
 
@@ -402,6 +437,67 @@ def _build_prompt_with_attachments(prompt: str, attachments: list[AttachmentInpu
     return "\n".join(blocks).strip()
 
 
+def _drop_unindexed_delta_lists(chunk: Any) -> None:
+    """Strip delta list fields the SDK cannot accumulate.
+
+    OpenRouter streams web-search `annotations` (url_citation entries) without
+    the per-entry `index` that ChatCompletionStreamState requires, which
+    raises mid-stream. Only content and tool calls are consumed downstream.
+    """
+    for choice in getattr(chunk, "choices", None) or []:
+        extra = getattr(choice.delta, "model_extra", None)
+        if not extra:
+            continue
+        for key in [
+            key
+            for key, value in extra.items()
+            if isinstance(value, list)
+            and any(isinstance(entry, dict) and "index" not in entry for entry in value)
+        ]:
+            del extra[key]
+
+
+def _consume_tool_budget(
+    extra_body: dict[str, Any], tool_calls: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Carry tool budgets across tool-loop steps so one reply never gets a
+    fresh `max_tool_calls` / search quota per upstream request."""
+    remaining_calls = extra_body.get("max_tool_calls")
+    tools = extra_body.get("tools")
+    if not tools or not isinstance(remaining_calls, int):
+        return extra_body
+
+    remaining_calls -= len(tool_calls)
+    search_calls = sum(
+        1 for call in tool_calls if "search" in call["function"]["name"].lower()
+    )
+    next_tools: list[dict[str, Any]] = []
+    for tool in tools:
+        parameters = tool.get("parameters") or {}
+        if tool.get("type") == "openrouter:web_search" and "max_uses" in parameters:
+            uses = parameters["max_uses"] - search_calls
+            if uses <= 0:
+                continue
+            tool = {
+                **tool,
+                "parameters": {
+                    **parameters,
+                    "max_uses": uses,
+                    "max_total_results": uses * parameters["max_results"],
+                },
+            }
+        next_tools.append(tool)
+
+    if remaining_calls <= 0 or not next_tools:
+        return {
+            **extra_body,
+            "tools": [],
+            "max_tool_calls": 0,
+            "parallel_tool_calls": False,
+        }
+    return {**extra_body, "tools": next_tools, "max_tool_calls": remaining_calls}
+
+
 def _build_openrouter_extra_body(
     *,
     web_search_enabled: bool,
@@ -409,6 +505,8 @@ def _build_openrouter_extra_body(
     reasoning_exclude: bool,
     allow_tools: bool = True,
     service_tier: str | None = None,
+    pdf_parser: bool = False,
+    web_search_limits: WebSearchLimits | None = None,
 ) -> dict[str, Any]:
     extra_body: dict[str, Any] = {
         "reasoning": {
@@ -422,12 +520,23 @@ def _build_openrouter_extra_body(
     if service_tier and service_tier != "default":
         extra_body["service_tier"] = service_tier
 
+    if pdf_parser:
+        # File parts need a parser engine on models without native file
+        # input; cloudflare-ai is OpenRouter's free engine.
+        extra_body["plugins"] = [
+            {"id": "file-parser", "pdf": {"engine": "cloudflare-ai"}}
+        ]
+
     # Only attach tool-control parameters when an actual tools array is
     # present. Sending `max_tool_calls`/`parallel_tool_calls` without a
     # `tools` array is a malformed OpenRouter request that causes the
     # provider to return an error response (choices: null), which surfaces
     # as a TypeError when indexing `response.choices`.
-    tools = WEB_SEARCH_TOOLS if (web_search_enabled and allow_tools) else []
+    tools = (
+        _build_web_search_tools(web_search_limits)
+        if (web_search_enabled and allow_tools)
+        else []
+    )
 
     if not allow_tools:
         # Explicitly disable tools for providers that default them on.
@@ -436,7 +545,11 @@ def _build_openrouter_extra_body(
         extra_body["parallel_tool_calls"] = False
     elif tools:
         extra_body["tools"] = tools
-        extra_body["max_tool_calls"] = 10
+        extra_body["max_tool_calls"] = (
+            EXTENDED_MAX_TOOL_CALLS
+            if web_search_limits is not None and web_search_limits.extended
+            else OPENROUTER_MAX_TOOL_CALLS
+        )
         extra_body["parallel_tool_calls"] = True
 
     return extra_body
@@ -888,7 +1001,10 @@ async def _run_chat_completion_with_tool_loop(
     for _ in range(max_steps):
         # Use with_raw_response so OpenRouter diagnostic headers (request id,
         # rate-limit state, provider error fields) remain inspectable when a
-        # parsed completion has no choices.
+        # parsed completion has no choices. The request is streamed because
+        # OpenRouter only stops generation and billing on client disconnect
+        # for streamed requests; chunks accumulate into the same completion
+        # the tool loop expects.
         raw = await client.chat.completions.with_raw_response.create(
             model=model,
             temperature=temperature,
@@ -896,9 +1012,29 @@ async def _run_chat_completion_with_tool_loop(
             max_completion_tokens=OPENROUTER_TOKEN_LIMIT,
             messages=history,
             extra_body=extra_body,
+            stream=True,
         )
-        response = raw.parse()
         headers = getattr(raw, "headers", None)
+
+        stream = raw.parse()
+        stream_state = ChatCompletionStreamState()
+        saw_chunk = False
+        try:
+            async for chunk in stream:
+                _drop_unindexed_delta_lists(chunk)
+                stream_state.handle_chunk(chunk)
+                saw_chunk = True
+        finally:
+            # Explicit close aborts the HTTP connection when the task is
+            # cancelled mid-stream (client disconnected).
+            await stream.close()
+
+        if not saw_chunk:
+            raise CompletionFailure(
+                f"{context} for model '{model}' returned no choices.",
+                diagnostics=_extract_response_diagnostics(None, headers),
+            )
+        response = stream_state.get_final_completion()
 
         choices = getattr(response, "choices", None)
         if not isinstance(choices, list) or not choices:
@@ -906,6 +1042,14 @@ async def _run_chat_completion_with_tool_loop(
             raise CompletionFailure(
                 f"{context} for model '{model}' returned no choices.",
                 diagnostics=diagnostics,
+            )
+
+        if getattr(choices[0], "finish_reason", None) is None:
+            # EOF before the terminal chunk leaves a truncated completion;
+            # a non-streamed truncated body failed the same way.
+            raise CompletionFailure(
+                f"{context} for model '{model}' ended before a finish reason.",
+                diagnostics=_extract_response_diagnostics(response, headers),
             )
 
         message = choices[0].message
@@ -939,6 +1083,8 @@ async def _run_chat_completion_with_tool_loop(
                     "content": _extract_tool_result_content(tool_call),
                 }
             )
+
+        extra_body = _consume_tool_budget(extra_body, tool_calls)
 
     raise RuntimeError(
         f"Tool-calling loop exceeded {max_steps} steps for model '{model}' without final text content."
@@ -1166,6 +1312,7 @@ async def run_direct_chat_model(
     reasoning_exclude: bool,
     attachments: list[AttachmentInput],
     service_tier: str | None = None,
+    web_search_limits: WebSearchLimits | None = None,
 ) -> str:
     normalized_messages: list[dict[str, Any]] = _build_direct_chat_messages(
         messages=messages,
@@ -1178,6 +1325,9 @@ async def run_direct_chat_model(
         reasoning_effort=reasoning_effort,
         reasoning_exclude=reasoning_exclude,
         service_tier=service_tier,
+        web_search_limits=web_search_limits,
+        pdf_parser=any(attachment.is_pdf for attachment in attachments)
+        or any(file.content for message in messages for file in message.files),
     )
 
     if model.endswith(BATCH_MODEL_SUFFIX):
@@ -1229,6 +1379,14 @@ def _validate_batch_direct_chat(
         raise CompletionFailure(
             "Batch endpoints only accept public image URLs, not uploaded "
             "images; pick the non-batch variant for image turns."
+        )
+    # Batch file parts are likewise URL-only upstream.
+    if any(attachment.is_pdf for attachment in attachments) or any(
+        file.content for message in request_messages for file in message.files
+    ):
+        raise CompletionFailure(
+            "Batch endpoints only accept public file URLs, not uploaded "
+            "PDFs; pick the non-batch variant for document turns."
         )
 
 
@@ -1416,6 +1574,7 @@ def _build_direct_chat_messages(
 
     normalized_messages: list[dict[str, Any]] = [{"role": "system", "content": resolved_system_prompt}]
     has_image_attachments = any(attachment.is_image for attachment in attachments)
+    has_pdf_attachments = any(attachment.is_pdf for attachment in attachments)
     last_user_message_index = next(
         (
             index
@@ -1426,12 +1585,12 @@ def _build_direct_chat_messages(
     )
     last_user_index = -1
     for index, message in enumerate(messages):
-        # Prior image turns re-embed their pixels in the message so follow-up
-        # requests keep earlier images in context. The latest turn's pixels
-        # normally arrive separately in `attachments` (handled below) —
-        # skipping them here avoids sending the same image twice; callers that
-        # embed pixels only in the message keep them instead.
-        embedded_image_parts = (
+        # Prior image/pdf turns re-embed their payloads in the message so
+        # follow-up requests keep earlier binaries in context. The latest
+        # turn's payloads normally arrive separately in `attachments`
+        # (handled below) — skipping them here avoids sending the same bytes
+        # twice; callers that embed them only in the message keep them.
+        embedded_parts = (
             [
                 {
                     "type": "image_url",
@@ -1444,13 +1603,27 @@ def _build_direct_chat_messages(
             ]
             if index != last_user_message_index or not has_image_attachments
             else []
+        ) + (
+            [
+                {
+                    "type": "file",
+                    "file": {
+                        "filename": file.name,
+                        "file_data": f"data:{file.content_type};base64,{file.content}"
+                    },
+                }
+                for file in message.files
+                if file.content
+            ]
+            if index != last_user_message_index or not has_pdf_attachments
+            else []
         )
         normalized_messages.append(
             {
                 "role": message.role,
                 "content": (
-                    [{"type": "text", "text": message.content}, *embedded_image_parts]
-                    if embedded_image_parts
+                    [{"type": "text", "text": message.content}, *embedded_parts]
+                    if embedded_parts
                     else message.content
                 ),
             }
@@ -1460,10 +1633,11 @@ def _build_direct_chat_messages(
 
     if attachments and last_user_index >= 0:
         existing = normalized_messages[last_user_index]["content"]
-        text_attachments = [attachment for attachment in attachments if not attachment.is_image]
+        text_attachments = [attachment for attachment in attachments if attachment.is_text]
         image_attachments = [attachment for attachment in attachments if attachment.is_image]
+        pdf_attachments = [attachment for attachment in attachments if attachment.is_pdf]
         if isinstance(existing, list):
-            # The message already carries embedded image parts — merge text
+            # The message already carries embedded binary parts — merge text
             # attachments into its text part rather than stringifying the
             # whole multipart list into the prompt.
             original = "\n".join(
@@ -1480,8 +1654,9 @@ def _build_direct_chat_messages(
             original = str(existing)
             embedded_parts = []
         composed = _build_prompt_with_attachments(original, text_attachments)
-        # OpenRouter multi-part content: text first, then image_url data URLs.
-        image_parts = [
+        # OpenRouter multi-part content: text first, then image_url data URLs
+        # and file parts.
+        binary_parts = [
             {
                 "type": "image_url",
                 "image_url": {
@@ -1489,10 +1664,19 @@ def _build_direct_chat_messages(
                 },
             }
             for attachment in image_attachments
+        ] + [
+            {
+                "type": "file",
+                "file": {
+                    "filename": attachment.name,
+                    "file_data": f"data:{attachment.content_type};base64,{attachment.content}"
+                },
+            }
+            for attachment in pdf_attachments
         ]
         normalized_messages[last_user_index]["content"] = (
-            [{"type": "text", "text": composed}, *embedded_parts, *image_parts]
-            if embedded_parts or image_parts
+            [{"type": "text", "text": composed}, *embedded_parts, *binary_parts]
+            if embedded_parts or binary_parts
             else composed
         )
 
