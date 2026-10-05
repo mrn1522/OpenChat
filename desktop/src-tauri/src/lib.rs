@@ -525,16 +525,18 @@ fn kill_sidecar_tree(child: CommandChild) -> bool {
     !tree_killed && kill_failed
 }
 
-// Stops any openchat-server.exe whose command line carries this app's
+// Stops any openchat-server process whose command line carries this app's
 // --parent-pid marker: a onefile worker survives the bootloader that spawned
-// it because its watchdog watches this app, not the bootloader. Best-effort —
-// an orphaned worker missed here degrades to the same wait/restore paths as
+// it because its watchdog watches this app, not the bootloader. The Name
+// filter stays loose because the bundled exe is openchat-server.exe while a
+// `tauri dev` sidecar keeps its target-triple suffix. Best-effort — an
+// orphaned worker missed here degrades to the same wait/restore paths as
 // before. Win32_Process.CommandLine is matched with a digit boundary so a
 // --parent-pid belonging to a different process id cannot collide.
 #[cfg(windows)]
 fn sweep_orphaned_workers() {
     let script = format!(
-        "Get-CimInstance Win32_Process -Filter \"Name='openchat-server.exe'\" \
+        "Get-CimInstance Win32_Process -Filter \"Name LIKE 'openchat-server%'\" \
          | Where-Object {{ $_.CommandLine -match '--parent-pid\\s+{}\\b' }} \
          | ForEach-Object {{ Stop-Process -Id $_.ProcessId -Force }}",
         std::process::id()
