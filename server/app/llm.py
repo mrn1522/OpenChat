@@ -457,6 +457,47 @@ def _drop_unindexed_delta_lists(chunk: Any) -> None:
             del extra[key]
 
 
+def _consume_tool_budget(
+    extra_body: dict[str, Any], tool_calls: list[dict[str, Any]]
+) -> dict[str, Any]:
+    """Carry tool budgets across tool-loop steps so one reply never gets a
+    fresh `max_tool_calls` / search quota per upstream request."""
+    remaining_calls = extra_body.get("max_tool_calls")
+    tools = extra_body.get("tools")
+    if not tools or not isinstance(remaining_calls, int):
+        return extra_body
+
+    remaining_calls -= len(tool_calls)
+    search_calls = sum(
+        1 for call in tool_calls if "search" in call["function"]["name"].lower()
+    )
+    next_tools: list[dict[str, Any]] = []
+    for tool in tools:
+        parameters = tool.get("parameters") or {}
+        if tool.get("type") == "openrouter:web_search" and "max_uses" in parameters:
+            uses = parameters["max_uses"] - search_calls
+            if uses <= 0:
+                continue
+            tool = {
+                **tool,
+                "parameters": {
+                    **parameters,
+                    "max_uses": uses,
+                    "max_total_results": uses * parameters["max_results"],
+                },
+            }
+        next_tools.append(tool)
+
+    if remaining_calls <= 0 or not next_tools:
+        return {
+            **extra_body,
+            "tools": [],
+            "max_tool_calls": 0,
+            "parallel_tool_calls": False,
+        }
+    return {**extra_body, "tools": next_tools, "max_tool_calls": remaining_calls}
+
+
 def _build_openrouter_extra_body(
     *,
     web_search_enabled: bool,
@@ -1042,6 +1083,8 @@ async def _run_chat_completion_with_tool_loop(
                     "content": _extract_tool_result_content(tool_call),
                 }
             )
+
+        extra_body = _consume_tool_budget(extra_body, tool_calls)
 
     raise RuntimeError(
         f"Tool-calling loop exceeded {max_steps} steps for model '{model}' without final text content."

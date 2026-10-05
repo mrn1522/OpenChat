@@ -1087,6 +1087,39 @@ class TestWebSearchLimits:
         )
         assert "tools" not in body
 
+    @staticmethod
+    def _calls(*names: str) -> list[dict]:
+        return [
+            {"id": f"c{i}", "type": "function", "function": {"name": name, "arguments": "{}"}}
+            for i, name in enumerate(names)
+        ]
+
+    def test_tool_budget_carries_across_loop_steps(self):
+        body = llm._build_openrouter_extra_body(
+            **self.base, web_search_limits=WebSearchLimits(max_uses=3, max_results=4)
+        )
+        nxt = llm._consume_tool_budget(body, self._calls("web_search", "web_fetch"))
+        search = nxt["tools"][0]["parameters"]
+        assert search["max_uses"] == 2
+        assert search["max_total_results"] == 8
+        assert nxt["max_tool_calls"] == llm.OPENROUTER_MAX_TOOL_CALLS - 2
+        assert body["tools"][0]["parameters"]["max_uses"] == 3
+
+    def test_spent_search_quota_drops_search_tool(self):
+        body = llm._build_openrouter_extra_body(
+            **self.base, web_search_limits=WebSearchLimits(max_uses=1)
+        )
+        nxt = llm._consume_tool_budget(body, self._calls("web_search"))
+        assert [tool["type"] for tool in nxt["tools"]] == ["openrouter:web_fetch"]
+
+    def test_spent_tool_calls_disable_tools(self):
+        body = llm._build_openrouter_extra_body(**self.base)
+        nxt = llm._consume_tool_budget(
+            body, self._calls(*["web_fetch"] * llm.OPENROUTER_MAX_TOOL_CALLS)
+        )
+        assert nxt["tools"] == []
+        assert nxt["max_tool_calls"] == 0
+
     def test_defaults_match_previous_total(self):
         limits = WebSearchLimits()
         assert limits.max_uses * limits.max_results == 10
