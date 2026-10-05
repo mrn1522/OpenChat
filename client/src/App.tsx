@@ -293,6 +293,12 @@ const ORCHESTRATION_FLOW: Array<{ id: OrchestrationStep; label: string; detail: 
 
 const REASONING_EFFORT_OPTIONS: ReasoningEffort[] = ["max", "xhigh", "high", "medium", "low", "minimal", "none"];
 const DEBATE_MODE_OPTIONS: DebateMode[] = ["off", "partial", "full"];
+// Mirrors server WebSearchLimits; Extended also raises fetch tokens (10k ->
+// 40k) and tool calls (10 -> 25) server-side.
+const WEB_SEARCH_PRESETS = {
+  standard: { maxUses: 2, maxResults: 5, maxUsesCeiling: 10 },
+  extended: { maxUses: 6, maxResults: 10, maxUsesCeiling: 20 },
+} as const;
 const SERVICE_TIER_LABELS: Record<ServiceTier, string> = {
   default: "Default",
   flex: "Flex",
@@ -807,6 +813,9 @@ function App() {
   const [directRunId, setDirectRunId] = useState<string | null>(null);
   const [directWebSearchEnabled, setDirectWebSearchEnabled] = useState(false);
   const [directTemperature, setDirectTemperature] = useState(1.0);
+  const [directSearchMaxUses, setDirectSearchMaxUses] = useState<number>(WEB_SEARCH_PRESETS.standard.maxUses);
+  const [directSearchMaxResults, setDirectSearchMaxResults] = useState<number>(WEB_SEARCH_PRESETS.standard.maxResults);
+  const [directSearchExtended, setDirectSearchExtended] = useState(false);
   const [directReasoningEffort, setDirectReasoningEffort] = useState<ReasoningEffort>("medium");
   const [directAttachments, setDirectAttachments] = useState<ComposerAttachment[]>([]);
   const [isDirectSettingsOpen, setIsDirectSettingsOpen] = useState(false);
@@ -2546,6 +2555,11 @@ function App() {
             temperature: directTemperature,
             max_output_tokens: OPENROUTER_TOKEN_LIMIT,
             web_search_enabled: directWebSearchEnabled,
+            web_search_limits: {
+              max_uses: directSearchMaxUses,
+              max_results: directSearchMaxResults,
+              extended: directSearchExtended,
+            },
             reasoning: {
               effort: directReasoningEffort,
               exclude: false,
@@ -3825,6 +3839,48 @@ function App() {
                           ))}
                         </select>
                       </label>
+                      <label className="checkbox-row" title="Boost search quota, results, and fetched page size">
+                        <input
+                          type="checkbox"
+                          role="switch"
+                          checked={directSearchExtended}
+                          disabled={!directWebSearchEnabled}
+                          onChange={(event) => {
+                            const preset = WEB_SEARCH_PRESETS[event.target.checked ? "extended" : "standard"];
+                            setDirectSearchExtended(event.target.checked);
+                            setDirectSearchMaxUses(preset.maxUses);
+                            setDirectSearchMaxResults(preset.maxResults);
+                          }}
+                        />
+                        <span>Extended web search</span>
+                      </label>
+                      <label title={directWebSearchEnabled ? undefined : "Enable web search to use this limit"}>
+                        <span>Searches per reply: {directSearchMaxUses}</span>
+                        <input
+                          type="range"
+                          min={1}
+                          max={WEB_SEARCH_PRESETS[directSearchExtended ? "extended" : "standard"].maxUsesCeiling}
+                          step={1}
+                          value={directSearchMaxUses}
+                          disabled={!directWebSearchEnabled}
+                          onChange={(event) => setDirectSearchMaxUses(Number(event.target.value))}
+                        />
+                      </label>
+                      <label title={directWebSearchEnabled ? undefined : "Enable web search to use this limit"}>
+                        <span>Results per search: {directSearchMaxResults}</span>
+                        <input
+                          type="range"
+                          min={1}
+                          max={25}
+                          step={1}
+                          value={directSearchMaxResults}
+                          disabled={!directWebSearchEnabled}
+                          onChange={(event) => setDirectSearchMaxResults(Number(event.target.value))}
+                        />
+                      </label>
+                      <p className="settings-fixed-value">
+                        Up to {directSearchMaxUses * directSearchMaxResults} results, {directSearchExtended ? "40k" : "10k"} tokens per fetched page
+                      </p>
                     </div>
                   )}
                 </div>

@@ -25,6 +25,7 @@ from app.models import (
     PersonaAssignment,
     SourceAgentSpec,
     SourceResult,
+    WebSearchLimits,
 )
 from app.prompting import (
     build_persona_generation_prompt,
@@ -49,6 +50,39 @@ WEB_SEARCH_TOOLS = [
         },
     },
 ]
+
+OPENROUTER_MAX_TOOL_CALLS = 10
+# Extended direct-chat web search: bigger fetch pages and enough tool calls
+# for 20 searches plus follow-up fetches.
+EXTENDED_WEB_FETCH_MAX_CONTENT_TOKENS = 40000
+EXTENDED_MAX_TOOL_CALLS = 25
+
+
+def _build_web_search_tools(limits: WebSearchLimits | None) -> list[dict[str, Any]]:
+    """Fusion keeps the static defaults; Direct Chat passes per-request limits.
+
+    `max_total_results` follows `max_uses * max_results` so the total cap
+    never starves searches the model is allowed to run.
+    """
+    if limits is None:
+        return WEB_SEARCH_TOOLS
+    search_tool, fetch_tool = WEB_SEARCH_TOOLS
+    fetch_parameters = dict(fetch_tool["parameters"])
+    if limits.extended:
+        fetch_parameters["max_content_tokens"] = EXTENDED_WEB_FETCH_MAX_CONTENT_TOKENS
+    return [
+        {
+            **search_tool,
+            "parameters": {
+                **search_tool["parameters"],
+                "max_uses": limits.max_uses,
+                "max_results": limits.max_results,
+                "max_total_results": limits.max_uses * limits.max_results,
+            },
+        },
+        {**fetch_tool, "parameters": fetch_parameters},
+    ]
+
 
 OPENROUTER_TOKEN_LIMIT = 65000
 SOURCE_EMPTY_RETRY_COUNT = 2
@@ -403,6 +437,26 @@ def _build_prompt_with_attachments(prompt: str, attachments: list[AttachmentInpu
     return "\n".join(blocks).strip()
 
 
+def _drop_unindexed_delta_lists(chunk: Any) -> None:
+    """Strip delta list fields the SDK cannot accumulate.
+
+    OpenRouter streams web-search `annotations` (url_citation entries) without
+    the per-entry `index` that ChatCompletionStreamState requires, which
+    raises mid-stream. Only content and tool calls are consumed downstream.
+    """
+    for choice in getattr(chunk, "choices", None) or []:
+        extra = getattr(choice.delta, "model_extra", None)
+        if not extra:
+            continue
+        for key in [
+            key
+            for key, value in extra.items()
+            if isinstance(value, list)
+            and any(isinstance(entry, dict) and "index" not in entry for entry in value)
+        ]:
+            del extra[key]
+
+
 def _build_openrouter_extra_body(
     *,
     web_search_enabled: bool,
@@ -411,6 +465,7 @@ def _build_openrouter_extra_body(
     allow_tools: bool = True,
     service_tier: str | None = None,
     pdf_parser: bool = False,
+    web_search_limits: WebSearchLimits | None = None,
 ) -> dict[str, Any]:
     extra_body: dict[str, Any] = {
         "reasoning": {
@@ -436,7 +491,11 @@ def _build_openrouter_extra_body(
     # `tools` array is a malformed OpenRouter request that causes the
     # provider to return an error response (choices: null), which surfaces
     # as a TypeError when indexing `response.choices`.
-    tools = WEB_SEARCH_TOOLS if (web_search_enabled and allow_tools) else []
+    tools = (
+        _build_web_search_tools(web_search_limits)
+        if (web_search_enabled and allow_tools)
+        else []
+    )
 
     if not allow_tools:
         # Explicitly disable tools for providers that default them on.
@@ -445,7 +504,11 @@ def _build_openrouter_extra_body(
         extra_body["parallel_tool_calls"] = False
     elif tools:
         extra_body["tools"] = tools
-        extra_body["max_tool_calls"] = 10
+        extra_body["max_tool_calls"] = (
+            EXTENDED_MAX_TOOL_CALLS
+            if web_search_limits is not None and web_search_limits.extended
+            else OPENROUTER_MAX_TOOL_CALLS
+        )
         extra_body["parallel_tool_calls"] = True
 
     return extra_body
@@ -917,6 +980,7 @@ async def _run_chat_completion_with_tool_loop(
         saw_chunk = False
         try:
             async for chunk in stream:
+                _drop_unindexed_delta_lists(chunk)
                 stream_state.handle_chunk(chunk)
                 saw_chunk = True
         finally:
@@ -1205,6 +1269,7 @@ async def run_direct_chat_model(
     reasoning_exclude: bool,
     attachments: list[AttachmentInput],
     service_tier: str | None = None,
+    web_search_limits: WebSearchLimits | None = None,
 ) -> str:
     normalized_messages: list[dict[str, Any]] = _build_direct_chat_messages(
         messages=messages,
@@ -1217,6 +1282,7 @@ async def run_direct_chat_model(
         reasoning_effort=reasoning_effort,
         reasoning_exclude=reasoning_exclude,
         service_tier=service_tier,
+        web_search_limits=web_search_limits,
         pdf_parser=any(attachment.is_pdf for attachment in attachments)
         or any(file.content for message in messages for file in message.files),
     )

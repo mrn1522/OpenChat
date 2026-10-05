@@ -1046,6 +1046,7 @@ async def direct_chat_stream(request: DirectChatRequest):
                 reasoning_exclude=request.reasoning.exclude,
                 attachments=request.attachments,
                 service_tier=request.service_tier,
+                web_search_limits=request.web_search_limits,
             )
         except Exception as exc:  # noqa: BLE001
             yield sse("error", {"message": str(exc)})
