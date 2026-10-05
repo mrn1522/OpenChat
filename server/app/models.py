@@ -475,13 +475,22 @@ class ChatHistoryListResponse(BaseModel):
     data: list[ChatHistorySummary]
 
 
+class ChatHistoryRequest(RunRequest):
+    """Stored run request. Direct-chat records keep image/PDF placeholders,
+    which RunRequest rejects for new fusion runs."""
+
+    @model_validator(mode="after")
+    def _reject_binary_attachments(self) -> "ChatHistoryRequest":
+        return self
+
+
 class ChatHistoryDetail(BaseModel):
     chat_id: str
     created_at: str
     run_id: str
     status: str
     elapsed_ms: int | None = None
-    request: RunRequest
+    request: ChatHistoryRequest
     source_results: list[SourceResult]
     debate_results: list[DebateResult]
     critique_output: str
